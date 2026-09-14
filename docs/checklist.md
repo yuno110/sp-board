@@ -1,11 +1,11 @@
 # board-service 구현 체크리스트
 
-`B-xx`·`I-xx` 항목 **상태의 단일 원본**이다. 항목의 범위·완료 기준·검증은 `simple-docs/plan/phase1.md`(B-xx)와 `simple-docs/plan/integration.md`(I-xx)의 같은 ID를 본다.
+`B-xx`·`I-xx` 항목 **상태의 단일 원본**이다. 항목의 범위·완료 기준·검증은 `sp-docs/plan/phase1.md`(B-xx)와 `sp-docs/plan/integration.md`(I-xx)의 같은 ID를 본다.
 
 줄 형식: `- [ ] <ID> <이름> · 상태 <todo|doing|review|blocked|done> · 커밋 <해시 또는 ->`
 `blocked`는 줄 끝에 `· 사유: ...`를 붙인다. 사유는 다음 작업자가 이어받을 수 있을 만큼 구체적으로 적는다.
 
-절차는 `simple-docs/process/dev-workflow.md`를 따른다.
+절차는 `sp-docs/process/dev-workflow.md`를 따른다.
 
 ## 상태
 
@@ -20,7 +20,7 @@
 **`doing`에서 곧바로 `done`으로 가지 않는다.** 리뷰를 거치지 않은 항목은 완료가 아니다.
 2라운드 이상이면 줄 끝에 `· 리뷰 2라운드`를 붙인다.
 
-**여러 워커가 이 파일을 고칠 수 있다.** 자기 항목의 줄만 수정하고, 파일을 재정렬하거나 다른 줄을 건드리지 않는다 (`simple-docs/process/orchestration.md` §6).
+**여러 워커가 이 파일을 고칠 수 있다.** 자기 항목의 줄만 수정하고, 파일을 재정렬하거나 다른 줄을 건드리지 않는다 (`sp-docs/process/orchestration.md` §6).
 
 ## 기반 단계 (순차)
 
@@ -54,5 +54,5 @@
 
 B-01을 시작하기 전에 아래가 준비되어야 한다. 준비되지 않았으면 `blocked`로 두고 보고한다.
 
-- [ ] MySQL 8.0 로컬 설치, `board_db` 스키마 생성 (`simple-docs/tech-stack.md` §4.1)
-- [ ] 문서 저장소 클론 (`../simple-docs`)
+- [ ] MySQL 8.0 로컬 설치, `board_db` 스키마 생성 (`sp-docs/tech-stack.md` §4.1)
+- [ ] 문서 저장소 클론 (`../sp-docs`)

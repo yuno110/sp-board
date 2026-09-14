@@ -6,14 +6,14 @@
 
 ## 정본 문서
 
-정본은 **문서 저장소** `yuno110/simple-docs`에 있다. 이 저장소에는 정본을 두지 않는다.
+정본은 **문서 저장소** `yuno110/sp-docs`에 있다. 이 저장소에는 정본을 두지 않는다.
 
 ```bash
 # 없으면 클론한다
-git clone https://github.com/yuno110/simple-docs.git ../simple-docs
+git clone https://github.com/yuno110/sp-docs.git ../sp-docs
 ```
 
-진입점은 `simple-docs/README.md`이며, **"작업별 읽을 문서" 표에서 필요한 문서만 고른다. 전부 읽지 않는다.**
+진입점은 `sp-docs/README.md`이며, **"작업별 읽을 문서" 표에서 필요한 문서만 고른다. 전부 읽지 않는다.**
 
 - 값(엔드포인트, 컬럼, 에러 코드, 버전)은 `api-contract.md`·`domain-model.md`·`tech-stack.md`에서만 가져온다
 - 결정의 이유가 궁금하면 `adr/`를 본다. 구현 중에는 대개 필요 없다
@@ -24,8 +24,8 @@ git clone https://github.com/yuno110/simple-docs.git ../simple-docs
 1. `docs/checklist.md`에서 상태가 `doing`인 항목을 찾는다. 있으면 그것을 이어서 한다
 2. 없으면 순서상 다음 `todo`를 고른다. **의존 항목이 모두 `done`이어야 한다**
 3. 고른 항목의 상태를 `doing`으로 바꾼다
-4. `simple-docs/plan/phase1.md`에서 그 항목의 산출물·참조·완료 기준·검증을 읽는다
-5. `simple-docs/process/dev-workflow.md`의 절차를 따른다
+4. `sp-docs/plan/phase1.md`에서 그 항목의 산출물·참조·완료 기준·검증을 읽는다
+5. `sp-docs/process/dev-workflow.md`의 절차를 따른다
 
 이 저장소가 담당하는 항목은 **B-01 ~ B-09**이고, 1차 완료 후 **I-01 ~ I-04**(통합 검증)도 여기서 추적한다. `M-xx`(member) 항목을 처리하지 않는다.
 
@@ -40,7 +40,7 @@ git clone https://github.com/yuno110/simple-docs.git ../simple-docs
 - **실패하는 테스트를 `@Disabled`로 넘기거나 단언을 약화하지 않는다**
 - 완료 기준을 전부 충족하지 못했으면 `done`이 아니다. `blocked`로 두고 사유를 구체적으로 적는다
 - 산출물 목록 밖의 파일을 수정하지 않는다
-- 금지 사항 전체는 `simple-docs/process/dev-workflow.md` §3에 있다
+- 금지 사항 전체는 `sp-docs/process/dev-workflow.md` §3에 있다
 
 ## 워크트리 작업
 
@@ -49,7 +49,7 @@ git clone https://github.com/yuno110/simple-docs.git ../simple-docs
 - **자기 워크트리 밖의 파일을 고치지 않는다**
 - **산출물 목록 밖의 파일을 고치지 않는다.** 다른 워커의 작업과 충돌한다
 - `docs/checklist.md`는 **자기 항목의 줄만** 수정한다. 파일을 재정렬하거나 다른 줄을 건드리지 않는다
-- **자기 항목이 소유한 경로에만 쓴다.** 경로 소유 지도는 `simple-docs/plan/phase1.md` §2에 있다
+- **자기 항목이 소유한 경로에만 쓴다.** 경로 소유 지도는 `sp-docs/plan/phase1.md` §2에 있다
 - 공유 지점(`SecurityConfig`, `Service`, `Controller`, `build.gradle`)은 §2.3의 닫힌 목록이다. 동시에 수정하지 않는다
 - 마이그레이션 버전 번호는 계획이 배정한다(§2.4). **스스로 정하지 않는다**
 - 소유하지 않은 경로에 파일을 만들어야 하면 진행하지 말고 BLOCKED로 보고한다(§2.5)
@@ -78,7 +78,7 @@ POST /api/v1/posts
 - `writer_id`, `writer_nickname`은 **JWT Claim에서만** 가져온다. 요청 본문의 값을 쓰지 않는다
 - 닉네임 변경이 과거 글에 반영되지 않는 것은 **의도된 동작**이다. 1차에서 해결하지 않는다
 
-배경은 `simple-docs/adr/0003-writer-snapshot.md`에 있다.
+배경은 `sp-docs/adr/0003-writer-snapshot.md`에 있다.
 
 ### JWT 검증
 

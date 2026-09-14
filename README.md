@@ -17,18 +17,18 @@
 정본 문서는 별도 저장소에 있다.
 
 ```bash
-git clone https://github.com/yuno110/simple-docs.git ../simple-docs
+git clone https://github.com/yuno110/sp-docs.git ../sp-docs
 ```
 
 | 무엇을 찾는가 | 문서 |
 | --- | --- |
-| 무슨 문서를 읽어야 하나 | `simple-docs/README.md` |
+| 무슨 문서를 읽어야 하나 | `sp-docs/README.md` |
 | 지금 할 일 | [`docs/checklist.md`](docs/checklist.md) |
-| 작업 항목의 상세 | `simple-docs/plan/phase1.md` |
-| 구현·테스트 절차 | `simple-docs/process/dev-workflow.md` |
-| 엔드포인트·에러 코드 | `simple-docs/api-contract.md` |
-| 엔티티·컬럼 | `simple-docs/domain-model.md` |
-| 기능 요구사항 | `simple-docs/requirements/board.md` |
+| 작업 항목의 상세 | `sp-docs/plan/phase1.md` |
+| 구현·테스트 절차 | `sp-docs/process/dev-workflow.md` |
+| 엔드포인트·에러 코드 | `sp-docs/api-contract.md` |
+| 엔티티·컬럼 | `sp-docs/domain-model.md` |
+| 기능 요구사항 | `sp-docs/requirements/board.md` |
 
 AI 워커는 [`CLAUDE.md`](CLAUDE.md)를 먼저 읽는다.
 
@@ -51,7 +51,7 @@ AI 워커는 [`CLAUDE.md`](CLAUDE.md)를 먼저 읽는다.
 
 **트레이드오프**: 닉네임을 바꿔도 과거 글에는 반영되지 않는다. **1차에서 해결하지 않는다.** 2차에 Kafka 이벤트로 해소한다.
 
-배경: `simple-docs/adr/0003-writer-snapshot.md`
+배경: `sp-docs/adr/0003-writer-snapshot.md`
 
 ## 주요 제약
 
