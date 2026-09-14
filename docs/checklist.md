@@ -54,5 +54,5 @@
 
 B-01을 시작하기 전에 아래가 준비되어야 한다. 준비되지 않았으면 `blocked`로 두고 보고한다.
 
-- [ ] MySQL 8.0 로컬 설치, `sp_board` 스키마 생성 (`sp-docs/tech-stack.md` §4.1)
-- [ ] 문서 저장소 클론 (`../sp-docs`)
+- [x] MySQL 8.0 로컬 설치, `sp_board` 스키마 생성, `SET PERSIST time_zone='+09:00'` (`sp-docs/tech-stack.md` §4.1)
+- [x] 문서 저장소 클론 (`../sp-docs`)
