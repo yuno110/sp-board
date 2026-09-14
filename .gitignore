@@ -1,0 +1,50 @@
+### 비밀 값 ###
+# 개인키는 이 저장소에 두지 않는다 (sp-docs/security.md). 공개키(jwt-public.pem)만 커밋한다.
+private.pem
+*.env
+
+# 로컬 전용 설정. 비밀번호가 들어가므로 커밋하지 않는다.
+# 템플릿은 application-local.yml.example 를 본다
+src/main/resources/application-local.yml
+.env
+
+### Gradle ###
+.gradle
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### QueryDSL Q타입 생성 경로 (sp-docs/tech-stack.md §3.2) ###
+build/generated/sources/annotationProcessor/
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+bin/
+!**/src/main/**/bin/
+!**/src/test/**/bin/
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+out/
+!**/src/main/**/out/
+!**/src/test/**/out/
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+
+### VS Code ###
+.vscode/
