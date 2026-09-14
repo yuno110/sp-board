@@ -1,0 +1,22 @@
+# 로컬 개발 전용 설정 템플릿
+#
+# 사용법: 이 파일을 application-local.yml 로 복사하고 비밀번호를 채운다.
+#   cp src/main/resources/application-local.yml.example src/main/resources/application-local.yml
+#
+# application-local.yml 은 .gitignore 에 있어 커밋되지 않는다.
+# application.yml 의 값을 덮어쓰므로 여기 적은 password 가 이긴다.
+
+spring:
+  datasource:
+    password: 여기에_MySQL_root_비밀번호
+
+  # 로컬 프로파일만 SQL 로그를 켠다 (sp-docs/conventions.md §8)
+  jpa:
+    show-sql: true
+    properties:
+      hibernate:
+        format_sql: true
+
+logging:
+  level:
+    org.hibernate.orm.jdbc.bind: trace

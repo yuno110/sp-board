@@ -1,0 +1,13 @@
+# 테스트는 H2 MySQL 호환 모드를 쓴다 (sp-docs/tech-stack.md §1).
+# main application.yml을 가리지 않도록 프로파일 설정으로 둔다 — 덧씌우기이므로 main 값이 살아 있다.
+spring:
+  datasource:
+    url: jdbc:h2:mem:sp_board;MODE=MySQL;DB_CLOSE_DELAY=-1;DB_CLOSE_ON_EXIT=FALSE
+    username: sa
+    password:
+    driver-class-name: org.h2.Driver
+  jpa:
+    hibernate:
+      # 스키마 출처를 Flyway로 고정한다. 임베디드 H2의 기본값 create-drop을 쓰면
+      # 마이그레이션이 아니라 엔티티로부터 스키마가 조용히 생성된다.
+      ddl-auto: validate
