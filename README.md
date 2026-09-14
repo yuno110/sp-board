@@ -7,7 +7,7 @@
 | 항목 | 값 |
 | --- | --- |
 | 포트 | 8082 |
-| 데이터베이스 | `board_db` (MySQL 8.0) |
+| 데이터베이스 | `sp_board` (MySQL 8.0) |
 | 소유 테이블 | `post`, `comment` |
 | 기본 패키지 | `com.example.board` |
 | JWT 역할 | **검증만** — RS256 RSA **공개키**만 보유 (서명 불가) |
@@ -55,7 +55,7 @@ AI 워커는 [`CLAUDE.md`](CLAUDE.md)를 먼저 읽는다.
 
 ## 주요 제약
 
-- **`member_db`를 조회하지 않는다.** 같은 MySQL 인스턴스에 있어도 크로스 스키마 조인 금지
+- **`sp_member`를 조회하지 않는다.** 같은 MySQL 인스턴스에 있어도 크로스 스키마 조인 금지
 - **`writer_id`에 FK 제약을 걸지 않는다**
 - `@Transactional` 안에서 member-service를 호출하지 않는다
 - JWT 필터를 직접 만들지 않는다. Spring Security `oauth2-resource-server`를 쓴다
@@ -67,7 +67,7 @@ AI 워커는 [`CLAUDE.md`](CLAUDE.md)를 먼저 읽는다.
 **1차는 Docker를 사용하지 않는다.** MySQL은 로컬에 직접 설치한다.
 
 ```sql
-CREATE DATABASE board_db DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
+CREATE DATABASE sp_board DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_ci;
 ```
 
 ```bash
@@ -76,7 +76,7 @@ CREATE DATABASE board_db DEFAULT CHARACTER SET utf8mb4 COLLATE utf8mb4_general_c
 
 | 환경변수 | 필수 | 설명 |
 | --- | --- | --- |
-| `DB_URL` | | 기본값 `jdbc:mysql://localhost:3306/board_db` |
+| `DB_URL` | | 기본값 `jdbc:mysql://localhost:3306/sp_board` |
 | `DB_USERNAME` / `DB_PASSWORD` | | |
 | `MEMBER_SERVICE_URL` | | 기본값 `http://localhost:8081` |
 

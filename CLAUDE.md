@@ -2,7 +2,7 @@
 
 ## 이 저장소
 
-`board-service`다. 게시글과 댓글을 담당한다. 기본 패키지는 `com.example.board`, 포트는 8082, DB는 `board_db`다.
+`board-service`다. 게시글과 댓글을 담당한다. 기본 패키지는 `com.example.board`, 포트는 8082, DB는 `sp_board`다.
 
 ## 정본 문서
 
@@ -59,7 +59,7 @@ git clone https://github.com/yuno110/sp-docs.git ../sp-docs
 
 ## 이 서비스의 경계 — 중요
 
-- **`member_db`를 조회하지 않는다.** 같은 MySQL 인스턴스에 있어도 크로스 스키마 조인 금지
+- **`sp_member`를 조회하지 않는다.** 같은 MySQL 인스턴스에 있어도 크로스 스키마 조인 금지
 - **`post.writer_id`에 FK 제약을 걸지 않는다**
 - `@Transactional` 안에서 member-service를 호출하지 않는다
 - member-service를 호출하지 않는다. 1차에서 호출 경로가 없다
