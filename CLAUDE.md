@@ -108,9 +108,9 @@ POST /api/v1/posts
 
 - **검증만** 한다. RSA 공개키만 갖는다. 개인키를 이 저장소에 두지 않는다
 - Spring Security `oauth2-resource-server`를 쓴다. **JWT 필터를 직접 만들지 않는다**
-- B-04 단계에서는 **테스트용 키 페어**로 자체 검증한다. `AU-04`를 기다리지 않는다. 계약이 `api-contract.md` §6에 확정되어 있다
-- `MemberClient`도 **스텁으로 테스트한다.** `M-10`을 기다리지 않는다. 기다리면 board 전체가 member의 임계 경로에 묶인다
-- 실제 공개키 교체는 I-01(통합 검증)에서 한다
+- **실제 공개키가 이미 `src/main/resources/jwt-public.pem`에 있다.** `AU-04`를 기다리지 않는다. 계약은 `api-contract.md` §6에 확정되어 있다
+- `MemberClient`는 **스텁으로 테스트한다.** `M-10`을 기다리지 않는다. 기다리면 board 전체가 member의 임계 경로에 묶인다
+- I-01에서는 **두 사본이 같은 키인지**와 **auth가 실제 발급한 토큰을 받는지**를 확인한다
 
 ## 보안
 

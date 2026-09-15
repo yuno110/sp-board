@@ -20,3 +20,8 @@ spring:
 logging:
   level:
     org.hibernate.orm.jdbc.bind: trace
+
+# 서비스 간 내부 API 인증 키. member 와 board 가 같은 값을 써야 한다
+# (sp-docs/security.md §6)
+member-service:
+  internal-api-key: 여기에_내부_API_키
