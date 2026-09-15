@@ -24,10 +24,10 @@ git clone https://github.com/yuno110/sp-docs.git ../sp-docs
 1. `docs/checklist.md`에서 상태가 `doing`인 항목을 찾는다. 있으면 그것을 이어서 한다
 2. 없으면 순서상 다음 `todo`를 고른다. **의존 항목이 모두 `done`이어야 한다**
 3. 고른 항목의 상태를 `doing`으로 바꾼다
-4. `sp-docs/plan/phase1.md`에서 그 항목의 산출물·참조·완료 기준·검증을 읽는다
+4. `sp-docs/plan/phase1.md` **§6**에서 그 항목의 산출물·참조·완료 기준·검증을 읽는다
 5. `sp-docs/process/dev-workflow.md`의 절차를 따른다
 
-이 저장소가 담당하는 항목은 **B-01 ~ B-09**이고, 1차 완료 후 **I-01 ~ I-04**(통합 검증)도 여기서 추적한다. `M-xx`(member) 항목을 처리하지 않는다.
+이 저장소가 담당하는 항목은 **`B-xx`**이고, 1차 완료 후 **`I-01`~`I-05`**(통합 검증)도 여기서 추적한다. `AU-xx`(auth)·`M-xx`(member)·`D-xx`(문서) 항목을 처리하지 않는다.
 
 ## 작업 규칙
 
@@ -57,32 +57,59 @@ git clone https://github.com/yuno110/sp-docs.git ../sp-docs
 
 ## 이 서비스의 경계 — 중요
 
-- **`sp_member`를 조회하지 않는다.** 같은 MySQL 인스턴스에 있어도 크로스 스키마 조인 금지
+- **`sp_member`·`sp_auth`를 조회하지 않는다.** 같은 MySQL 인스턴스에 있어도 크로스 스키마 조인 금지
 - **`post.writer_id`에 FK 제약을 걸지 않는다**
-- `@Transactional` 안에서 member-service를 호출하지 않는다
-- member-service를 호출하지 않는다. 1차에서 호출 경로가 없다
-- 시간대는 `Asia/Seoul`로 명시 설정한다
+- **`@Transactional` 안에서 member-service를 호출하지 않는다.** 원격 호출을 먼저 하고 그 다음 트랜잭션을 연다
+- **member-service는 글·댓글 생성 시에만 호출한다.** 조회·수정·삭제 경로에서는 호출하지 않는다
+- **auth-service를 호출하지 않는다.** 토큰 검증은 공개키로 오프라인 수행한다
+- `LoginMember`는 `(accountId, role)`이다. **`nickname`이 없다**
+- 시간대는 실행 환경이 정한다. 코드나 `build.gradle`에서 설정하지 않는다 (`sp-docs/adr/0011`)
 
 ### 작성자 정보 — 스냅샷
 
-작성자 닉네임은 member-service 소유 데이터이므로 조인할 수 없다. **JWT Claim에서 가져와 복제 저장한다.**
+작성자 닉네임은 member-service 소유 데이터이므로 조인할 수 없다. 복제 저장하는 것은 그대로지만, **취득 경로가 바뀌었다.**
+
+**`writer_id`는 JWT Claim에서, `writer_nickname`은 member의 내부 API에서 얻는다.** JWT Claim에 `nickname`이 없기 때문이다 (`sp-docs/adr/0012` §3).
 
 ```
 POST /api/v1/posts
-  JWT Claim { sub: "3", nickname: "홍길동" }
-    -> INSERT INTO post (writer_id, writer_nickname, ...) VALUES (3, '홍길동', ...)
+  JWT Claim { sub: "3", role: "USER" }
+    1) POST /internal/v1/members/bulk  { accountIds: [3] }     <- 트랜잭션 밖
+       -> 200 { members: [{ accountId: 3, nickname: "홍길동", deleted: false }] }
+    2) BEGIN
+       INSERT INTO post (writer_id, writer_nickname, ...) VALUES (3, '홍길동', ...)
+       COMMIT
 ```
 
-- `writer_id`, `writer_nickname`은 **JWT Claim에서만** 가져온다. 요청 본문의 값을 쓰지 않는다
+- `writer_id`는 **검증된 JWT의 `sub`에서만**, `writer_nickname`은 **내부 API 응답에서만** 가져온다. 요청 본문의 값을 쓰지 않는다
+- **조회 키도 JWT의 `sub`다.** 본문의 `writerId`로 조회하지 않는다
+- **수정 시 스냅샷을 갱신하지 않는다.** 그래서 수정 경로는 member를 호출하지 않는다
 - 닉네임 변경이 과거 글에 반영되지 않는 것은 **의도된 동작**이다. 1차에서 해결하지 않는다
 
-배경은 `sp-docs/adr/0003-writer-snapshot.md`에 있다.
+배경은 `sp-docs/adr/0003-writer-snapshot.md`, 경로가 바뀐 이유는 `sp-docs/adr/0012` §6에 있다.
+
+### 실패 판정 — HTTP 404를 업무 의미로 쓰지 않는다
+
+프로필 유무는 **200 응답의 본문으로만** 판정한다.
+
+| member 응답 | 처리 |
+| --- | --- |
+| 200, 결과에 `deleted = false` | 진행 |
+| 200, 결과에서 제외됨 / `deleted = true` | 403 `S002` — 재시도 무의미 |
+| **그 밖의 모든 응답** (4xx, 5xx, 타임아웃, 파싱 실패) | **503 `S001` — 경보 대상** |
+
+**404를 "프로필 없음"으로 해석하면 안 된다.** `MEMBER_SERVICE_URL` 오설정이나 내부 API 키 거부가 업무 오류로 위장되어, 경보도 서킷도 없이 전 사용자의 쓰기가 조용히 멈춘다.
+
+타임아웃은 **connect 1초 / read 3초**다. 1차에서는 재시도·서킷브레이커를 두지 않는다. 계약은 `sp-docs/api-contract.md` §5.1이 정본이다.
+
+**member 장애 시 새 글 작성이 중단된다.** 이것은 `sp-docs/adr/0012`가 비용으로 수용한 것이다. 조회·수정·삭제는 영향받지 않는다.
 
 ### JWT 검증
 
 - **검증만** 한다. RSA 공개키만 갖는다. 개인키를 이 저장소에 두지 않는다
 - Spring Security `oauth2-resource-server`를 쓴다. **JWT 필터를 직접 만들지 않는다**
-- B-03 단계에서는 **테스트용 키 페어**로 자체 검증한다. M-05를 기다리지 않는다. 계약이 `api-contract.md §5`에 확정되어 있다
+- B-04 단계에서는 **테스트용 키 페어**로 자체 검증한다. `AU-04`를 기다리지 않는다. 계약이 `api-contract.md` §6에 확정되어 있다
+- `MemberClient`도 **스텁으로 테스트한다.** `M-10`을 기다리지 않는다. 기다리면 board 전체가 member의 임계 경로에 묶인다
 - 실제 공개키 교체는 I-01(통합 검증)에서 한다
 
 ## 보안
