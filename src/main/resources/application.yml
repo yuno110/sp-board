@@ -10,3 +10,16 @@ spring:
 
 server:
   port: ${SERVER_PORT:8082}
+
+# 1차부터 글·댓글 생성 시 member 의 내부 API 를 호출한다 (sp-docs/adr/0012 §6).
+# 타임아웃은 sp-docs/nfr.md §3 이 정본이다. 기본값(무제한)으로 두지 않는다.
+member-service:
+  url: ${MEMBER_SERVICE_URL:http://localhost:8081}
+  internal-api-key: ${INTERNAL_API_KEY}
+  connect-timeout: 1s
+  read-timeout: 3s
+
+# auth-service 가 발급한 토큰을 공개키로 검증만 한다.
+# 개인키는 이 서비스에 없다 (sp-docs/security.md §2).
+jwt:
+  public-key-location: classpath:jwt-public.pem

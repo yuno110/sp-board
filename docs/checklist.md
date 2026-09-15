@@ -63,8 +63,11 @@
 
 B-02를 시작하기 전에 아래가 준비되어야 한다. 준비되지 않았으면 `blocked`로 두고 보고한다.
 
-- [ ] **`D-01`(정본 개정)이 `done`이다** (`sp-docs/docs/checklist.md`)
+- [x] **`D-01`(정본 개정)이 `done`이다** (`sp-docs/docs/checklist.md`)
 - [x] MySQL 8.0 로컬 설치, `sp_board` 스키마 생성, `SET PERSIST time_zone='+09:00'` (`sp-docs/tech-stack.md` §4.1)
 - [x] `application-local.yml` 생성하고 MySQL 비밀번호 기입 (`sp-docs/tech-stack.md` §4.3.1)
-- [ ] `application-local.yml`에 `INTERNAL_API_KEY` 추가 (member와 같은 값)
+- [x] `application-local.yml`에 `INTERNAL_API_KEY` 추가 (member와 같은 값)
+- [x] **공개키** `jwt-public.pem`을 `src/main/resources/`에 배치 — **실제 키다.** 개인키는 두지 않는다
+
+> **B-04는 테스트용 키 페어를 만들 필요가 없다.** 실제 공개키가 이미 배치되어 있다. `MemberClient`는 여전히 스텁으로 테스트한다 — M-10을 기다리지 않는다.
 - [x] 문서 저장소 클론 (`../sp-docs`)
