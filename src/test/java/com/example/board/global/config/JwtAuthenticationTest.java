@@ -118,8 +118,17 @@ class JwtAuthenticationTest {
 	@ParameterizedTest(name = "{0} {1}")
 	@CsvSource({
 			"POST,/api/v1/posts",
-			// 내가 쓴 글 목록 (P-08, sp-docs/api-contract.md §4). 규칙을 /posts/{id} 보다
-			// 뒤에 두면 permitAll 이 먼저 잡아 401 이 아니게 되므로 이 한 줄이 순서를 고정한다
+			// 내가 쓴 글 목록 (P-08, sp-docs/api-contract.md §4).
+			//
+			// 이 줄은 순서를 고정하지 않는다. B-09 가 핸들러를 만들기 전에는 규칙을
+			// /posts/{id} 보다 뒤에 두면 permitAll 이 먼저 잡아 이 줄이 빨개졌다 — 그때의
+			// 응답은 400 C002 다(B-09 2라운드 리뷰 측정값, sp-docs/api-contract.md §4).
+			// 매핑이 없어 404 가 되는 것이 아니라 GET /posts/{id} 의 @PathVariable Long id
+			// 가 "me" 를 잡아 MethodArgumentTypeMismatchException 이 된다. 지금은 핸들러의
+			// @CurrentMember 가 익명 principal 을 보고 던져 응답이 똑같이 401 A001 이다 —
+			// 뒤집은 변이에서 이 클래스 45개가 전부 통과했다(실측). 선언 순서를 잡는 것은
+			// PostControllerTest.내_글_목록은_필터_체인이_막는다 이고, 그쪽이 거부한
+			// 계층(선택된 핸들러·해석된 예외)을 본다. 이 줄은 무토큰 401 A001 만 고정한다
 			"GET,/api/v1/posts/me",
 			"PUT,/api/v1/posts/1",
 			"DELETE,/api/v1/posts/1",

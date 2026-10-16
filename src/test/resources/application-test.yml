@@ -19,6 +19,14 @@ spring:
       # 스키마 출처를 Flyway 하나로 고정한다. 임베디드 H2 의 기본값 create-drop 을 쓰면
       # 마이그레이션이 아니라 엔티티로부터 스키마가 조용히 생성된다 (sp-docs/tech-stack.md §5.1).
       ddl-auto: validate
+    properties:
+      hibernate:
+        # 목록 조회가 발행한 statement 수를 세는 수단이다 (PostListQueryCountTest).
+        # 행 수만 바꾼 두 측정이 같은지 보는 것이 N+1 관측이고 (sp-docs/plan/phase1.md §6 B-09),
+        # 그 집계를 Hibernate 가 제공한다.
+        #
+        # 테스트 프로파일에만 켠다. 운영에서는 통계 수집이 쿼리마다 비용을 더하고 쓰는 곳이 없다
+        generate_statistics: true
 
 # 테스트 전용 값이다. 정책값이 아니다 — 정본(sp-docs/security.md §1.1)은 허용 오리진을
 # 환경이 정하게 두고 목록을 정하지 않았다. 운영·로컬 값은 환경이 준다

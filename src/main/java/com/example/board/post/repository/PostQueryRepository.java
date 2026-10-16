@@ -46,17 +46,44 @@ public class PostQueryRepository {
 
 	/**
 	 * 목록·검색. 응답 형식은 sp-docs/api-contract.md §7.1 이고 변환은 서비스가 한다.
+	 */
+	public Page<Post> search(PostSearchCondition condition) {
+		return page(condition, keywordCondition(condition));
+	}
+
+	/**
+	 * 내가 쓴 글 목록 (P-08, sp-docs/requirements/board.md §1).
+	 *
+	 * <p><b>조회 키를 파라미터로 받는다.</b> {@link PostSearchCondition} 에 넣지 않는 것은 그
+	 * 레코드가 <b>요청 파라미터</b>의 정규화를 맡기 때문이다 — {@code writerId} 는 요청이 주는
+	 * 값이 아니라 검증된 JWT 의 {@code sub} 다 (sp-docs/requirements/board.md §3 규칙 3,
+	 * sp-docs/api-contract.md §4.1). 둘을 한 레코드에 섞으면 요청에서 온 값과 토큰에서 온 값이
+	 * 같은 자리에 놓인다.
+	 *
+	 * <p>{@code searchType}·{@code keyword} 는 이 경로에 없다 (§4.1) — P-08 이
+	 * "{@code writer_id} 기준 페이징" 만 요구한다. 그래서 조건은 작성자 하나다.
+	 */
+	public Page<Post> searchByWriter(long writerId, PostSearchCondition condition) {
+		return page(condition, post.writerId.eq(writerId));
+	}
+
+	/**
+	 * 두 목록이 공유하는 페이징이다. 다른 것은 {@code filter} 하나뿐이다.
+	 *
+	 * <p><b>{@code deleted = false} 와 정렬이 여기 한 자리에 있다.</b> 목록마다 복제하면 한
+	 * 군데가 빠지는 순간 삭제된 글이 노출되거나 정렬이 전순서를 잃는다 (클래스 주석).
 	 *
 	 * <p>건수는 매번 센다. {@code totalElements}·{@code totalPages} 가 항상 실제 건수에서
 	 * 나오므로 마지막 페이지 판정이 응답마다 일관된다.
+	 *
+	 * @param filter 목록별 조건. {@code null} 이면 조건이 붙지 않는다 (클래스 주석)
 	 */
-	public Page<Post> search(PostSearchCondition condition) {
+	private Page<Post> page(PostSearchCondition condition, BooleanExpression filter) {
 		Pageable pageable = PageRequest.of(condition.page(), condition.size());
-		BooleanExpression keywordCondition = keywordCondition(condition);
 
 		List<Post> content = this.queryFactory
 				.selectFrom(post)
-				.where(post.deleted.isFalse(), keywordCondition)
+				.where(post.deleted.isFalse(), filter)
 				.orderBy(order(condition))
 				.offset(pageable.getOffset())
 				.limit(pageable.getPageSize())
@@ -65,7 +92,7 @@ public class PostQueryRepository {
 		Long total = this.queryFactory
 				.select(post.count())
 				.from(post)
-				.where(post.deleted.isFalse(), keywordCondition)
+				.where(post.deleted.isFalse(), filter)
 				.fetchOne();
 
 		return new PageImpl<>(content, pageable, Objects.requireNonNullElse(total, 0L));

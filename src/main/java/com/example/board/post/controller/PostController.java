@@ -100,6 +100,44 @@ public class PostController {
 	}
 
 	/**
+	 * 내가 쓴 글 목록 (P-08). <b>인증이 필요하다</b> (sp-docs/api-contract.md §4). 응답은
+	 * §7.1 의 페이징 형식이고 항목은 §4.3 의 <b>목록 모양</b>이다 — 목록과 같다.
+	 *
+	 * <p><b>{@code page}·{@code size}·{@code sort} 만 받는다</b> (§4.1).
+	 * {@code searchType}·{@code keyword} 는 없다 — P-08 이 "{@code writer_id} 기준 페이징" 만
+	 * 요구한다 (sp-docs/requirements/board.md §1). <b>{@code writerId} 도 받지 않는다</b> —
+	 * 조회 키는 {@code @CurrentMember} 가 검증된 JWT 의 {@code sub} 에서 꺼낸 것뿐이다
+	 * (§4.1, sp-docs/requirements/board.md §3 규칙 3).
+	 *
+	 * <p><b>하한 제약을 {@link #getList} 와 같이 여기에도 둔다.</b> 집행하는 자리가 파라미터
+	 * 제약이므로 (§4.1 §2.3, {@link #getList} 의 주석) 핸들러마다 붙여야 한다 —
+	 * {@link PostSearchCondition} 은 상한 절삭만 맡고 하한을 보지 않으므로, 빠뜨리면
+	 * {@code size=0} 이 {@code PageRequest.of} 까지 내려가 400 {@code C001} 이어야 할 응답이
+	 * <b>500 {@code C005}</b> 가 되고 {@code log.error} 경보를 만든다.
+	 *
+	 * <p><b>{@code /me} 의 인가 선언은 {@code /posts/{id}} 보다 앞이어야 한다</b> (§4).
+	 * MVC 라우팅은 리터럴 세그먼트를 경로 변수보다 구체적으로 보므로 이 클래스의 선언 순서는
+	 * 무관하지만, {@code SecurityConfig.authorizeHttpRequests} 는 선언 순서대로 평가하므로
+	 * 거기서 뒤집으면 {@code permitAll} 이 이 경로를 먼저 잡아 <b>인증 없이 디스패치된다.</b>
+	 *
+	 * <p><b>"열린다" 가 아니다.</b> 뒤집어도 이 메서드의 {@code @CurrentMember} 가 익명
+	 * principal 을 보고 던지므로 응답은 똑같이 401 {@code A001} 이고, <b>상태 코드로는 그
+	 * 어긋남이 관측되지 않는다</b> (§4 의 블록인용). 관측은 <b>선택된 핸들러와 해석된
+	 * 예외</b>로 하고 그 자리는 {@code PostControllerTest.내_글_목록은_필터_체인이_막는다} 다.
+	 */
+	@GetMapping("/me")
+	public ApiResponse<PageResponse<PostResponse>> getMyPosts(
+			@CurrentMember LoginMember loginMember,
+			@RequestParam(required = false) @Min(PostSearchCondition.MIN_PAGE) Integer page,
+			@RequestParam(required = false) @Min(PostSearchCondition.MIN_SIZE) Integer size,
+			@RequestParam(required = false) PostSortType sort) {
+
+		return ApiResponse.success(this.postService.getMyPosts(
+				loginMember.accountId(),
+				PostSearchCondition.of(page, size, sort, null, null)));
+	}
+
+	/**
 	 * 게시글 상세 조회. <b>비로그인 허용이고</b> 조회수가 1 증가한다
 	 * (sp-docs/requirements/board.md §1 P-04 P-05).
 	 *

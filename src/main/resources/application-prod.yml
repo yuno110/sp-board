@@ -1,0 +1,49 @@
+# 운영 프로파일. application.yml 과 달라야 하는 것만 적는다.
+#
+# 비밀 값을 이 파일에 적지 않는다. DB 비밀번호·내부 API 키·CORS 오리진은 application.yml 이
+# 환경변수로 받고 기본값을 두지 않으므로, 없으면 기동이 실패한다
+# (sp-docs/tech-stack.md §4.3). 이 파일은 커밋되므로 값을 적으면 이력에 남는다.
+#
+# /actuator 는 application.yml 이 health 만 노출하도록 두었고 인가 차단은 SecurityConfig 가
+# 한다. 프로파일에 따라 달라지지 않으므로 여기서 다시 적지 않는다.
+#
+# 공개키 경로도 여기서 다시 적지 않는다 — classpath:jwt-public.pem 이 커밋된 실제 키이고
+# 프로파일과 무관하다. 개인키는 이 저장소에 없다 (sp-docs/security.md §2 §3).
+#
+# member-service 의 connect-timeout·read-timeout 도 프로파일과 무관하다 (sp-docs/nfr.md §3).
+
+spring:
+  jpa:
+    # SQL 로그는 로컬 프로파일에서만 켠다 (sp-docs/nfr.md §5)
+    show-sql: false
+    properties:
+      hibernate:
+        format_sql: false
+
+# API 문서는 운영에서 비활성화한다 (sp-docs/nfr.md §8, sp-docs/security.md §5.1.1).
+#
+# 둘을 함께 끈다 — swagger-ui 만 끄면 /v3/api-docs 가 스키마를 그대로 내보내므로
+# UI 없이 전체 엔드포인트 목록을 얻을 수 있다. SecurityConfig 는 두 경로를 permitAll 로
+# 두므로(경로별 인가는 프로파일을 모른다) 끄는 지점은 여기다.
+springdoc:
+  api-docs:
+    enabled: false
+  swagger-ui:
+    enabled: false
+
+# 바인드 파라미터 로그를 운영에서 고정으로 끈다. 루트 수준이 올라가도
+# (LOGGING_LEVEL_ROOT=DEBUG) 이 둘은 warn 에 머문다 — 블록이 일하는 순간이 그때다.
+#
+# 정본이 드는 보안 근거는 "바인드 파라미터 로그에 비밀번호가 평문으로 실린다" 이고
+# (sp-docs/nfr.md §5, sp-docs/conventions.md §8), board 는 비밀번호를 갖지 않는다 — 계정은
+# auth 소유다 (sp-docs/adr/0012). board 의 바인드 파라미터에 실리는 것은 writer_id·닉네임과
+# 게시글·댓글 본문이다. 그래도 같은 모양으로 둔다: 세 서비스가 같은 운영 설정을 쓰고
+# (sp-docs/plan/phase1.md §6 B-09, AU-11·M-11), 운영 로그에 사용자가 쓴 본문을 흘리지 않는
+# 것 자체도 이득이다.
+#
+# application-local.yml 은 바인드 파라미터 로거를 trace 로 올리고, SQL 로그는 logging.level 이
+# 아니라 spring.jpa.show-sql 로 올린다
+logging:
+  level:
+    org.hibernate.SQL: warn
+    org.hibernate.orm.jdbc.bind: warn

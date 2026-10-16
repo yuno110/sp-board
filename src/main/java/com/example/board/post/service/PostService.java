@@ -158,6 +158,32 @@ public class PostService {
 	}
 
 	/**
+	 * 내가 쓴 글 목록 (P-08). <b>인증이 필요하다</b> (sp-docs/api-contract.md §4).
+	 *
+	 * <p><b>조회 키는 검증된 JWT 의 {@code sub} 다</b> ({@code accountId} 파라미터) —
+	 * 쿼리 파라미터의 {@code writerId} 로 조회하지 않는다
+	 * (sp-docs/requirements/board.md §3 규칙 3, sp-docs/api-contract.md §4.1). 받으면 아무
+	 * 토큰으로나 남의 글 목록을 꺼낼 수 있다.
+	 *
+	 * <p>응답 항목은 {@link #getList} 와 <b>같은 모양</b>이다 (sp-docs/api-contract.md §4.3) —
+	 * 목록 모양은 하나이고 이 경로가 두 번째를 만들지 않는다.
+	 *
+	 * <p><b>{@code MemberClient} 를 호출하지 않는다</b> (§4.2). {@link #getList} 와 같은
+	 * 이유다 — 조회 경로의 원격 호출은 0회가 기준이다 (sp-docs/nfr.md §1).
+	 *
+	 * <p>삭제된 글 제외와 정렬은 {@link PostQueryRepository} 가 쿼리로 처리한다. 마지막 정렬
+	 * 키가 {@code id} 라 동률이 있어도 페이지 경계가 안정적이다 (§7.1).
+	 *
+	 * @param accountId 검증된 JWT 의 {@code sub}
+	 */
+	@Transactional(readOnly = true)
+	public PageResponse<PostResponse> getMyPosts(Long accountId, PostSearchCondition condition) {
+		return PageResponse.of(this.postQueryRepository
+				.searchByWriter(accountId, condition)
+				.map(PostResponse::from));
+	}
+
+	/**
 	 * 게시글 수정 (P-06). <b>작성자 본인만 할 수 있다</b> — ADMIN 도 못 한다
 	 * (sp-docs/security.md §5.2, sp-docs/requirements/board.md §5 규칙 6).
 	 *

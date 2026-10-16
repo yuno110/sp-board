@@ -70,8 +70,9 @@ public class SecurityConfig {
 
 				.authorizeHttpRequests(auth -> auth
 						// --- 인프라 경로 (sp-docs/security.md §5.1.1) ---
-						// prod 프로파일에서는 springdoc 자체가 꺼져 경로가 사라진다. 그 확인은
-						// B-09 가 한다
+						// prod 프로파일에서는 springdoc 자체가 꺼져 경로가 사라진다 — 경로별
+						// 인가는 프로파일을 모르므로 끄는 지점은 application-prod.yml 이고,
+						// 두 경로가 그 프로파일에서 404 인 것은 ProdProfileTest 가 본다
 						.requestMatchers("/swagger-ui.html", "/swagger-ui/**").permitAll()
 						.requestMatchers("/v3/api-docs", "/v3/api-docs/**").permitAll()
 						.requestMatchers("/actuator/health").permitAll()
@@ -86,9 +87,15 @@ public class SecurityConfig {
 						.requestMatchers(HttpMethod.GET, "/api/v1/posts").permitAll()
 						// ★ /posts/me 를 /posts/{id} 보다 먼저 선언한다. authorizeHttpRequests
 						// 는 선언 순서대로 평가하므로, {id} 가 먼저면 permitAll 이 /posts/me 를
-						// 먼저 잡아 내가 쓴 글 목록이 인증 없이 열린다
-						// (sp-docs/api-contract.md §4). 핸들러는 B-09 가 만든다 — 매처는
-						// 핸들러를 요구하지 않으므로 규칙을 먼저 둔다
+						// 먼저 잡아 내가 쓴 글 목록이 인증 없이 디스패치된다
+						// (sp-docs/api-contract.md §4). 이 경로의 핸들러는
+						// PostController.getMyPosts 다.
+						//
+						// 이 순서를 잡는 것은 PostControllerTest.내_글_목록은_필터_체인이_막는다
+						// 다. 상태 코드로는 관측되지 않는다 — 뒤집어도 핸들러의
+						// @CurrentMember 가 익명 principal 을 보고 던져 응답이 똑같이 401
+						// A001 이 되므로, 그 테스트는 거부한 계층(핸들러가 선택됐는지)을 본다.
+						// 뒤집은 변이에서 그 하나만 빨개지는 것을 측정했다
 						.requestMatchers(HttpMethod.GET, "/api/v1/posts/me").authenticated()
 						.requestMatchers(HttpMethod.GET, "/api/v1/posts/{id}").permitAll()
 						.requestMatchers(HttpMethod.GET, "/api/v1/posts/{postId}/comments").permitAll()

@@ -24,6 +24,7 @@ import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executors;
@@ -67,9 +68,10 @@ import org.springframework.test.web.servlet.MvcResult;
  * 아니다.
  *
  * <p>픽스처의 {@code writerId} 는 작성·상세(B-05)가 521~539, 목록·검색(B-06)이 621~639,
- * 수정·삭제(B-07)가 741~759 를 쓴다. 이미 쓰이는 대역(201~210, 301~317, 401~402,
- * {@code PostServiceTest} 의 501~519·701~719, {@code PostQueryRepositoryTest} 의 601~619)과
- * 겹치지 않게 둔다 (sp-docs/tech-stack.md §5.3 — 같은 JVM 의 모든 테스트가 한 H2 DB 를 본다).
+ * 수정·삭제(B-07)가 741~759, 내가 쓴 글(B-09)이 861~869 를 쓴다. 이미 쓰이는 대역(201~210,
+ * 301~317, 401~402, {@code PostServiceTest} 의 501~519·701~719,
+ * {@code PostQueryRepositoryTest} 의 601~619)과 겹치지 않게 둔다
+ * (sp-docs/tech-stack.md §5.3 — 같은 JVM 의 모든 테스트가 한 H2 DB 를 본다).
  *
  * <p><b>목록 쪽 단언은 검색 조건으로 범위를 좁힌다.</b> 이 클래스는 롤백에 기대지 않고 커밋하므로
  * 테이블 전체를 세는 단언은 다른 클래스의 픽스처에 흔들린다. 전체 건수를 보는 것은 롤백되는
@@ -152,6 +154,7 @@ class PostControllerTest {
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 521 AND 539");
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 621 AND 639");
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 741 AND 759");
+		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 861 AND 869");
 	}
 
 	// --- 작성 (P-01, sp-docs/api-contract.md §4) ---
@@ -533,6 +536,42 @@ class PostControllerTest {
 	}
 
 	/**
+	 * <b>경계는 양쪽이다 — 하한 값은 성공해야 한다</b> (sp-docs/conventions.md §9.2).
+	 * {@code page} 는 0 이상, {@code size} 는 1 이상이므로 {@code page=0}·{@code size=1} 은
+	 * 200 이다 (sp-docs/requirements/board.md §4, sp-docs/api-contract.md §4.1).
+	 *
+	 * <p><b>위의 하한 미달 테스트가 이것을 대신하지 않는다.</b> 위반하는 쪽만 보면
+	 * <b>하한을 올리는 어긋남이 조용하다</b> — {@code MIN_SIZE} 를 1 에서 2 로 올려도
+	 * {@code size=0} 은 여전히 400 이다(실측: 그 변이에서 263개가 전부 통과했다). 상한에서
+	 * 배운 것과 방향만 반대다 (§9.2).
+	 *
+	 * <p>돌려받은 값을 함께 본다. 기대값은 {@code @CsvSource} 의 둘째 칼럼이므로 자기참조가
+	 * 아니다. <b>다만 그 단언이 구속하는 것은 {@code size} 쪽뿐이다</b> —
+	 * {@code DEFAULT_PAGE} 와 {@code MIN_PAGE} 가 <b>같은 값(0)</b>이라, {@code page} 를
+	 * 핸들러가 통째로 무시해도 기본값이 채워져 {@code $.data.page} 가 0 으로 나온다(측정값:
+	 * {@code page} 를 받지 않게 한 변이에서 {@code [page,0]} 이 녹색이었다). 그 결함을 잡는
+	 * 것은 위의 하한 미달 테스트다 — 같은 변이에서 {@code [page,-1]} 이 빨개졌다. <b>이 행이
+	 * 지키는 것은 하한 값 0 이 거부되지 않는 것</b>이고, 그것은 {@code MIN_PAGE} 를 올리는
+	 * 변이가 깨뜨린다.
+	 *
+	 * <p>{@code DEFAULT_PAGE} 를 0 이 아닌 값으로 바꾸면 이 설명이 달라진다 — 그때는
+	 * {@code page} 행도 "무시" 를 구속하게 된다.
+	 *
+	 * <p>{@code /posts/me} 쪽은 {@link #내_글_목록의_페이징_하한_값은_200} 이 따로 본다 —
+	 * 두 경로가 같은 상수를 쓰므로 한쪽만으로는 부족하다 (§9.2).
+	 */
+	@ParameterizedTest
+	@CsvSource({"page,0", "size,1"})
+	@DisplayName("page=0 · size=1 은 200 이고 그 값이 응답에 실린다")
+	void 페이징_하한_값은_200(String parameter, int value) throws Exception {
+		savedPost(627L, "하한값작성자", "하한 값 대상", "본문");
+
+		this.mockMvc.perform(get(PATH).param(parameter, String.valueOf(value)))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data." + parameter).value(value));
+	}
+
+	/**
 	 * 정본이 고정한 값은 소문자다 (sp-docs/api-contract.md §4.1). 상수 이름을 대문자로 바꾸면
 	 * 변환이 대소문자를 구분하므로 이 두 줄이 400 이 된다.
 	 */
@@ -622,6 +661,202 @@ class PostControllerTest {
 				.andExpect(status().isOk())
 				.andExpect(jsonPath("$.success").value(true))
 				.andExpect(jsonPath("$.data.content").isArray());
+	}
+
+	// --- 내가 쓴 글 (P-08, sp-docs/api-contract.md §4 §4.1) ---
+
+	/**
+	 * 검증표의 "내 글 5건 + 타인 글 3건 → 5건만 반환" 이다 (sp-docs/plan/phase1.md §6 B-09).
+	 *
+	 * <p><b>조회 키는 JWT 의 {@code sub} 다</b> (sp-docs/api-contract.md §4.1,
+	 * sp-docs/requirements/board.md §3 규칙 3). 타인 글 3건을 토큰과 다른 {@code writer_id} 로
+	 * 두므로, 작성자 조건이 빠지면 8건이 돌아와 두 단언이 함께 깨진다.
+	 *
+	 * <p><b>member 를 호출하지 않는다</b> (§4.2, sp-docs/nfr.md §1) — 조회 경로다. 목록에
+	 * 실리는 닉네임은 작성 시점 스냅샷이다.
+	 *
+	 * <p>응답 모양은 <b>목록과 같다</b> (§4.3) — 봉투는 §7.1 이고 항목에 {@code content} 가
+	 * 없다. 두 키 집합은 이 클래스가 리터럴로 고정한 것이다.
+	 *
+	 * <p>{@code totalElements} 는 한 페이지에 다 들어가는 결과라
+	 * {@code PageImpl} 의 보정과 구별되지 않으므로 건수 쿼리를 보지 않는다
+	 * (sp-docs/process/review-policy.md §4.1). 작성자 조건이 붙은 건수 쿼리를 관측하는 것은
+	 * {@code PostQueryRepositoryTest.내가_쓴_글의_삭제분_제외()} 다.
+	 */
+	@Test
+	@DisplayName("내가 쓴 글 목록은 내 글만 돌려주고 항목 키가 정확히 일곱이다")
+	void 내가_쓴_글만_돌려준다() throws Exception {
+		for (int i = 0; i < 5; i++) {
+			savedPost(861L, "내글작성자", "내 글 " + i, "본문");
+		}
+		for (int i = 0; i < 3; i++) {
+			savedPost(862L, "타인작성자", "타인 글 " + i, "본문");
+		}
+
+		MvcResult result = this.mockMvc.perform(get(PATH + "/me")
+						.header(HttpHeaders.AUTHORIZATION, bearer(861L)))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.success").value(true))
+				.andExpect(jsonPath("$.error").value(nullValue()))
+				.andExpect(jsonPath("$.data.content.length()").value(5))
+				.andReturn();
+
+		assertThat(itemTitles(result))
+				.as("타인 글 3건이 섞이면 제목이 '타인 글 ...' 로 나온다")
+				.allSatisfy(title -> assertThat(title).startsWith("내 글 "));
+		assertThat(dataKeys(result))
+				.as("sp-docs/api-contract.md §7.1 의 페이징 봉투")
+				.isEqualTo(PAGE_KEYS);
+		assertThat(firstItemKeys(result))
+				.as("내가 쓴 글도 목록 항목 모양이다 (§4.3) — content 가 없다")
+				.isEqualTo(LIST_ITEM_KEYS);
+		assertThat(REQUEST_COUNT.get())
+				.as("조회 경로는 member 를 호출하지 않는다 (sp-docs/api-contract.md §4.2)")
+				.isZero();
+	}
+
+	/**
+	 * <b>{@code writerId} 를 쿼리 파라미터로 받지 않는다</b> (sp-docs/api-contract.md §4.1).
+	 * 받으면 아무 토큰으로나 남의 글 목록을 꺼낼 수 있다.
+	 *
+	 * <p>파라미터가 가리키는 쪽에 글을 하나 두므로, 그 값을 조회 키로 쓰는 구현이면 응답이
+	 * 그 글 하나가 되어 제목 단언이 깨진다. Spring 이 선언되지 않은 파라미터를 무시하는 것에
+	 * 기대는 테스트이고, 핸들러가 {@code writerId} 를 선언하는 순간 빨개진다.
+	 */
+	@Test
+	@DisplayName("writerId 쿼리 파라미터는 조회 키가 되지 않는다")
+	void writerId_파라미터는_무시된다() throws Exception {
+		savedPost(863L, "내글작성자", "파라미터 내 글", "본문");
+		savedPost(864L, "타인작성자", "파라미터 타인 글", "본문");
+
+		MvcResult result = this.mockMvc.perform(get(PATH + "/me")
+						.param("writerId", "864")
+						.header(HttpHeaders.AUTHORIZATION, bearer(863L)))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.content.length()").value(1))
+				.andReturn();
+
+		assertThat(itemTitles(result)).containsExactly("파라미터 내 글");
+	}
+
+	/**
+	 * <b>{@code /posts/me} 의 인가 규칙이 {@code /posts/{id}} 의 {@code permitAll} 보다 먼저
+	 * 평가되는지를 잡는다</b> (sp-docs/api-contract.md §4 — {@code authorizeHttpRequests} 는
+	 * 선언 순서대로 평가한다).
+	 *
+	 * <p><b>상태 코드만으로는 그 순서가 관측되지 않는다</b>(측정값). 두 선언을 뒤집으면
+	 * {@code permitAll} 이 이 경로를 먼저 잡아 요청이 인증 없이 디스패치되지만, 핸들러의
+	 * {@code @CurrentMember} 가 익명 principal 을 보고 {@code BusinessException(UNAUTHORIZED)}
+	 * 을 던져 <b>응답이 똑같이 401 {@code A001} 이 된다.</b> 그래서 뒤집은 변이에서
+	 * {@code JwtAuthenticationTest.인증이_필요한_경로} 를 포함한 <b>262개가 전부 통과했다</b> —
+	 * 핸들러가 생기기 전에는 그 테스트가 순서를 잡았지만 B-09 가 핸들러를 만든 뒤로는 잡지
+	 * 못한다.
+	 *
+	 * <p><b>그때의 응답은 400 {@code C002} 였다</b> (B-09 2라운드 리뷰 측정값,
+	 * sp-docs/api-contract.md §4). 매핑이 없어 404 가 되는 것이 아니라
+	 * {@code GET /posts/{id}} 의 {@code @PathVariable Long id} 가 {@code "me"} 를 잡아
+	 * {@code MethodArgumentTypeMismatchException} 이 된다 — 같은 기준 경로에 경로 변수
+	 * 핸들러가 있으면 그것이 먼저 잡는다. 어느 쪽이든 401 이 아니므로 그때는 그 줄이 순서를
+	 * 잡았다는 결론은 같다.
+	 *
+	 * <p><b>그래서 거부한 계층을 본다.</b> 규칙이 {@code authenticated()} 로 걸리면 요청이
+	 * {@code DispatcherServlet} 에 닿지 않으므로 핸들러가 선택되지 않고 해석된 예외도 없다.
+	 * {@code permitAll} 이 먼저 잡으면 둘 다 채워진다. 401 과 {@code A001} 단언은
+	 * {@code JwtAuthenticationTest} 와 겹치지만, <b>그 겹치는 부분이 아래 두 단언을 의미 있게
+	 * 만든다</b> — 어느 계층이 냈는지는 "401 이 났다" 를 전제로만 말이 된다.
+	 */
+	@Test
+	@DisplayName("토큰 없는 내 글 목록 요청은 핸들러에 닿기 전에 필터 체인이 막는다")
+	void 내_글_목록은_필터_체인이_막는다() throws Exception {
+		MvcResult result = this.mockMvc.perform(get(PATH + "/me"))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("A001"))
+				.andReturn();
+
+		assertThat(result.getHandler())
+				.as("핸들러가 선택됐다면 permitAll 이 /posts/me 를 먼저 잡은 것이다 "
+						+ "(sp-docs/api-contract.md §4) — SecurityConfig 의 선언 순서를 되돌려야 한다")
+				.isNull();
+		assertThat(result.getResolvedException())
+				.as("필터 체인이 막으면 디스패치가 없으므로 해석된 예외도 없다. "
+						+ "CurrentMemberArgumentResolver 가 낸 401 이면 여기에 BusinessException 이 담긴다")
+				.isNull();
+	}
+
+	/**
+	 * 검증표의 "내 글 목록에 {@code size=0} / {@code page=-1} → 400 {@code C001},
+	 * {@code fieldErrors} 1건. 500 이 아니다" 다.
+	 *
+	 * <p><b>목록 쪽 테스트가 이 핸들러를 덮지 않는다.</b> 하한을 집행하는 자리가 파라미터
+	 * 제약이므로 (sp-docs/api-contract.md §4.1 §2.3) 핸들러마다 따로 붙어야 하고, 이 핸들러에서
+	 * 빠지면 {@code size=0} 이 {@code PageRequest.of} 까지 내려가 <b>500 {@code C005}</b> 와
+	 * {@code log.error} 경보가 된다 — 400 이어야 할 클라이언트 실수가 서버 장애로 보고된다
+	 * (sp-docs/conventions.md §6.1).
+	 *
+	 * <p>기대하는 {@code field} 는 {@code @CsvSource} 의 첫 칼럼이므로 응답에서 뽑아 온
+	 * 자기참조가 아니다.
+	 */
+	@ParameterizedTest
+	@CsvSource({"page,-1", "size,0"})
+	@DisplayName("내 글 목록의 page 0 미만 · size 1 미만은 400 C001 이고 fieldErrors 가 1건이다")
+	void 내_글_목록의_페이징_하한_미달은_400_C001(String parameter, String value) throws Exception {
+		this.mockMvc.perform(get(PATH + "/me")
+						.param(parameter, value)
+						.header(HttpHeaders.AUTHORIZATION, bearer(865L)))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("C001"))
+				.andExpect(jsonPath("$.error.fieldErrors", hasSize(1)))
+				.andExpect(jsonPath("$.error.fieldErrors[0].field").value(parameter));
+	}
+
+	/**
+	 * <b>이 경로의 하한 값도 성공해야 한다</b> (sp-docs/conventions.md §9.2). 이유는
+	 * {@link #페이징_하한_값은_200} 과 같고, <b>두 경로가 {@code MIN_PAGE}·{@code MIN_SIZE} 를
+	 * 공유하므로 한쪽만 보면 부족하다</b> — 하한을 올리는 어긋남은 두 경로에 동시에 번진다
+	 * (§9.2 의 "상수를 두 경로가 공유하면").
+	 */
+	@ParameterizedTest
+	@CsvSource({"page,0", "size,1"})
+	@DisplayName("내 글 목록의 page=0 · size=1 은 200 이고 그 값이 응답에 실린다")
+	void 내_글_목록의_페이징_하한_값은_200(String parameter, int value) throws Exception {
+		savedPost(867L, "하한값내글작성자", "하한 값 내 글", "본문");
+
+		this.mockMvc.perform(get(PATH + "/me")
+						.param(parameter, String.valueOf(value))
+						.header(HttpHeaders.AUTHORIZATION, bearer(867L)))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data." + parameter).value(value))
+				.andExpect(jsonPath("$.data.content.length()").value(1));
+	}
+
+	/**
+	 * {@code /posts/me} 는 {@code page}·{@code size}·{@code sort} 를 받는다
+	 * (sp-docs/api-contract.md §4.1). <b>{@code sort} 를 핸들러가 선언하지 않으면 그 값이
+	 * 조용히 무시되고</b> 사용자는 정렬이 걸린 줄 알고 기본 순서를 받는다
+	 * (sp-docs/AGENTS.md 불변식 9 의 silent degradation).
+	 *
+	 * <p>그래서 픽스처를 <b>기본 정렬과 다른 순서가 나오게</b> 둔다. 저장 순서가
+	 * 1 → 3 → 2 (조회수)이므로 기본 {@code latest}({@code created_at DESC, id DESC})는
+	 * 2 → 3 → 1 이고 {@code views} 는 3 → 2 → 1 이다. 두 순서가 다르므로
+	 * {@code sort} 가 무시되면 단언이 깨진다.
+	 */
+	@Test
+	@DisplayName("내 글 목록의 sort=views 는 view_count 내림차순이다")
+	void 내_글_목록의_sort_가_적용된다() throws Exception {
+		withViewCount(savedPost(866L, "정렬작성자", "내 글 조회수 1", "본문"), 1);
+		withViewCount(savedPost(866L, "정렬작성자", "내 글 조회수 3", "본문"), 3);
+		withViewCount(savedPost(866L, "정렬작성자", "내 글 조회수 2", "본문"), 2);
+
+		MvcResult result = this.mockMvc.perform(get(PATH + "/me")
+						.param("sort", "views")
+						.header(HttpHeaders.AUTHORIZATION, bearer(866L)))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.content.length()").value(3))
+				.andReturn();
+
+		assertThat(itemTitles(result))
+				.as("sort 가 무시되면 기본 latest 순서(조회수 2 → 3 → 1)가 나온다")
+				.containsExactly("내 글 조회수 3", "내 글 조회수 2", "내 글 조회수 1");
 	}
 
 	// --- 수정 (P-06, sp-docs/api-contract.md §4 §4.3, sp-docs/security.md §5.2) ---
@@ -876,6 +1111,17 @@ class PostControllerTest {
 				.build());
 	}
 
+	/**
+	 * 조회수를 박는다. {@code view_count} 기본값이 0 이라 손대지 않으면 전체가 동률이고
+	 * {@code sort=views} 가 적용됐는지 관측되지 않는다 (sp-docs/api-contract.md §7.1).
+	 */
+	private void withViewCount(Post post, int times) {
+		for (int i = 0; i < times; i++) {
+			post.increaseViewCount();
+		}
+		this.postRepository.saveAndFlush(post);
+	}
+
 	private int rowCount(long writerId) {
 		Integer count = this.jdbcTemplate.queryForObject(
 				"SELECT COUNT(*) FROM post WHERE writer_id = ?", Integer.class, writerId);
@@ -896,6 +1142,14 @@ class PostControllerTest {
 	private static Set<String> firstItemKeys(MvcResult result) throws Exception {
 		Map<String, Object> item = JsonPath.read(bodyOf(result), "$.data.content[0]");
 		return item.keySet();
+	}
+
+	/**
+	 * 목록 항목의 제목을 응답 순서대로 읽는다. 어느 행이 실렸는지와 그 순서를 함께 본다 —
+	 * {@code id}·{@code writerId} 는 JSON 숫자의 자바 타입에 기대야 하지만 제목은 문자열이다.
+	 */
+	private static List<String> itemTitles(MvcResult result) throws Exception {
+		return JsonPath.read(bodyOf(result), "$.data.content[*].title");
 	}
 
 	private static long dataId(MvcResult result) throws Exception {

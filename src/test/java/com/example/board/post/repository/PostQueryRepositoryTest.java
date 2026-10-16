@@ -12,6 +12,7 @@ import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
+import java.util.function.IntFunction;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -36,7 +37,8 @@ import org.springframework.test.context.ActiveProfiles;
  * {@code JPAQueryFactory} 빈이 없고, {@code PostQueryRepository} 역시 슬라이스의 스캔 대상이
  * 아니다.
  *
- * <p>픽스처의 {@code writerId} 는 601~619 를 쓴다. 같은 JVM 의 모든 테스트가 하나의 H2 DB 를
+ * <p>픽스처의 {@code writerId} 는 목록·검색(B-06)이 601~619, 내가 쓴 글(B-09)이 871~879 를
+ * 쓴다. 같은 JVM 의 모든 테스트가 하나의 H2 DB 를
  * 보므로 (sp-docs/tech-stack.md §5.3) 이미 쓰이는 대역과 겹치지 않게 둔다. 각 테스트는
  * {@code @DataJpaTest} 의 기본 롤백으로 정리되어 행이 남지 않는다.
  *
@@ -292,6 +294,73 @@ class PostQueryRepositoryTest {
 				.isPresent();
 	}
 
+	// --- 내가 쓴 글 (B-09, P-08 / sp-docs/api-contract.md §4.1) ---
+
+	/**
+	 * 검증표의 "내 글 중 삭제분 포함 → 삭제분 제외" 다 (sp-docs/plan/phase1.md §6 B-09).
+	 * <b>목록과 건수 양쪽에서</b> 빠져야 하므로 두 쿼리를 따로 단언한다.
+	 *
+	 * <p>건수 쿼리의 조건을 관측하는 두 요건은 {@link #삭제분_제외()} 와 같다
+	 * (sp-docs/process/review-policy.md §4.1). 하나는 <b>페이지가 꽉 차는 것</b>이다 —
+	 * {@code size} 를 2 로 두어 {@code offset 0 + 2 = 2} 가 올바른 건수 3 보다 작게 만든다.
+	 * 다른 하나는 <b>각 조건이 배제하는 행이 픽스처에 있는 것</b>이다. 그래서
+	 * {@code deleted} 를 위한 삭제분 하나와 <b>{@code writer_id} 를 위한 다른 작성자의 활성 행
+	 * 하나</b>를 둘 다 둔다 — 후자가 없으면 건수 쿼리에서 작성자 조건을 떼어낸 변이가 같은 3 을
+	 * 내어 단언이 아무것도 보지 못한다.
+	 */
+	@Test
+	@DisplayName("내가 쓴 글 목록에서 삭제된 글이 목록과 건수에서 모두 제외된다")
+	void 내가_쓴_글의_삭제분_제외() {
+		Long first = save(871L, "내글작성자", "내 글 하나", "본문").getId();
+		Long second = save(871L, "내글작성자", "내 글 둘", "본문").getId();
+		Long third = save(871L, "내글작성자", "내 글 셋", "본문").getId();
+		Post removed = save(871L, "내글작성자", "삭제된 내 글", "본문");
+		removed.softDelete();
+		// 다른 작성자의 활성 행. 이것이 없으면 건수 쿼리의 writer_id 조건이 관측되지 않는다
+		save(872L, "타인작성자", "타인의 활성 글", "본문");
+		this.em.flush();
+		this.em.clear();
+
+		Page<Post> wholeResult = searchByWriter(871L, condition(0, DEFAULT_SIZE));
+
+		assertThat(wholeResult.getContent()).extracting(Post::getId)
+				.containsExactlyInAnyOrder(first, second, third);
+
+		Page<Post> fullPage = searchByWriter(871L, condition(0, 2));
+
+		assertThat(fullPage.getContent()).hasSize(2);
+		assertThat(fullPage.getTotalElements())
+				.as("건수 쿼리에도 deleted = false 와 writer_id 조건이 둘 다 붙어야 한다")
+				.isEqualTo(3);
+		assertThat(fullPage.getTotalPages()).isEqualTo(2);
+		assertThat(this.postRepository.findById(removed.getId()))
+				.as("논리 삭제이므로 행은 남아 있다")
+				.isPresent();
+	}
+
+	/**
+	 * <b>마지막 정렬 키가 {@code id} 다</b> (sp-docs/api-contract.md §7.1, B-09 완료 기준).
+	 * 1차 키가 전부 동률이어도 1·2페이지에 중복도 누락도 없다.
+	 *
+	 * <p>동률을 만들려면 시각을 직접 박아야 한다 — H2 는 마이크로초를 유지하므로 연속 저장만으로는
+	 * 재현되지 않는다 (클래스 주석의 "{@code created_at} 을 직접 박는 이유").
+	 *
+	 * <p>작성자 조건으로 좁히므로 {@code 871} 대역의 다른 테스트 픽스처와 섞이지 않는다 —
+	 * {@code @DataJpaTest} 의 롤백이 테스트마다 비운다.
+	 */
+	@Test
+	@DisplayName("created_at 이 전부 같아도 내가 쓴 글의 1·2페이지에 중복·누락이 없다")
+	void 내가_쓴_글의_동률_페이지_경계() {
+		List<Long> all = new ArrayList<>();
+		for (int i = 0; i < TIED_FIXTURE_COUNT; i++) {
+			all.add(save(873L, "동률내글작성자", "동률 내 글 " + i, "본문").getId());
+		}
+		setCreatedAtForWriter(873L, BASE_TIME);
+
+		assertStablePageBoundary(
+				page -> searchByWriter(873L, condition(page, TIED_PAGE_SIZE)), all);
+	}
+
 	// --- 검색 (sp-docs/requirements/board.md §6) ---
 
 	/**
@@ -374,6 +443,10 @@ class PostQueryRepositoryTest {
 		return this.postQueryRepository.search(condition);
 	}
 
+	private Page<Post> searchByWriter(long writerId, PostSearchCondition condition) {
+		return this.postQueryRepository.searchByWriter(writerId, condition);
+	}
+
 	/**
 	 * 두 페이지를 이어 받아 <b>합집합이 전체와 같고 교집합이 빈다</b>는 것을 본다 — 그것이
 	 * "중복·누락 없음" 이다 (sp-docs/api-contract.md §7.1). 순서가 결정적이라는 단언만으로는
@@ -384,10 +457,19 @@ class PostQueryRepositoryTest {
 	 * 고정했다.
 	 */
 	private void assertStablePageBoundary(String nickname, PostSortType sort, List<Long> all) {
-		List<Long> firstPage = idsOf(search(PostSearchCondition.of(
-				0, TIED_PAGE_SIZE, sort, SearchType.WRITER, nickname)));
-		List<Long> secondPage = idsOf(search(PostSearchCondition.of(
-				1, TIED_PAGE_SIZE, sort, SearchType.WRITER, nickname)));
+		assertStablePageBoundary(page -> search(PostSearchCondition.of(
+				page, TIED_PAGE_SIZE, sort, SearchType.WRITER, nickname)), all);
+	}
+
+	/**
+	 * 목록을 가리는 조건과 무관한 부분이다. 검색 목록과 내가 쓴 글 목록이 <b>같은 정렬</b>을
+	 * 쓰므로 (두 쪽이 한 메서드를 지난다) 단언을 복제하지 않고 조회만 달리 넘긴다.
+	 *
+	 * @param pageAt 페이지 번호를 받아 그 페이지를 돌려주는 조회
+	 */
+	private void assertStablePageBoundary(IntFunction<Page<Post>> pageAt, List<Long> all) {
+		List<Long> firstPage = idsOf(pageAt.apply(0));
+		List<Long> secondPage = idsOf(pageAt.apply(1));
 
 		assertThat(firstPage).hasSize(TIED_PAGE_SIZE);
 		assertThat(secondPage).hasSize(TIED_FIXTURE_COUNT - TIED_PAGE_SIZE);
