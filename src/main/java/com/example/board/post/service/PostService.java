@@ -1,9 +1,13 @@
 package com.example.board.post.service;
 
 import com.example.board.client.MemberClient;
+import com.example.board.global.common.PageResponse;
 import com.example.board.post.dto.PostCreateRequest;
 import com.example.board.post.dto.PostDetailResponse;
+import com.example.board.post.dto.PostResponse;
+import com.example.board.post.dto.PostSearchCondition;
 import com.example.board.post.entity.Post;
+import com.example.board.post.repository.PostQueryRepository;
 import com.example.board.post.repository.PostRepository;
 import com.example.board.post.support.PostReader;
 import org.springframework.stereotype.Service;
@@ -12,8 +16,8 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * 게시글 쓰기·상세 조회. 정본: sp-docs/requirements/board.md §1 (P-01, P-04, P-05) §3 §3.0,
- * sp-docs/api-contract.md §4 §4.2 §4.3 §5.1.
+ * 게시글 쓰기·조회. 정본: sp-docs/requirements/board.md §1 (P-01 ~ P-05) §3 §3.0 §6,
+ * sp-docs/api-contract.md §4 §4.1 §4.2 §4.3 §5.1.
  *
  * <p>트랜잭션 경계는 서비스에 둔다 (sp-docs/conventions.md §5).
  */
@@ -21,6 +25,8 @@ import org.springframework.transaction.support.TransactionTemplate;
 public class PostService {
 
 	private final PostRepository postRepository;
+
+	private final PostQueryRepository postQueryRepository;
 
 	private final PostReader postReader;
 
@@ -35,11 +41,13 @@ public class PostService {
 
 	public PostService(
 			PostRepository postRepository,
+			PostQueryRepository postQueryRepository,
 			PostReader postReader,
 			MemberClient memberClient,
 			PlatformTransactionManager transactionManager) {
 
 		this.postRepository = postRepository;
+		this.postQueryRepository = postQueryRepository;
 		this.postReader = postReader;
 		this.memberClient = memberClient;
 		this.insertTransaction = new TransactionTemplate(transactionManager);
@@ -103,6 +111,25 @@ public class PostService {
 		Post post = this.postReader.getActiveById(id);
 		post.increaseViewCount();
 		return PostDetailResponse.from(post);
+	}
+
+	/**
+	 * 게시글 목록·검색 (P-02, P-03). <b>비로그인 허용이다</b> (sp-docs/api-contract.md §4).
+	 *
+	 * <p><b>{@code MemberClient} 를 호출하지 않는다.</b> 목록에 실리는 작성자 닉네임은 작성
+	 * 시점 스냅샷이고, 조회 경로의 원격 호출은 0회가 기준이다 (sp-docs/nfr.md §1,
+	 * sp-docs/api-contract.md §4.2). {@code commentCount} 도 {@code post} 에 비정규화되어
+	 * 있어 집계 쿼리가 없다 (sp-docs/domain-model.md §4.1).
+	 *
+	 * <p>목록 항목은 {@link PostResponse} 다 — 본문을 싣지 않는다
+	 * (sp-docs/api-contract.md §4.3). 한 페이지가 {@link PostSearchCondition#MAX_SIZE} 건이면
+	 * 본문만 500,000자가 된다.
+	 *
+	 * <p>삭제된 게시글 제외·검색 조건·정렬은 {@link PostQueryRepository} 가 쿼리로 처리한다.
+	 */
+	@Transactional(readOnly = true)
+	public PageResponse<PostResponse> getList(PostSearchCondition condition) {
+		return PageResponse.of(this.postQueryRepository.search(condition).map(PostResponse::from));
 	}
 
 }

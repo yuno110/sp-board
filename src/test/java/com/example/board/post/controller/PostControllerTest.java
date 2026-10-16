@@ -1,6 +1,7 @@
 package com.example.board.post.controller;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.nullValue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -30,6 +31,7 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.CsvSource;
 import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
@@ -61,9 +63,14 @@ import org.springframework.test.web.servlet.MvcResult;
  * ({@code {"success": true, "data": {"members": [...]}, "error": null}}) — 배열이 최상위가
  * 아니다.
  *
- * <p>픽스처의 {@code writerId} 는 521~539 를 쓴다. 이미 쓰이는 대역(201~210, 301~317,
- * 401~402, {@code PostServiceTest} 의 501~519)과 겹치지 않게 둔다
+ * <p>픽스처의 {@code writerId} 는 작성·상세(B-05)가 521~539, 목록·검색(B-06)이 621~639 를
+ * 쓴다. 이미 쓰이는 대역(201~210, 301~317, 401~402, {@code PostServiceTest} 의 501~519,
+ * {@code PostQueryRepositoryTest} 의 601~619)과 겹치지 않게 둔다
  * (sp-docs/tech-stack.md §5.3 — 같은 JVM 의 모든 테스트가 한 H2 DB 를 본다).
+ *
+ * <p><b>목록 쪽 단언은 검색 조건으로 범위를 좁힌다.</b> 이 클래스는 롤백에 기대지 않고 커밋하므로
+ * 테이블 전체를 세는 단언은 다른 클래스의 픽스처에 흔들린다. 전체 건수를 보는 것은 롤백되는
+ * {@code PostQueryRepositoryTest} 가 맡는다.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -90,6 +97,18 @@ class PostControllerTest {
 	private static final Set<String> DETAIL_KEYS = Set.of(
 			"id", "title", "content", "writerId", "writerNickname",
 			"viewCount", "commentCount", "createdAt");
+
+	/**
+	 * sp-docs/api-contract.md §4.3 §9.3 이 정한 <b>목록 항목</b>의 키 집합. 상세에서
+	 * {@code content} 를 뺀 것이다. {@code DETAIL_KEYS} 와 같은 이유로 리터럴이다.
+	 */
+	private static final Set<String> LIST_ITEM_KEYS = Set.of(
+			"id", "title", "writerId", "writerNickname",
+			"viewCount", "commentCount", "createdAt");
+
+	/** sp-docs/api-contract.md §7.1 의 페이징 봉투 키 집합. 여기도 리터럴이다. */
+	private static final Set<String> PAGE_KEYS = Set.of(
+			"content", "page", "size", "totalElements", "totalPages", "first", "last");
 
 	private static final HttpServer STUB = startStub();
 
@@ -126,6 +145,7 @@ class PostControllerTest {
 	@AfterEach
 	void 픽스처_정리() {
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 521 AND 539");
+		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 621 AND 639");
 	}
 
 	// --- 작성 (P-01, sp-docs/api-contract.md §4) ---
@@ -375,6 +395,229 @@ class PostControllerTest {
 				.andExpect(jsonPath("$.error.code").value("P001"));
 	}
 
+	// --- 목록·검색 (P-02, P-03, sp-docs/api-contract.md §4.1 §7.1) ---
+
+	/**
+	 * <b>비로그인 허용이고</b> (sp-docs/api-contract.md §4) <b>member 를 호출하지 않는다</b> —
+	 * 조회 경로의 원격 호출은 0회가 기준이다 (sp-docs/nfr.md §1, §4.2). 목록에 실리는 닉네임은
+	 * 작성 시점 스냅샷이다.
+	 *
+	 * <p>건수를 단언하지 않는다. 조건 없는 목록은 다른 테스트 클래스의 픽스처까지 센다.
+	 */
+	@Test
+	@DisplayName("목록 조회는 토큰 없이 200 이고 member 호출이 0회다")
+	void 목록_조회는_비로그인_200_이고_member_호출이_없다() throws Exception {
+		savedPost(621L, "목록작성자", "목록 조회 대상", "본문");
+
+		this.mockMvc.perform(get(PATH))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.success").value(true))
+				.andExpect(jsonPath("$.error").value(nullValue()))
+				.andExpect(jsonPath("$.data.content").isArray());
+
+		assertThat(REQUEST_COUNT.get())
+				.as("목록 조회는 member 를 호출하지 않는다 (sp-docs/api-contract.md §4.2)")
+				.isZero();
+	}
+
+	/**
+	 * 봉투는 §7.1, 항목은 §4.3 의 목록 모양이다 — 항목에 {@code content} 가 없다.
+	 *
+	 * <p>여기의 {@code totalElements} 는 한 페이지에 다 들어가는 결과라 보정된 값과 구별되지
+	 * 않으므로 건수 쿼리를 보지 않는다 (sp-docs/process/review-policy.md §4.1) — 검색 조건이
+	 * 걸린 건수 쿼리를 관측하는 것은 {@code PostQueryRepositoryTest.삭제분_제외()} 다. 꽉 찬
+	 * 페이지만으로는 부족하고 조건이 <b>배제하는 행</b>이 픽스처에 있어야 하는데, 그 조건을
+	 * 갖춘 것이 그쪽이다. 이 테스트가 보는 것은 <b>응답의 모양</b>이다.
+	 */
+	@Test
+	@DisplayName("목록 응답은 §7.1 페이징 키를 갖고 항목 키는 정확히 일곱이다")
+	void 목록_응답_형식() throws Exception {
+		Post post = savedPost(622L, "형식작성자", "응답형식확인", "본문입니다");
+
+		MvcResult result = this.mockMvc.perform(get(PATH)
+						.param("searchType", "TITLE")
+						.param("keyword", "응답형식확인"))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.content[0].id").value(post.getId()))
+				.andExpect(jsonPath("$.data.content[0].writerNickname").value("형식작성자"))
+				.andExpect(jsonPath("$.data.totalElements").value(1))
+				.andExpect(jsonPath("$.data.first").value(true))
+				.andExpect(jsonPath("$.data.last").value(true))
+				.andReturn();
+
+		assertThat(dataKeys(result))
+				.as("sp-docs/api-contract.md §7.1 의 페이징 봉투")
+				.isEqualTo(PAGE_KEYS);
+		assertThat(firstItemKeys(result))
+				.as("목록 항목에는 content 가 없다 (§4.3) — 한 페이지 50건이면 본문만 500,000자다")
+				.isEqualTo(LIST_ITEM_KEYS);
+	}
+
+	@Test
+	@DisplayName("page·size 를 주지 않으면 page 0, size 10 이다")
+	void 기본_페이징_값() throws Exception {
+		savedPost(623L, "기본값작성자", "기본값확인 첫째", "본문");
+		savedPost(623L, "기본값작성자", "기본값확인 둘째", "본문");
+
+		this.mockMvc.perform(get(PATH)
+						.param("searchType", "TITLE")
+						.param("keyword", "기본값확인"))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.page").value(0))
+				.andExpect(jsonPath("$.data.size").value(10))
+				.andExpect(jsonPath("$.data.content.length()").value(2));
+	}
+
+	/**
+	 * {@code size} 는 최대 50 이고 초과분은 절삭된다 (sp-docs/api-contract.md §4.1).
+	 *
+	 * <p>51건을 저장해 두고 51건을 요청한다. 픽스처가 상한보다 적으면 절삭이 없어도 같은 결과가
+	 * 나와 단언이 아무것도 보지 못한다.
+	 *
+	 * <p><b>여기의 {@code totalElements} 는 건수 쿼리의 검색 조건을 구속하지 않는다.</b> 절삭
+	 * 결과로 페이지가 꽉 차서 {@code PageImpl} 의 보정은 일어나지 않지만, 꽉 찬 페이지는
+	 * <b>필요조건일 뿐이다</b> — 이 픽스처의 모든 활성 행이 {@code 절삭확인} 에 매칭되므로
+	 * 조건을 떼어낸 건수와 붙인 건수가 같은 값이다 (측정값: 건수 쿼리에서
+	 * {@code keywordCondition} 을 떼어낸 변이가 이 테스트를 통과했다). 조건이 배제하는 행을 둔
+	 * 관측은 {@code PostQueryRepositoryTest.삭제분_제외()} 가 한다
+	 * (sp-docs/process/review-policy.md §4.1). <b>이 테스트가 보는 것은 절삭이다.</b>
+	 */
+	@Test
+	@DisplayName("size=51 은 50 으로 절삭된다")
+	void size_상한_절삭() throws Exception {
+		for (int i = 0; i < 51; i++) {
+			savedPost(624L, "절삭작성자", "절삭확인 " + i, "본문");
+		}
+
+		this.mockMvc.perform(get(PATH)
+						.param("searchType", "TITLE")
+						.param("keyword", "절삭확인")
+						.param("size", "51"))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.size").value(50))
+				.andExpect(jsonPath("$.data.content.length()").value(50))
+				.andExpect(jsonPath("$.data.totalElements").value(51))
+				.andExpect(jsonPath("$.data.totalPages").value(2));
+	}
+
+	/**
+	 * {@code page} 는 0 이상, {@code size} 는 1~50 이다 (sp-docs/requirements/board.md §4).
+	 * <b>상한 초과만 절삭으로 정해져 있으므로</b> 하한 미달은 입력 검증 위반이고 400
+	 * {@code C001} 이다 (sp-docs/api-contract.md §8.1).
+	 *
+	 * <p>이 제약이 없으면 {@code PageRequest.of} 가 터져 <b>500 {@code C005}</b> 가 되고
+	 * {@code log.error} 경보를 만든다 (측정값) — 클라이언트 실수가 서버 장애로 보고된다
+	 * (sp-docs/conventions.md §6.1).
+	 *
+	 * <p><b>{@code fieldErrors} 가 1건이고 {@code field} 는 파라미터명이다</b>
+	 * (sp-docs/api-contract.md §4.1 §2.3). 하한 위반은 <b>바인딩이 성공한 뒤</b> 범위 규칙을
+	 * 어긴 것이므로 §2.3 이 말한 "바인딩된 필드의 오류" 이고, 조합 위반(아래 두 테스트)의 빈
+	 * 배열과 갈린다. 기대하는 {@code field} 는 {@code @CsvSource} 의 첫 칼럼이므로 응답에서
+	 * 뽑아 온 자기참조가 아니다.
+	 */
+	@ParameterizedTest
+	@CsvSource({"page,-1", "size,0"})
+	@DisplayName("page 0 미만 · size 1 미만은 400 C001 이고 fieldErrors 가 1건이다")
+	void 페이징_하한_미달은_400_C001(String parameter, String value) throws Exception {
+		this.mockMvc.perform(get(PATH).param(parameter, value))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("C001"))
+				.andExpect(jsonPath("$.error.fieldErrors", hasSize(1)))
+				.andExpect(jsonPath("$.error.fieldErrors[0].field").value(parameter));
+	}
+
+	/**
+	 * 정본이 고정한 값은 소문자다 (sp-docs/api-contract.md §4.1). 상수 이름을 대문자로 바꾸면
+	 * 변환이 대소문자를 구분하므로 이 두 줄이 400 이 된다.
+	 */
+	@ParameterizedTest
+	@ValueSource(strings = {"latest", "views"})
+	@DisplayName("sort=latest · sort=views 는 200 이다")
+	void 정렬_화이트리스트_값(String sort) throws Exception {
+		savedPost(625L, "정렬작성자", "정렬 대상", "본문");
+
+		this.mockMvc.perform(get(PATH).param("sort", sort))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.success").value(true));
+	}
+
+	/**
+	 * <b>정렬 파라미터로 임의 컬럼명을 넣을 수 없다</b> (sp-docs/requirements/board.md §6).
+	 * 화이트리스트 enum 으로 받으므로 변환 단계에서 걸린다 — 타입 변환 실패이므로
+	 * {@code C002} 다 (sp-docs/api-contract.md §8.1, sp-docs/conventions.md §6.1).
+	 *
+	 * <p>{@code title} 은 실제 {@code post} 컬럼이다. 화이트리스트가 아니라 컬럼명을 받는
+	 * 구현이면 {@code password} 는 막히고 이 값은 통과한다.
+	 */
+	@ParameterizedTest
+	@ValueSource(strings = {"password", "title"})
+	@DisplayName("sort=password · sort=title 은 400 이다")
+	void 정렬_화이트리스트_밖은_400(String sort) throws Exception {
+		this.mockMvc.perform(get(PATH).param("sort", sort))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.error.code").value("C002"));
+	}
+
+	/**
+	 * {@code searchType} 과 {@code keyword} 는 둘 다 있거나 둘 다 없어야 한다
+	 * (sp-docs/api-contract.md §4.1, sp-docs/requirements/board.md §6). 아래 세 테스트가 그
+	 * 규칙의 세 입력이다.
+	 *
+	 * <p><b>조합 위반의 {@code fieldErrors} 는 빈 배열이다</b> (§4.1). 한 필드의 오류가 아니라
+	 * <b>요청 수준</b> 규칙이어서 담을 필드가 하나로 정해지지 않는다 — §2.3 이 가른 요청 수준과
+	 * 바인딩 수준의 구분이고, 하한 위반의 1건과 짝을 이룬다. <b>두 방향 모두 단언한다</b> —
+	 * 기대 결과가 대칭이므로 한쪽만 구속하면 다른 쪽이 조용히 어긋날 수 있다.
+	 */
+	@Test
+	@DisplayName("searchType 만 전달하면 400 C001 이고 fieldErrors 는 빈 배열이다")
+	void searchType_만_전달하면_400_C001() throws Exception {
+		this.mockMvc.perform(get(PATH).param("searchType", "TITLE"))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("C001"))
+				.andExpect(jsonPath("$.error.fieldErrors", hasSize(0)));
+	}
+
+	/**
+	 * <b>반대 방향도 같은 판정이다.</b> 키워드를 조용히 무시하면 사용자는 검색이 걸린 줄 알고
+	 * 전체 목록을 받는다 (§4.1, sp-docs/AGENTS.md 불변식 9). {@code fieldErrors} 도 위와 같이
+	 * 빈 배열이다.
+	 */
+	@Test
+	@DisplayName("keyword 만 전달하면 400 C001 이다 — 조용히 무시하지 않는다")
+	void keyword_만_전달하면_400_C001() throws Exception {
+		this.mockMvc.perform(get(PATH).param("keyword", "공지"))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("C001"))
+				.andExpect(jsonPath("$.error.fieldErrors", hasSize(0)));
+	}
+
+	/** 공백만인 키워드는 "없음" 이므로 {@code searchType} 만 온 것과 같다 (§4.1). */
+	@Test
+	@DisplayName("공백만인 keyword 를 searchType 과 함께 보내면 400 C001 이다")
+	void 공백_keyword_와_searchType_은_400_C001() throws Exception {
+		this.mockMvc.perform(get(PATH)
+						.param("searchType", "TITLE")
+						.param("keyword", "   "))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("C001"));
+	}
+
+	/**
+	 * <b>정규화가 조합 검증보다 먼저라는 것을 이 테스트가 핀한다</b> (§4.1). 순서가 뒤집히면
+	 * 공백만인 키워드가 "한쪽만 온 것" 으로 걸려 400 이 된다.
+	 */
+	@Test
+	@DisplayName("공백만인 keyword 단독은 200 전체 목록이다")
+	void 공백_keyword_단독은_200() throws Exception {
+		savedPost(626L, "공백키워드작성자", "공백 키워드 대상", "본문");
+
+		this.mockMvc.perform(get(PATH).param("keyword", "   "))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.success").value(true))
+				.andExpect(jsonPath("$.data.content").isArray());
+	}
+
 	// --- 헬퍼 ---
 
 	private void assertCreateFails(
@@ -432,6 +675,11 @@ class PostControllerTest {
 	private static Set<String> dataKeys(MvcResult result) throws Exception {
 		Map<String, Object> data = JsonPath.read(bodyOf(result), "$.data");
 		return data.keySet();
+	}
+
+	private static Set<String> firstItemKeys(MvcResult result) throws Exception {
+		Map<String, Object> item = JsonPath.read(bodyOf(result), "$.data.content[0]");
+		return item.keySet();
 	}
 
 	private static long dataId(MvcResult result) throws Exception {
