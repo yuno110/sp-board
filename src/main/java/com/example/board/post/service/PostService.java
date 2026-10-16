@@ -1,11 +1,16 @@
 package com.example.board.post.service;
 
 import com.example.board.client.MemberClient;
+import com.example.board.comment.repository.CommentRepository;
 import com.example.board.global.common.PageResponse;
+import com.example.board.global.error.BusinessException;
+import com.example.board.global.error.ErrorCode;
+import com.example.board.global.security.LoginMember;
 import com.example.board.post.dto.PostCreateRequest;
 import com.example.board.post.dto.PostDetailResponse;
 import com.example.board.post.dto.PostResponse;
 import com.example.board.post.dto.PostSearchCondition;
+import com.example.board.post.dto.PostUpdateRequest;
 import com.example.board.post.entity.Post;
 import com.example.board.post.repository.PostQueryRepository;
 import com.example.board.post.repository.PostRepository;
@@ -16,13 +21,24 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * 게시글 쓰기·조회. 정본: sp-docs/requirements/board.md §1 (P-01 ~ P-05) §3 §3.0 §6,
- * sp-docs/api-contract.md §4 §4.1 §4.2 §4.3 §5.1.
+ * 게시글 쓰기·조회. 정본: sp-docs/requirements/board.md §1 (P-01 ~ P-07) §3 §3.0 §5 §6 §7,
+ * sp-docs/api-contract.md §4 §4.1 §4.2 §4.3 §5.1, sp-docs/security.md §5.
  *
  * <p>트랜잭션 경계는 서비스에 둔다 (sp-docs/conventions.md §5).
+ *
+ * <p><b>소유자 검증도 여기다</b> (sp-docs/security.md §5.1,
+ * sp-docs/requirements/board.md §5 규칙 5). Controller 나 Security 설정에 두지 않는다 —
+ * 리소스를 조회해야 판정할 수 있다.
  */
 @Service
 public class PostService {
+
+	/**
+	 * sp-docs/api-contract.md §6 이 정한 {@code role} claim 의 값이다 ({@code USER} |
+	 * {@code ADMIN}). <b>권한 판정은 이 Claim 만으로 한다</b> — 권한을 다른 서비스에 되묻지
+	 * 않는다 (sp-docs/requirements/board.md §7).
+	 */
+	private static final String ROLE_ADMIN = "ADMIN";
 
 	private final PostRepository postRepository;
 
@@ -31,6 +47,13 @@ public class PostService {
 	private final PostReader postReader;
 
 	private final MemberClient memberClient;
+
+	/**
+	 * 게시글 삭제 시 하위 댓글을 함께 논리 삭제한다 (sp-docs/requirements/board.md §5 규칙 3).
+	 * {@code softDeleteByPostId} 는 B-03 산출물이다 — B-08 을 기다리지 않는다
+	 * (sp-docs/plan/phase1.md §2.5).
+	 */
+	private final CommentRepository commentRepository;
 
 	/**
 	 * 작성의 DB 트랜잭션. <b>{@code @Transactional} 로 메서드 전체를 감쌀 수 없어서</b> 템플릿을
@@ -44,12 +67,14 @@ public class PostService {
 			PostQueryRepository postQueryRepository,
 			PostReader postReader,
 			MemberClient memberClient,
+			CommentRepository commentRepository,
 			PlatformTransactionManager transactionManager) {
 
 		this.postRepository = postRepository;
 		this.postQueryRepository = postQueryRepository;
 		this.postReader = postReader;
 		this.memberClient = memberClient;
+		this.commentRepository = commentRepository;
 		this.insertTransaction = new TransactionTemplate(transactionManager);
 	}
 
@@ -130,6 +155,99 @@ public class PostService {
 	@Transactional(readOnly = true)
 	public PageResponse<PostResponse> getList(PostSearchCondition condition) {
 		return PageResponse.of(this.postQueryRepository.search(condition).map(PostResponse::from));
+	}
+
+	/**
+	 * 게시글 수정 (P-06). <b>작성자 본인만 할 수 있다</b> — ADMIN 도 못 한다
+	 * (sp-docs/security.md §5.2, sp-docs/requirements/board.md §5 규칙 6).
+	 *
+	 * <p><b>{@code MemberClient} 를 호출하지 않는다.</b> 수정 시 작성자 스냅샷을 갱신하지
+	 * 않으므로 닉네임을 다시 얻을 이유가 없다 (sp-docs/requirements/board.md §3 규칙 7,
+	 * sp-docs/api-contract.md §4.2). 활성 프로필도 요구하지 않는다 — 생성에만 필요하다
+	 * (§5 규칙 8). 그래서 member 장애가 수정을 막지 않는다.
+	 *
+	 * <p>응답은 <b>상세와 같은 모양</b>이다 (sp-docs/api-contract.md §4.3). 모양은 둘뿐이고
+	 * 쓰기 응답이 세 번째를 만들지 않는다.
+	 *
+	 * <p>없는 id·삭제된 게시글은 {@link PostReader} 가 404 {@code P001} 로 만든다 —
+	 * <b>조회가 권한 판정보다 먼저다</b> (sp-docs/api-contract.md §4.4). 타인의 삭제된 글도
+	 * {@code P001} 이고 {@code P002} 가 아니다. 정보 노출이 아니다: 상세 조회가 비로그인에
+	 * 열려 있어 존재 여부는 이미 공개 정보이고 (§4.2), 403 을 먼저 내보내면 공개 조회와
+	 * 어긋난 두 답이 나간다. <b>비공개 자원이라면 반대가 맞다</b> — 1차의 board 에는 그런
+	 * 자원이 없다 (§4.4).
+	 */
+	@Transactional
+	public PostDetailResponse update(Long id, LoginMember loginMember, PostUpdateRequest request) {
+		Post post = this.postReader.getActiveById(id);
+		validateWriter(post, loginMember);
+
+		post.update(request.title(), request.content());
+
+		return PostDetailResponse.from(post);
+	}
+
+	/**
+	 * 게시글 삭제 (P-07). <b>작성자 본인과 ADMIN 이 할 수 있다</b>
+	 * (sp-docs/security.md §5.2). Soft Delete 이므로 행이 남는다.
+	 *
+	 * <p><b>하위 댓글도 함께 {@code deleted = true} 가 된다</b>
+	 * (sp-docs/requirements/board.md §5 규칙 3). {@code comment_count} 는 그대로 둔다
+	 * (sp-docs/domain-model.md §5 의 표 셋째 줄).
+	 *
+	 * <p><b>그 두 효과가 한 로컬 트랜잭션이다</b> (sp-docs/domain-model.md §5). 따로 커밋되면
+	 * 둘 중 하나만 반영된 상태가 남는다 — 게시글은 사라졌는데 댓글이 살아 있거나, 댓글만
+	 * 지워지고 게시글이 목록에 남는다. 경계는 이 메서드의 {@code @Transactional} 하나이고,
+	 * <b>연산마다 자기 트랜잭션을 열지 않는다</b> — 그 변이는 행위 단언으로 잡히지 않으므로
+	 * {@code PostServiceTest} 가 커밋 횟수를 직접 센다
+	 * (sp-docs/process/review-policy.md §4.1).
+	 *
+	 * <p>{@code post.deleted} 를 먼저 세우고 댓글을 지운다. {@code softDeleteByPostId} 의
+	 * {@code flushAutomatically} 가 그 변경을 같은 트랜잭션 안에서 내보낸다.
+	 *
+	 * <p><b>{@code MemberClient} 를 호출하지 않는다</b> (sp-docs/api-contract.md §4.2).
+	 * {@link #update} 와 같은 이유다.
+	 *
+	 * <p><b>조회가 권한 판정보다 먼저인 것도 {@link #update} 와 같다</b> — §4.4 는 수정과
+	 * 삭제를 함께 못박는다. 타인의 삭제된 글은 404 {@code P001} 이고 403 {@code P002} 가
+	 * 아니며, <b>조용한 204 도 아니다.</b>
+	 */
+	@Transactional
+	public void delete(Long id, LoginMember loginMember) {
+		Post post = this.postReader.getActiveById(id);
+		validateWriterOrAdmin(post, loginMember);
+
+		post.softDelete();
+		this.commentRepository.softDeleteByPostId(id);
+	}
+
+	/**
+	 * 수정의 권한 판정. <b>작성자 본인뿐이다.</b>
+	 *
+	 * <p><b>{@link #validateWriterOrAdmin} 와 한 메서드로 합치지 않는다.</b> 수정과 삭제의
+	 * 권한이 다르다 — ADMIN 은 삭제만 할 수 있다 (sp-docs/security.md §5.2,
+	 * sp-docs/requirements/board.md §5 규칙 6). 타인 글의 내용 변조를 막기 위한 것이고,
+	 * 부적절 게시물은 삭제로만 처리한다. 한쪽에 플래그를 받는 메서드로 합치면 호출처가 그
+	 * 플래그를 잘못 넘기는 순간 ADMIN 이 타인 글을 고칠 수 있게 된다.
+	 */
+	private static void validateWriter(Post post, LoginMember loginMember) {
+		if (!post.getWriterId().equals(loginMember.accountId())) {
+			throw new BusinessException(ErrorCode.POST_FORBIDDEN);
+		}
+	}
+
+	/**
+	 * 삭제의 권한 판정. <b>작성자 본인 또는 ADMIN 이다</b> (sp-docs/security.md §5.2).
+	 *
+	 * <p>판정은 검증된 JWT 의 {@code sub}·{@code role} 만으로 한다 — 권한을 다른 서비스에
+	 * 되묻지 않는다 (sp-docs/requirements/board.md §7). 오프라인 검증이므로 권한 박탈이 기존
+	 * 토큰에 즉시 반영되지 않고, ADMIN 토큰의 잔여 권한에는 타인 글 삭제가 포함된다
+	 * (sp-docs/security.md §5.3) — 1차가 비용으로 수용한 것이다.
+	 */
+	private static void validateWriterOrAdmin(Post post, LoginMember loginMember) {
+		if (ROLE_ADMIN.equals(loginMember.role())) {
+			return;
+		}
+		validateWriter(post, loginMember);
 	}
 
 }

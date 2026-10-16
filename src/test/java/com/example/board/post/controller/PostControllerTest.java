@@ -3,8 +3,11 @@ package com.example.board.post.controller;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.nullValue;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -63,10 +66,10 @@ import org.springframework.test.web.servlet.MvcResult;
  * ({@code {"success": true, "data": {"members": [...]}, "error": null}}) — 배열이 최상위가
  * 아니다.
  *
- * <p>픽스처의 {@code writerId} 는 작성·상세(B-05)가 521~539, 목록·검색(B-06)이 621~639 를
- * 쓴다. 이미 쓰이는 대역(201~210, 301~317, 401~402, {@code PostServiceTest} 의 501~519,
- * {@code PostQueryRepositoryTest} 의 601~619)과 겹치지 않게 둔다
- * (sp-docs/tech-stack.md §5.3 — 같은 JVM 의 모든 테스트가 한 H2 DB 를 본다).
+ * <p>픽스처의 {@code writerId} 는 작성·상세(B-05)가 521~539, 목록·검색(B-06)이 621~639,
+ * 수정·삭제(B-07)가 741~759 를 쓴다. 이미 쓰이는 대역(201~210, 301~317, 401~402,
+ * {@code PostServiceTest} 의 501~519·701~719, {@code PostQueryRepositoryTest} 의 601~619)과
+ * 겹치지 않게 둔다 (sp-docs/tech-stack.md §5.3 — 같은 JVM 의 모든 테스트가 한 H2 DB 를 본다).
  *
  * <p><b>목록 쪽 단언은 검색 조건으로 범위를 좁힌다.</b> 이 클래스는 롤백에 기대지 않고 커밋하므로
  * 테이블 전체를 세는 단언은 다른 클래스의 픽스처에 흔들린다. 전체 건수를 보는 것은 롤백되는
@@ -83,6 +86,8 @@ class PostControllerTest {
 
 	/** sp-docs/api-contract.md §6 의 {@code role} claim 값. */
 	private static final String ROLE = "USER";
+
+	private static final String ROLE_ADMIN = "ADMIN";
 
 	/** member 의 내부 API 가 돌려주는 닉네임. 스냅샷의 유일한 출처다. */
 	private static final String MEMBER_NICKNAME = "member가준닉네임";
@@ -146,6 +151,7 @@ class PostControllerTest {
 	void 픽스처_정리() {
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 521 AND 539");
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 621 AND 639");
+		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 741 AND 759");
 	}
 
 	// --- 작성 (P-01, sp-docs/api-contract.md §4) ---
@@ -618,6 +624,208 @@ class PostControllerTest {
 				.andExpect(jsonPath("$.data.content").isArray());
 	}
 
+	// --- 수정 (P-06, sp-docs/api-contract.md §4 §4.3, sp-docs/security.md §5.2) ---
+
+	/**
+	 * 검증표 "본인 글 수정 → 200, 반영됨". <b>응답은 상세와 같은 모양이다</b> — 쓰기 응답이
+	 * 세 번째 모양을 만들지 않는다 (sp-docs/api-contract.md §4.3). 저장된 값은
+	 * {@code PostServiceTest} 도 본다.
+	 */
+	@Test
+	@DisplayName("본인 글 수정은 200 이고 상세 모양(여덟 키)을 돌려준다")
+	void 본인_글_수정은_200() throws Exception {
+		Post post = savedPost(741L, "작성자닉네임", "원래 제목", "원래 본문");
+
+		MvcResult result = this.mockMvc.perform(put(PATH + "/" + post.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(741L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("바뀐 제목", "바뀐 본문")))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.success").value(true))
+				.andExpect(jsonPath("$.error").value(nullValue()))
+				.andExpect(jsonPath("$.data.id").value(post.getId()))
+				.andExpect(jsonPath("$.data.title").value("바뀐 제목"))
+				.andExpect(jsonPath("$.data.content").value("바뀐 본문"))
+				.andExpect(jsonPath("$.data.writerId").value(741L))
+				.andExpect(jsonPath("$.data.writerNickname").value("작성자닉네임"))
+				.andReturn();
+
+		assertThat(dataKeys(result))
+				.as("수정 응답은 상세와 같은 모양이다 (sp-docs/api-contract.md §4.3)")
+				.isEqualTo(DETAIL_KEYS);
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getTitle())
+				.isEqualTo("바뀐 제목");
+	}
+
+	/** 검증표 "타인 글 수정 → 403 {@code P002}". */
+	@Test
+	@DisplayName("타인 글 수정은 403 P002 다")
+	void 타인_글_수정은_403_P002() throws Exception {
+		Post post = savedPost(742L, "작성자닉네임", "원래 제목", "원래 본문");
+
+		this.mockMvc.perform(put(PATH + "/" + post.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(743L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("탈취 제목", "탈취 본문")))
+				.andExpect(status().isForbidden())
+				.andExpect(jsonPath("$.error.code").value("P002"));
+
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getTitle())
+				.isEqualTo("원래 제목");
+	}
+
+	/**
+	 * 검증표 "ADMIN 이 타인 글 수정 → 403 {@code P002}". <b>삭제는 할 수 있다</b> —
+	 * {@link #ADMIN_이_타인_글_삭제는_204()} 와 쌍으로 두 경로의 권한이 다른 것을 고정한다
+	 * (sp-docs/security.md §5.2).
+	 */
+	@Test
+	@DisplayName("ADMIN 이 타인 글을 수정하면 403 P002 다")
+	void ADMIN_이_타인_글_수정은_403_P002() throws Exception {
+		Post post = savedPost(744L, "작성자닉네임", "원래 제목", "원래 본문");
+
+		this.mockMvc.perform(put(PATH + "/" + post.getId())
+						.header(HttpHeaders.AUTHORIZATION, adminBearer(745L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("관리자 수정", "관리자 본문")))
+				.andExpect(status().isForbidden())
+				.andExpect(jsonPath("$.error.code").value("P002"));
+
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getTitle())
+				.isEqualTo("원래 제목");
+	}
+
+	/** 검증표 "없는 글 수정 → 404 {@code P001}". */
+	@Test
+	@DisplayName("없는 글 수정은 404 P001 이다")
+	void 없는_글_수정은_404_P001() throws Exception {
+		this.mockMvc.perform(put(PATH + "/987654324")
+						.header(HttpHeaders.AUTHORIZATION, bearer(746L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("제목", "본문")))
+				.andExpect(status().isNotFound())
+				.andExpect(jsonPath("$.error.code").value("P001"));
+	}
+
+	/**
+	 * 검증표 "토큰 없이 수정 → 401 {@code A001}". {@code SecurityConfig} 가
+	 * {@code PUT /posts/{id}} 를 {@code authenticated} 로 선언한 것이 집행 지점이다
+	 * (sp-docs/api-contract.md §4).
+	 */
+	@Test
+	@DisplayName("토큰 없이 수정하면 401 A001 이고 내용이 바뀌지 않는다")
+	void 토큰_없이_수정하면_401_A001() throws Exception {
+		Post post = savedPost(747L, "작성자닉네임", "원래 제목", "원래 본문");
+
+		this.mockMvc.perform(put(PATH + "/" + post.getId())
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("무토큰 제목", "무토큰 본문")))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("A001"));
+
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getTitle())
+				.isEqualTo("원래 제목");
+	}
+
+	/**
+	 * 검증표에 없는 회귀 테스트다 — <b>{@code @Valid} 가 수정 핸들러에도 걸려 있는지</b>를 본다.
+	 * {@link com.example.board.post.dto.PostUpdateRequest} 가 §4 의 제약을 작성과 같은 값으로
+	 * 쓰므로 (sp-docs/requirements/board.md §4), 애노테이션이 빠지면 201자 제목이 저장된다 —
+	 * 컬럼 폭이 200 이라 거기서 500 이 된다.
+	 */
+	@Test
+	@DisplayName("제목 201자로 수정하면 400 C001 이고 내용이 바뀌지 않는다")
+	void 입력_검증_위반_수정은_400_C001() throws Exception {
+		Post post = savedPost(748L, "작성자닉네임", "원래 제목", "원래 본문");
+
+		this.mockMvc.perform(put(PATH + "/" + post.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(748L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("가".repeat(201), "본문")))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("C001"));
+
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getTitle())
+				.isEqualTo("원래 제목");
+	}
+
+	// --- 삭제 (P-07, sp-docs/api-contract.md §4) ---
+
+	/**
+	 * 검증표 "본인 글 삭제 → 204, {@code deleted = true}, 행 존재". <b>본문이 없다</b>
+	 * (sp-docs/api-contract.md §4).
+	 */
+	@Test
+	@DisplayName("본인 글 삭제는 204 이고 행이 deleted = true 로 남는다")
+	void 본인_글_삭제는_204() throws Exception {
+		Post post = savedPost(749L, "작성자닉네임", "삭제될 글", "본문");
+
+		this.mockMvc.perform(delete(PATH + "/" + post.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(749L)))
+				.andExpect(status().isNoContent())
+				.andExpect(content().string(""));
+
+		assertThat(this.postRepository.findById(post.getId()))
+				.as("Soft Delete 다 — 행이 남는다")
+				.isPresent()
+				.get()
+				.extracting(Post::isDeleted)
+				.isEqualTo(true);
+	}
+
+	/** 검증표 "ADMIN 이 타인 글 삭제 → 204". 수정과 달리 허용된다 (sp-docs/security.md §5.2). */
+	@Test
+	@DisplayName("ADMIN 이 타인 글을 삭제하면 204 다")
+	void ADMIN_이_타인_글_삭제는_204() throws Exception {
+		Post post = savedPost(750L, "작성자닉네임", "관리자가 지울 글", "본문");
+
+		this.mockMvc.perform(delete(PATH + "/" + post.getId())
+						.header(HttpHeaders.AUTHORIZATION, adminBearer(751L)))
+				.andExpect(status().isNoContent());
+
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().isDeleted()).isTrue();
+	}
+
+	/** 검증표 "타인(일반)이 삭제 → 403 {@code P002}". */
+	@Test
+	@DisplayName("타인(일반 USER)이 삭제하면 403 P002 이고 글이 남는다")
+	void 타인_일반_사용자의_삭제는_403_P002() throws Exception {
+		Post post = savedPost(752L, "작성자닉네임", "남의 글", "본문");
+
+		this.mockMvc.perform(delete(PATH + "/" + post.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(753L)))
+				.andExpect(status().isForbidden())
+				.andExpect(jsonPath("$.error.code").value("P002"));
+
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().isDeleted()).isFalse();
+	}
+
+	/**
+	 * <b>수정·삭제 경로는 member 를 호출하지 않는다</b> (sp-docs/api-contract.md §4.2).
+	 * 스텁이 받은 요청 수가 0 인 것으로 관측한다 — 이 클래스는 실제 {@code MemberClient} 를
+	 * 쓰므로 호출이 있으면 스텁에 닿는다. 수정 시 스냅샷을 갱신하지 않는 것에서 따라오고,
+	 * 그래서 <b>member 장애 중에도 수정·삭제가 된다.</b>
+	 */
+	@Test
+	@DisplayName("수정·삭제는 member 호출이 0회다")
+	void 수정과_삭제는_member_호출이_없다() throws Exception {
+		Post post = savedPost(754L, "작성자닉네임", "원래 제목", "원래 본문");
+
+		this.mockMvc.perform(put(PATH + "/" + post.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(754L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("바뀐 제목", "바뀐 본문")))
+				.andExpect(status().isOk());
+		this.mockMvc.perform(delete(PATH + "/" + post.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(754L)))
+				.andExpect(status().isNoContent());
+
+		assertThat(REQUEST_COUNT.get())
+				.as("수정·삭제에는 활성 프로필이 필요하지 않다 "
+						+ "(sp-docs/api-contract.md §4.2, sp-docs/requirements/board.md §5 규칙 8)")
+				.isZero();
+	}
+
 	// --- 헬퍼 ---
 
 	private void assertCreateFails(
@@ -649,6 +857,14 @@ class PostControllerTest {
 
 	private static String bearer(long accountId) {
 		return "Bearer " + TestTokenFactory.accessToken(accountId, ROLE);
+	}
+
+	/**
+	 * {@code role = ADMIN} 토큰 (sp-docs/api-contract.md §6). ADMIN 은 <b>삭제만</b> 할 수
+	 * 있으므로 수정·삭제 두 쪽에서 쓰인다 (sp-docs/security.md §5.2).
+	 */
+	private static String adminBearer(long accountId) {
+		return "Bearer " + TestTokenFactory.accessToken(accountId, ROLE_ADMIN);
 	}
 
 	private Post savedPost(long writerId, String nickname, String title, String content) {

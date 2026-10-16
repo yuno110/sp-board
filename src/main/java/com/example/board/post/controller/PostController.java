@@ -9,15 +9,18 @@ import com.example.board.post.dto.PostDetailResponse;
 import com.example.board.post.dto.PostResponse;
 import com.example.board.post.dto.PostSearchCondition;
 import com.example.board.post.dto.PostSortType;
+import com.example.board.post.dto.PostUpdateRequest;
 import com.example.board.post.dto.SearchType;
 import com.example.board.post.service.PostService;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Min;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
+import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
@@ -105,6 +108,45 @@ public class PostController {
 	@GetMapping("/{id}")
 	public ApiResponse<PostDetailResponse> getDetail(@PathVariable Long id) {
 		return ApiResponse.success(this.postService.getDetail(id));
+	}
+
+	/**
+	 * 게시글 수정 (P-06). <b>200</b> 이고 응답은 <b>상세와 같은 모양</b>이다
+	 * (sp-docs/api-contract.md §4 §4.3).
+	 *
+	 * <p><b>소유자 검증을 여기서 하지 않는다.</b> {@code PostService} 가 한다 —
+	 * 리소스를 조회해야 판정할 수 있으므로 Controller 나 {@code @PreAuthorize} 에 둘 수 없다
+	 * (sp-docs/security.md §5.1). 이 경로에 인증이 필요한 것까지가 {@code SecurityConfig} 의
+	 * 몫이고, "본인 글인가" 는 서비스의 몫이다. <b>ADMIN 도 수정할 수 없다</b> (§5.2) — 그
+	 * 판정도 서비스에 있다.
+	 *
+	 * <p>{@code loginMember} 는 {@code @CurrentMember} 가 검증된 JWT 에서 꺼낸 것이다. 수정
+	 * 대상의 작성자와 비교할 값이므로 요청 본문·경로에서 받지 않는다
+	 * (sp-docs/requirements/board.md §3 규칙 1).
+	 */
+	@PutMapping("/{id}")
+	public ApiResponse<PostDetailResponse> update(
+			@PathVariable Long id,
+			@CurrentMember LoginMember loginMember,
+			@Valid @RequestBody PostUpdateRequest request) {
+
+		return ApiResponse.success(this.postService.update(id, loginMember, request));
+	}
+
+	/**
+	 * 게시글 삭제 (P-07). <b>204 이고 본문이 없다</b> (sp-docs/api-contract.md §4).
+	 *
+	 * <p><b>작성자 본인과 ADMIN 이 삭제할 수 있다</b> (sp-docs/security.md §5.2) — 수정과
+	 * 권한이 다르다. 그 판정은 {@code PostService} 가 하고 여기서 복제하지 않는다 (§5.1).
+	 *
+	 * <p>Soft Delete 이고 하위 댓글도 함께 논리 삭제된다
+	 * (sp-docs/requirements/board.md §5 규칙 3). 그 둘이 한 트랜잭션인 것은 서비스의 경계가
+	 * 보장한다 (sp-docs/domain-model.md §5).
+	 */
+	@DeleteMapping("/{id}")
+	@ResponseStatus(HttpStatus.NO_CONTENT)
+	public void delete(@PathVariable Long id, @CurrentMember LoginMember loginMember) {
+		this.postService.delete(id, loginMember);
 	}
 
 }

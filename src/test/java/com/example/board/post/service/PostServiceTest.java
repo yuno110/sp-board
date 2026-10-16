@@ -2,6 +2,7 @@ package com.example.board.post.service;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.willAnswer;
@@ -11,26 +12,37 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 
 import com.example.board.client.MemberClient;
+import com.example.board.comment.entity.Comment;
+import com.example.board.comment.repository.CommentRepository;
 import com.example.board.global.error.BusinessException;
 import com.example.board.global.error.ErrorCode;
+import com.example.board.global.security.LoginMember;
 import com.example.board.post.dto.PostCreateRequest;
 import com.example.board.post.dto.PostDetailResponse;
 import com.example.board.post.dto.PostResponse;
+import com.example.board.post.dto.PostUpdateRequest;
 import com.example.board.post.entity.Post;
 import com.example.board.post.repository.PostRepository;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
@@ -51,10 +63,12 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * <p>리포지터리는 스텁으로 바꾸지 않고 H2 를 그대로 쓴다. "글이 저장되지 않는다" 와 "조회수가
  * 1 증가한다" 는 저장된 행을 봐야 확인된다.
  *
- * <p>픽스처의 {@code writerId} 는 501~519 를 쓴다. 같은 JVM 의 모든 테스트가 하나의 H2 DB 를
- * 보므로 (sp-docs/tech-stack.md §5.3) 이미 쓰이는 대역(201~210, 301~317, 401~402,
- * {@code PostControllerTest} 의 521~539)과 겹치지 않게 둔다. 이 클래스는 트랜잭션 롤백에
+ * <p>픽스처의 {@code writerId} 는 작성·조회(B-05)가 501~519, 수정·삭제(B-07)가 701~729 를
+ * 쓴다. 같은 JVM 의 모든 테스트가 하나의 H2 DB 를 보므로 (sp-docs/tech-stack.md §5.3) 이미
+ * 쓰이는 대역(201~210, 301~317, 401~402, {@code PostControllerTest} 의 521~539·741~759,
+ * {@code PostQueryRepositoryTest} 의 601~619)과 겹치지 않게 둔다. 이 클래스는 트랜잭션 롤백에
  * 기대지 않고 — 작성 경로가 스스로 커밋한다 — {@code @AfterEach} 가 자기 대역을 지운다.
+ * <b>테이블 전체를 지우지 않는다</b> — 다른 클래스의 픽스처를 없애면 그쪽이 간헐 실패한다.
  */
 @SpringBootTest
 @ActiveProfiles("test")
@@ -65,11 +79,19 @@ class PostServiceTest {
 	/** member 의 내부 API 가 돌려주는 닉네임. 스냅샷에 저장될 유일한 출처다 (§3 규칙 2). */
 	private static final String MEMBER_NICKNAME = "member가준닉네임";
 
+	/** sp-docs/api-contract.md §6 의 {@code role} claim 값. */
+	private static final String ROLE_USER = "USER";
+
+	private static final String ROLE_ADMIN = "ADMIN";
+
 	@Autowired
 	private PostService postService;
 
 	@Autowired
 	private PostRepository postRepository;
+
+	@Autowired
+	private CommentRepository commentRepository;
 
 	@Autowired
 	private JdbcTemplate jdbcTemplate;
@@ -82,7 +104,11 @@ class PostServiceTest {
 
 	@AfterEach
 	void 픽스처_정리() {
+		// comment.post_id 에 FK 가 있으므로 (fk_comment_post_id) 댓글을 먼저 지운다
+		this.jdbcTemplate.update("DELETE FROM comment WHERE post_id IN "
+				+ "(SELECT id FROM post WHERE writer_id BETWEEN 701 AND 729)");
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 501 AND 519");
+		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 701 AND 729");
 	}
 
 	// --- 작성 (P-01, sp-docs/requirements/board.md §3) ---
@@ -329,6 +355,526 @@ class PostServiceTest {
 				"viewCount", "commentCount", "createdAt"));
 	}
 
+	// --- 수정 (P-06, sp-docs/security.md §5.2) ---
+
+	/**
+	 * B-07 검증표 "본인 글 수정 → 200, 반영됨" 중 <b>반영됨</b> 쪽이다. HTTP 상태와 응답
+	 * 모양은 {@code PostControllerTest} 가 본다.
+	 */
+	@Test
+	@DisplayName("본인 글 수정이면 제목·내용이 바뀐다")
+	void 본인_글_수정이_반영된다() {
+		Post post = savedPost(701L, "작성자닉네임", "원래 제목", "원래 본문");
+
+		PostDetailResponse updated = this.postService.update(
+				post.getId(), user(701L), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+
+		assertThat(updated.title()).isEqualTo("바뀐 제목");
+		assertThat(updated.content()).isEqualTo("바뀐 본문");
+
+		Post saved = this.postRepository.findById(post.getId()).orElseThrow();
+		assertThat(saved.getTitle()).isEqualTo("바뀐 제목");
+		assertThat(saved.getContent()).isEqualTo("바뀐 본문");
+	}
+
+	/**
+	 * 검증표 "수정 후 {@code writer_id} → 변경 없음". <b>{@link #수정_후_닉네임은_그대로다()} 와
+	 * 한 테스트로 합치지 않는다</b> — 검증표가 두 행으로 적었고, 둘은 취득 경로가 다른 값이다
+	 * ({@code writer_id} 는 JWT Claim, {@code writer_nickname} 은 member 의 내부 API —
+	 * sp-docs/requirements/board.md §3 규칙 1·2).
+	 *
+	 * <p><b>"반영됨" 을 함께 단언한다.</b> {@code update} 가 아무것도 하지 않는 변이에서도
+	 * {@code writer_id} 는 그대로이므로, 수정이 실제로 일어났는지를 보지 않으면 이 단언이 그
+	 * 변이를 통과시킨다.
+	 */
+	@Test
+	@DisplayName("수정해도 writer_id 는 그대로다")
+	void 수정_후_writer_id_는_그대로다() {
+		Post post = savedPost(702L, "작성자닉네임", "원래 제목", "원래 본문");
+
+		this.postService.update(
+				post.getId(), user(702L), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+
+		Post saved = this.postRepository.findById(post.getId()).orElseThrow();
+		assertThat(saved.getTitle())
+				.as("수정이 일어나지 않았다면 아래 단언은 아무것도 보지 못한다")
+				.isEqualTo("바뀐 제목");
+		assertThat(saved.getWriterId())
+				.as("수정 시 작성자 스냅샷을 갱신하지 않는다 "
+						+ "(sp-docs/requirements/board.md §3 규칙 7)")
+				.isEqualTo(702L);
+	}
+
+	/** 검증표 "수정 후 {@code writer_nickname} → 변경 없음". 위와 별개의 행이다. */
+	@Test
+	@DisplayName("수정해도 writer_nickname 은 그대로다")
+	void 수정_후_닉네임은_그대로다() {
+		Post post = savedPost(703L, "작성당시닉네임", "원래 제목", "원래 본문");
+
+		this.postService.update(
+				post.getId(), user(703L), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+
+		Post saved = this.postRepository.findById(post.getId()).orElseThrow();
+		assertThat(saved.getContent())
+				.as("수정이 일어나지 않았다면 아래 단언은 아무것도 보지 못한다")
+				.isEqualTo("바뀐 본문");
+		assertThat(saved.getWriterNickname())
+				.as("닉네임 변경이 과거 글에 반영되지 않는 것은 의도된 동작이다 (sp-docs/adr/0003)")
+				.isEqualTo("작성당시닉네임");
+	}
+
+	/**
+	 * 검증표 "타인 글 수정 → 403 {@code P002}". <b>이 테스트가 소유자 검증의 위치를 고정한다</b>
+	 * — 서비스를 직접 불러 {@code P002} 가 나오므로 판정이 Controller 나 Security 설정이 아니라
+	 * Service 계층에 있다 (sp-docs/security.md §5.1,
+	 * sp-docs/requirements/board.md §5 규칙 5).
+	 */
+	@Test
+	@DisplayName("타인 글 수정은 P002 이고 내용이 바뀌지 않는다")
+	void 타인_글_수정은_P002() {
+		Post post = savedPost(704L, "작성자닉네임", "원래 제목", "원래 본문");
+
+		assertThatThrownBy(() -> this.postService.update(
+				post.getId(), user(705L), new PostUpdateRequest("탈취 제목", "탈취 본문")))
+				.isInstanceOf(BusinessException.class)
+				.extracting(e -> ((BusinessException) e).getErrorCode())
+				.isEqualTo(ErrorCode.POST_FORBIDDEN);
+
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getTitle())
+				.isEqualTo("원래 제목");
+	}
+
+	/**
+	 * 검증표 "ADMIN 이 타인 글 수정 → 403 {@code P002}". <b>삭제와 권한이 다르다</b> — ADMIN 은
+	 * 삭제만 할 수 있다 (sp-docs/security.md §5.2,
+	 * sp-docs/requirements/board.md §5 규칙 6). 타인 글의 내용 변조를 막기 위한 것이고,
+	 * 부적절 게시물은 삭제(블라인드)로만 처리한다.
+	 */
+	@Test
+	@DisplayName("ADMIN 도 타인 글을 수정할 수 없다 — P002")
+	void ADMIN_도_타인_글을_수정할_수_없다() {
+		Post post = savedPost(706L, "작성자닉네임", "원래 제목", "원래 본문");
+
+		assertThatThrownBy(() -> this.postService.update(
+				post.getId(), admin(707L), new PostUpdateRequest("관리자 수정", "관리자 본문")))
+				.isInstanceOf(BusinessException.class)
+				.extracting(e -> ((BusinessException) e).getErrorCode())
+				.isEqualTo(ErrorCode.POST_FORBIDDEN);
+
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getTitle())
+				.isEqualTo("원래 제목");
+	}
+
+	/** 검증표 "없는 글 수정 → 404 {@code P001}". 판정은 {@code PostReader} 가 한다. */
+	@Test
+	@DisplayName("없는 글 수정은 P001 이다")
+	void 없는_글_수정은_P001() {
+		assertThatThrownBy(() -> this.postService.update(
+				987654323L, user(708L), new PostUpdateRequest("제목", "본문")))
+				.isInstanceOf(BusinessException.class)
+				.extracting(e -> ((BusinessException) e).getErrorCode())
+				.isEqualTo(ErrorCode.POST_NOT_FOUND);
+	}
+
+	/**
+	 * 검증표 <b>"타인의 삭제된 글 수정 → 404 {@code P001}. 403 {@code P002} 가 아니다"</b>
+	 * (sp-docs/api-contract.md §4.4). <b>없는 글이 먼저다</b> — 조회를 권한 판정보다 앞에
+	 * 둔다. 삭제 경로는 {@link #타인의_삭제된_글_삭제는_P001()} 이 본다.
+	 *
+	 * <p><b>삭제된 글을 타인이 수정하는 경우로 만든다.</b> 행이 아예 없는 id 로는 선후가
+	 * 관측되지 않는다 — 비교할 {@code writer_id} 가 없으므로 권한 판정을 앞에 둔 구현도 404
+	 * 밖에 낼 수 없다. 행이 남아 있고 보이지만 않는 상태에서만 두 순서가 서로 다른 답을
+	 * 낸다: 조회가 먼저면 404 {@code P001}, 권한이 먼저면 403 {@code P002} 다.
+	 *
+	 * <p><b>{@link #없는_글_수정은_P001()} 과 같은 결함을 보는 것이 아니다.</b> 그쪽은
+	 * "행이 없으면 404" 이고 {@code PostReader} 의 {@code orElseThrow} 를 겨눈다 — 호출자가
+	 * 작성자인지와 무관하게 성립한다. 이쪽은 <b>두 판정의 순서</b>를 겨누고, {@code deleted}
+	 * 판정을 권한 판정 뒤로 옮기는 변이에서만 빨개진다. 그 변이에서 저쪽은 녹색으로 남는
+	 * 것을 실측했다.
+	 *
+	 * <p>{@code ErrorCode.POST_NOT_FOUND} 가 404 와 {@code P001} 을 함께 들고 있고 그 대응은
+	 * {@code ErrorCodeTest} 가 핀하므로, 여기서는 코드만 단언하면 HTTP 답까지 정해진다.
+	 *
+	 * <p><b>정보 노출이 아니다.</b> {@code GET /posts/{id}} 가 비로그인에 열려 있어 존재
+	 * 여부는 이미 공개 정보다 (§4.2 §4.4). 비공개 자원이라면 반대가 맞고, 1차의 board 에는
+	 * 그런 자원이 없다.
+	 */
+	@Test
+	@DisplayName("타인의 삭제된 글을 수정하면 P001 이다 — P002 가 아니다")
+	void 타인의_삭제된_글_수정은_P001() {
+		Post post = savedPost(720L, "작성자닉네임", "삭제된 남의 글", "본문");
+		post.softDelete();
+		this.postRepository.saveAndFlush(post);
+
+		assertThatThrownBy(() -> this.postService.update(
+				post.getId(), user(721L), new PostUpdateRequest("탈취 제목", "탈취 본문")))
+				.isInstanceOf(BusinessException.class)
+				.extracting(e -> ((BusinessException) e).getErrorCode())
+				.as("없는 글이 먼저다 — 조회를 권한 판정보다 앞에 둔다 "
+						+ "(sp-docs/api-contract.md §4.4)")
+				.isEqualTo(ErrorCode.POST_NOT_FOUND);
+	}
+
+	// --- 삭제 (P-07, sp-docs/requirements/board.md §5 규칙 3) ---
+
+	/**
+	 * 검증표 "본인 글 삭제 → 204, {@code deleted = true}, 행 존재". 상태 코드는
+	 * {@code PostControllerTest} 가 보고, 여기서는 <b>Soft Delete 라서 행이 남는 것</b>을 본다
+	 * ({@code Post.softDelete()}).
+	 */
+	@Test
+	@DisplayName("본인 글 삭제는 deleted = true 이고 행이 남는다")
+	void 본인_글_삭제는_soft_delete_다() {
+		Post post = savedPost(709L, "작성자닉네임", "삭제될 글", "본문");
+
+		this.postService.delete(post.getId(), user(709L));
+
+		assertThat(this.postRepository.findById(post.getId()))
+				.as("Soft Delete 다 — 행이 사라지면 \"삭제된 댓글입니다\" 표시의 근거도 사라진다")
+				.isPresent()
+				.get()
+				.extracting(Post::isDeleted)
+				.isEqualTo(true);
+	}
+
+	/** 검증표 "ADMIN 이 타인 글 삭제 → 204". 수정과 달리 허용된다 (sp-docs/security.md §5.2). */
+	@Test
+	@DisplayName("ADMIN 은 타인 글을 삭제할 수 있다")
+	void ADMIN_은_타인_글을_삭제할_수_있다() {
+		Post post = savedPost(710L, "작성자닉네임", "관리자가 지울 글", "본문");
+
+		this.postService.delete(post.getId(), admin(711L));
+
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().isDeleted()).isTrue();
+	}
+
+	/** 검증표 "타인(일반)이 삭제 → 403 {@code P002}". */
+	@Test
+	@DisplayName("타인(일반 USER)의 삭제는 P002 이고 글이 남는다")
+	void 타인_일반_사용자의_삭제는_P002() {
+		Post post = savedPost(712L, "작성자닉네임", "남의 글", "본문");
+
+		assertThatThrownBy(() -> this.postService.delete(post.getId(), user(713L)))
+				.isInstanceOf(BusinessException.class)
+				.extracting(e -> ((BusinessException) e).getErrorCode())
+				.isEqualTo(ErrorCode.POST_FORBIDDEN);
+
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().isDeleted()).isFalse();
+	}
+
+	/**
+	 * 검증표 <b>"타인의 삭제된 글 삭제 → 404 {@code P001}"</b>. §4.4 는 수정과 <b>삭제</b>를
+	 * 함께 못박는다 (sp-docs/api-contract.md §4.4) — {@link #타인의_삭제된_글_수정은_P001()}
+	 * 과 같은 규칙이고 경로만 다르다.
+	 *
+	 * <p><b>이 한 행이 변이 둘을 함께 잡는다</b>(실측). 둘 다 이 테스트가 없으면 199개 전부를
+	 * 통과한다 — B-07 리뷰가 그것을 측정해 검증표에 행을 추가했다.
+	 *
+	 * <table border="1">
+	 * <caption>이 테스트가 잡는 변이 (실측)</caption>
+	 * <tr><th>변이</th><th>관측값</th></tr>
+	 * <tr><td>권한 판정을 {@code deleted} 판정보다 앞으로 (조회를
+	 * {@code findById} 로 바꾸고 삭제 여부를 뒤에서 본다)</td>
+	 * <td>{@code POST_FORBIDDEN} — 403 이 된다</td></tr>
+	 * <tr><td>없는·삭제된 글에 조용히 성공 (예외를 던지지 않고 빠져나간다)</td>
+	 * <td>예외가 아예 나지 않는다 — HTTP 로는 <b>204</b> 다</td></tr>
+	 * </table>
+	 *
+	 * <p><b>호출자를 일반 {@code USER} 로 둔다.</b> ADMIN 이면 순서를 뒤집은 변이에서도 권한
+	 * 판정을 통과해 {@code P001} 이 나오므로 그 변이가 보이지 않는다 — 삭제는 ADMIN 에게
+	 * 열려 있기 때문이다 (sp-docs/security.md §5.2).
+	 *
+	 * <p>수정 쪽과 같은 이유로 <b>삭제된 행</b>을 쓴다. 행이 아예 없는 id 로는 선후가
+	 * 관측되지 않는다 — 비교할 {@code writer_id} 가 없다.
+	 */
+	@Test
+	@DisplayName("타인의 삭제된 글을 삭제하면 P001 이다 — P002 도 아니고 조용한 성공도 아니다")
+	void 타인의_삭제된_글_삭제는_P001() {
+		Post post = savedPost(722L, "작성자닉네임", "삭제된 남의 글", "본문");
+		post.softDelete();
+		this.postRepository.saveAndFlush(post);
+
+		assertThatThrownBy(() -> this.postService.delete(post.getId(), user(723L)))
+				.as("조용히 성공하면 없는 글에 204 가 나간다")
+				.isInstanceOf(BusinessException.class)
+				.extracting(e -> ((BusinessException) e).getErrorCode())
+				.as("없는 글이 먼저다 — 조회를 권한 판정보다 앞에 둔다 "
+						+ "(sp-docs/api-contract.md §4.4)")
+				.isEqualTo(ErrorCode.POST_NOT_FOUND);
+	}
+
+	/**
+	 * 검증표 "게시글 삭제 후 하위 댓글 → 전부 {@code deleted = true}"
+	 * (sp-docs/requirements/board.md §5 규칙 3).
+	 *
+	 * <p><b>{@code comment_count} 는 그대로다</b> (sp-docs/domain-model.md §5 의 표 셋째 줄) —
+	 * 감소시키는 변이를 이 단언이 잡는다. 다른 게시글의 댓글은 건드리지 않는 것도 함께 본다:
+	 * {@code where c.post.id = :postId} 를 빼는 변이가 거기서 빨개진다.
+	 */
+	@Test
+	@DisplayName("게시글 삭제 시 하위 댓글이 전부 deleted = true 가 되고 comment_count 는 그대로다")
+	void 삭제_시_하위_댓글도_deleted_가_된다() {
+		Post target = savedPost(714L, "작성자닉네임", "삭제될 글", "본문");
+		savedComment(target, 715L, "댓글1");
+		savedComment(target, 716L, "댓글2");
+		target.increaseCommentCount();
+		target.increaseCommentCount();
+		this.postRepository.saveAndFlush(target);
+
+		Post other = savedPost(717L, "다른작성자", "남는 글", "본문");
+		savedComment(other, 715L, "남는 댓글");
+
+		this.postService.delete(target.getId(), user(714L));
+
+		assertThat(활성_댓글_수(target.getId()))
+				.as("하위 댓글이 전부 deleted = true 가 된다 "
+						+ "(sp-docs/requirements/board.md §5 규칙 3)")
+				.isZero();
+		assertThat(this.postRepository.findById(target.getId()).orElseThrow().getCommentCount())
+				.as("게시글 삭제에서는 comment_count 를 그대로 둔다 (sp-docs/domain-model.md §5)")
+				.isEqualTo(2);
+		assertThat(활성_댓글_수(other.getId()))
+				.as("다른 게시글의 댓글은 건드리지 않는다")
+				.isEqualTo(1);
+	}
+
+	/**
+	 * <b>수정·삭제 경로는 {@code MemberClient} 를 호출하지 않는다</b>
+	 * (sp-docs/api-contract.md §4.2, sp-docs/requirements/board.md §7). 수정 시 스냅샷을
+	 * 갱신하지 않으므로 닉네임을 다시 얻을 이유가 없고, 활성 프로필은 생성에만 필요하다
+	 * (§5 규칙 8). 그래서 <b>member 장애가 수정·삭제를 막지 않는다.</b>
+	 */
+	@Test
+	@DisplayName("수정·삭제는 MemberClient 를 호출하지 않는다")
+	void 수정과_삭제는_member_를_호출하지_않는다() {
+		Post post = savedPost(718L, "작성자닉네임", "원래 제목", "원래 본문");
+
+		this.postService.update(
+				post.getId(), user(718L), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+		this.postService.delete(post.getId(), user(718L));
+
+		verifyNoInteractions(this.memberClient);
+	}
+
+	/**
+	 * 완료 기준 <b>"게시글 삭제의 두 효과가 한 로컬 트랜잭션이다"</b>
+	 * (sp-docs/domain-model.md §5, sp-docs/plan/phase1.md §6 B-07). 검증표의 두 줄 — "삭제 중
+	 * 예외 발생 → 둘 다 롤백, 두 단언이 각각 반증 가능해야 한다" 와 "한 번의 삭제에 커밋이
+	 * 정확히 한 번 — 변이 셋(A·B·C)을 돌린다" — 이 여기 있다.
+	 *
+	 * <p>구조는 AU-08·AU-09 의 {@code 트랜잭션_경계} 와 같다. 빈 둘을 스파이로 바꿔야 하므로
+	 * 중첩 클래스이고, 바깥 클래스의 {@code postService} 에는 스파이가 아닌 원래 빈이 들어
+	 * 있으므로 여기서 다시 주입받는다.
+	 *
+	 * <table border="1">
+	 * <caption>{@code delete} 변이별 실패 (실측, 전체 198개 기준)</caption>
+	 * <tr><th>변이</th><th>무엇이 깨지나</th><th>실측 결과</th></tr>
+	 * <tr><td><b>A</b> — {@code @Transactional} 제거</td><td>트랜잭션이 아예 없다</td>
+	 * <td><b>9개 실패.</b> {@link #커밋이_정확히_한_번이다()} 는 집계 전에
+	 * {@code InvalidDataAccessApiUsageException} 이 난다 —
+	 * {@code softDeleteByPostId} 의 {@code flushAutomatically} 가 트랜잭션 없이
+	 * {@code flush} 를 부른다. {@link #둘_다_롤백된다()} 는 <b>댓글 단언</b>이 빨개진다
+	 * (활성 댓글 2 기대, 0 관측 — 주입한 UPDATE 가 그 자리에서 커밋됐다)</td></tr>
+	 * <tr><td><b>B</b> — {@code @Transactional(noRollbackFor = …)}</td>
+	 * <td>트랜잭션은 있고 원자성만 깨진다</td>
+	 * <td><b>1개 실패 — {@link #둘_다_롤백된다()} 하나뿐.</b> 거기서
+	 * <b>{@code post.deleted} 단언</b>이 빨개진다</td></tr>
+	 * <tr><td><b>C</b> — 연산마다 자기 트랜잭션 ({@code TransactionTemplate} 둘)</td>
+	 * <td><b>독립적으로 커밋되는 트랜잭션 둘</b></td>
+	 * <td><b>2개 실패, 둘 다 진짜 단언 실패.</b>
+	 * {@link #커밋이_정확히_한_번이다()} 의 집계가 <b>2</b> 였다</td></tr>
+	 * </table>
+	 *
+	 * <p><b>두 단언이 각각 반증 가능하다</b>(§4.1) — A 가 댓글 단언을, B 가
+	 * {@code post.deleted} 단언을 따로 빨갛게 만들었다. 통과하는 것으로는 부족하고 깨뜨려
+	 * 봐야 알 수 있는 부분이다.
+	 *
+	 * <p><b>집계 2 는 측정값이고 예측값이 아니다</b>(§4.1 — 그 절의 앞 판이 숫자를 두 번
+	 * 틀렸다). AU-09 의 같은 변이는 3이었다. 여기서 하나 적은 이유는 {@code PostReader} 가
+	 * 쓰는 파생 쿼리({@code findByIdAndDeletedFalse})에 {@code SimpleJpaRepository} 의 기본
+	 * {@code @Transactional} 이 적용되지 않아 그 조회가 트랜잭션을 열지 않기 때문이다
+	 * (§4.1 의 마지막 블록인용이 같은 사실을 변이 A 에 대해 적는다). <b>단언은 "정확히 한
+	 * 번" 에만 걸고 이 수치에 걸지 않는다.</b>
+	 *
+	 * <p><b>C 가 핵심이고 행위 단언으로 잡히지 않는다</b>
+	 * (sp-docs/process/review-policy.md §4.1). 정상 경로는 두 효과가 여전히 둘 다 일어나므로
+	 * 통과하고, 실패를 주입해도 "한 트랜잭션" 과 "첫 트랜잭션이 롤백된 두 트랜잭션" 이 관측상
+	 * 구별되지 않는다. 그래서 커밋 횟수를 직접 센다.
+	 *
+	 * <p>위 실측에서 {@link #둘_다_롤백된다()} 가 C 에서도 빨개졌지만 <b>거기에 기대지
+	 * 않는다.</b> 이 변이 형태는 첫 쓰기가 스파이 바깥({@code post.deleted} 쪽)에 있어 그것이
+	 * 먼저 커밋되지만, 스파이가 가로채는 연산이 첫 쓰기가 되는 형태에서는 아무것도 커밋되지
+	 * 않아 두 단언이 <b>"한 트랜잭션이어서" 가 아니라 "애초에 아무것도 쓰이지 않아서"</b>
+	 * 통과한다(§4.1). <b>C 를 잡는 것은 경계 관측이다.</b>
+	 *
+	 * <p><b>이 셋이 잡힌다는 것은 아무것도 증명하지 않는다</b>(§4.1). 변이 테스트는 반증
+	 * 도구다 — 잡히지 않은 변이가 발견이다.
+	 *
+	 * <p>C 의 손상이 이 항목에서 뜻하는 것: <b>게시글은 사라졌는데 댓글이 살아 있거나, 댓글만
+	 * 지워지고 게시글이 목록에 남는다</b> (sp-docs/domain-model.md §5).
+	 */
+	@Nested
+	@DisplayName("게시글 삭제와 하위 댓글 삭제가 한 로컬 트랜잭션이다")
+	class 삭제_트랜잭션_경계 {
+
+		/** 댓글 연쇄 삭제 지점에 실패를 주입한다. 나머지 메서드는 실제 빈에 위임된다. */
+		@MockitoSpyBean
+		private CommentRepository spyCommentRepository;
+
+		/**
+		 * <b>경계를 관측하는 지점이다.</b> {@code TransactionInterceptor} 가 이 빈으로
+		 * 트랜잭션을 열고 닫으므로 커밋이 전부 여기를 지난다.
+		 */
+		@MockitoSpyBean
+		private PlatformTransactionManager spyTransactionManager;
+
+		/** 위 스파이들을 주입받은 쪽이다. 바깥 클래스의 것과 다른 인스턴스다. */
+		@Autowired
+		private PostService postService;
+
+		@Autowired
+		private PostRepository postRepository;
+
+		/**
+		 * <b>JPA 를 거치지 않고 읽는다.</b> 롤백 여부를 보는 것이므로 영속성 컨텍스트가 아니라
+		 * 커밋된 행을 봐야 한다. {@link #둘_다_롤백된다()} 는 쓰기에도 쓴다 — 거기에 이유가
+		 * 적혀 있다.
+		 */
+		@Autowired
+		private JdbcTemplate jdbcTemplate;
+
+		/**
+		 * 검증표 <b>"한 번의 삭제에 커밋이 정확히 한 번"</b>. 경계 자체를 관측하므로 행위
+		 * 단언으로 대체할 수 없다 (sp-docs/process/review-policy.md §4.1).
+		 *
+		 * <p><b>{@code isNewTransaction()} 이 참인 커밋만 센다.</b> 참여 트랜잭션도 매니저의
+		 * {@code commit} 을 지나지만 그것은 물리 트랜잭션의 커밋이 아니므로, 빼고 남는 수가
+		 * 실제로 커밋된 트랜잭션의 수다.
+		 *
+		 * <p><b>"필터가 없으면 집계가 1을 넘는다" 를 이 자리의 근거로 적지 않는다.</b>
+		 * {@code delete} 는 {@code SimpleJpaRepository} 상속 메서드를 하나도 부르지 않고
+		 * 파생 쿼리와 {@code @Query} 만 지나므로 <b>필터를 지워도 올바른 구현의 집계가 1
+		 * 그대로다</b> (B-07 리뷰 실측). 다른 항목에서 성립하는 이유를 여기 옮겨 적으면
+		 * 측정하지 않은 주장이 된다 (sp-docs/conventions.md §9.5).
+		 *
+		 * <p><b>그래도 필터는 둔다.</b> sp-docs/process/review-policy.md §4.1 이 요구하는
+		 * 형태이고, 조회가 상속 메서드로 바뀌는 순간 필터 없는 테스트는 <b>올바른 구현에서</b>
+		 * 빨개진다.
+		 *
+		 * <p><b>단언은 "정확히 한 번" 에만 걸고 다른 수치를 예측값으로 쓰지 않는다</b>(§4.1).
+		 */
+		@Test
+		@DisplayName("한 번의 삭제에 물리 트랜잭션이 정확히 하나 커밋된다")
+		void 커밋이_정확히_한_번이다() {
+			Post post = 댓글_둘인_게시글을_만든다(719L);
+
+			// 준비가 끝난 뒤에 센다. 세는 구간을 delete 한 번으로 좁혀 둔다
+			List<TransactionStatus> 커밋된_물리_트랜잭션 = new ArrayList<>();
+			willAnswer(invocation -> {
+				TransactionStatus status = invocation.getArgument(0);
+				if (status.isNewTransaction()) {
+					커밋된_물리_트랜잭션.add(status);
+				}
+				return invocation.callRealMethod();
+			}).given(this.spyTransactionManager).commit(any(TransactionStatus.class));
+
+			this.postService.delete(post.getId(), new LoginMember(719L, ROLE_USER));
+
+			assertThat(커밋된_물리_트랜잭션)
+					.as("post.deleted 와 하위 댓글의 deleted 가 한 로컬 트랜잭션이다 "
+							+ "(sp-docs/domain-model.md §5)")
+					.hasSize(1);
+		}
+
+		/**
+		 * 검증표 <b>"삭제 중 예외 발생 → {@code post.deleted} 와 댓글 {@code deleted} 둘 다
+		 * 롤백. 두 단언이 각각 반증 가능해야 한다"</b>.
+		 *
+		 * <p><b>스텁이 실제 UPDATE 를 돌린 뒤에 throw 한다.</b> 그냥 {@code willThrow} 로
+		 * 가로채면 UPDATE 가 발행될 자리가 사라져 "댓글도 롤백된다" 가 <b>어떤 구현에서도
+		 * 참</b>이 된다 — {@code @Transactional} 이 아예 없어도 통과하는 반증 불가능한 단언이다
+		 * (sp-docs/process/review-policy.md §4.1). 되돌릴 효과를 실제로 만들어야 단언이
+		 * 일한다.
+		 *
+		 * <p>{@code post.deleted} 쪽은 반대로 <b>미반영이 정상</b>이다. 관리 엔티티의 변경이
+		 * 커밋 시점에 flush 되므로, 롤백되면 쓰이지 않고 커밋되면(변이 B) {@code true} 가
+		 * 쓰인다.
+		 *
+		 * <p><b>UPDATE 를 {@code JdbcTemplate} 으로 발행한다.</b> 리포지터리는 JDK 프록시이고
+		 * 스파이가 그것을 {@code delegatesTo} 로 감싸므로 {@code callRealMethod()} 를 쓸 수
+		 * 없다("Cannot call abstract real method"). {@code JpaTransactionManager} 가 같은
+		 * {@code DataSource} 의 커넥션을 트랜잭션에 묶으므로 이 UPDATE 는 <b>서비스의
+		 * 트랜잭션에 참여한다</b> — 경계가 없으면 그 자리에서 커밋되고, 있으면 함께 롤백된다.
+		 */
+		@Test
+		@DisplayName("댓글 연쇄 삭제가 실패하면 post.deleted 도 댓글 deleted 도 커밋되지 않는다")
+		void 둘_다_롤백된다() {
+			Post post = 댓글_둘인_게시글을_만든다(719L);
+
+			willAnswer(invocation -> {
+				// 이 문장의 짝은 CommentRepository.softDeleteByPostId 다. 둘이 어긋나면 아래
+				// 단언이 그 자리에서 터진다 — 영향 행 수를 버리면 0행이 되어도 조용하고,
+				// 되돌릴 효과가 없으므로 댓글 단언이 반증 불가능해진다
+				// (sp-docs/process/review-policy.md §4.1 "실패할 수 없는 단언을 쓰지 않는다")
+				int updated = this.jdbcTemplate.update(
+						"UPDATE comment SET deleted = TRUE WHERE post_id = ? AND deleted = FALSE",
+						(Long) invocation.getArgument(0));
+				assertThat(updated)
+						.as("주입한 UPDATE 가 실제로 행을 바꿔야 이 테스트가 일한다")
+						.isEqualTo(2);
+				throw new DataIntegrityViolationException("댓글 연쇄 삭제 실패");
+			}).given(this.spyCommentRepository).softDeleteByPostId(anyLong());
+
+			assertThatThrownBy(() ->
+					this.postService.delete(post.getId(), new LoginMember(719L, ROLE_USER)))
+					.isInstanceOf(DataIntegrityViolationException.class);
+
+			assertThat(커밋된_삭제_여부(post.getId()))
+					.as("두 효과가 한 로컬 트랜잭션이다 (sp-docs/domain-model.md §5)")
+					.isFalse();
+			assertThat(커밋된_활성_댓글_수(post.getId()))
+					.as("발행된 UPDATE 도 함께 되돌아간다 — 댓글이 활성으로 남아 있어야 한다")
+					.isEqualTo(2);
+		}
+
+		private Post 댓글_둘인_게시글을_만든다(long writerId) {
+			Post post = this.postRepository.saveAndFlush(Post.builder()
+					.writerId(writerId)
+					.writerNickname("작성자닉네임")
+					.title("경계 관측 대상")
+					.content("본문")
+					.build());
+			this.spyCommentRepository.saveAllAndFlush(List.of(
+					Comment.builder().post(post).writerId(writerId)
+							.writerNickname("댓글작성자").content("댓글1").build(),
+					Comment.builder().post(post).writerId(writerId)
+							.writerNickname("댓글작성자").content("댓글2").build()));
+			return post;
+		}
+
+		private boolean 커밋된_삭제_여부(Long postId) {
+			return Boolean.TRUE.equals(this.jdbcTemplate.queryForObject(
+					"SELECT deleted FROM post WHERE id = ?", Boolean.class, postId));
+		}
+
+		private long 커밋된_활성_댓글_수(Long postId) {
+			Long count = this.jdbcTemplate.queryForObject(
+					"SELECT COUNT(*) FROM comment WHERE post_id = ? AND deleted = FALSE",
+					Long.class, postId);
+			return count == null ? 0 : count;
+		}
+
+	}
+
+	/** sp-docs/api-contract.md §6 의 Claim 으로 만든 주체. {@code nickname} 은 없다. */
+	private static LoginMember user(long accountId) {
+		return new LoginMember(accountId, ROLE_USER);
+	}
+
+	private static LoginMember admin(long accountId) {
+		return new LoginMember(accountId, ROLE_ADMIN);
+	}
+
 	private Post savedPost(long writerId, String nickname, String title, String content) {
 		return this.postRepository.saveAndFlush(Post.builder()
 				.writerId(writerId)
@@ -336,6 +882,22 @@ class PostServiceTest {
 				.title(title)
 				.content(content)
 				.build());
+	}
+
+	private Comment savedComment(Post post, long writerId, String content) {
+		return this.commentRepository.saveAndFlush(Comment.builder()
+				.post(post)
+				.writerId(writerId)
+				.writerNickname("댓글작성자")
+				.content(content)
+				.build());
+	}
+
+	private long 활성_댓글_수(Long postId) {
+		Long count = this.jdbcTemplate.queryForObject(
+				"SELECT COUNT(*) FROM comment WHERE post_id = ? AND deleted = FALSE",
+				Long.class, postId);
+		return count == null ? 0 : count;
 	}
 
 	private int rowCount(long writerId) {
