@@ -28,7 +28,7 @@
 
 - [x] B-01 프로젝트 스캐폴딩 · 상태 done
 - [x] B-02 공통 기반 · 상태 done
-- [ ] B-03 도메인 기반 · 상태 todo
+- [x] B-03 도메인 기반 · 상태 done
 - [ ] B-04 보안 기반 · 상태 todo
 
 > **B-04에 `MemberClient`가 추가됐다.** JWT Claim에서 `nickname`이 빠져 글·댓글 생성 시 member의 내부 API를 호출해야 한다 (`sp-docs/adr/0012` §6). `M-10`을 기다리지 않고 **스텁으로 테스트**한다.

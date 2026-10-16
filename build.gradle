@@ -57,5 +57,8 @@ dependencies {
 
 tasks.named('test') {
 	useJUnitPlatform()
+	// @ActiveProfiles 를 빠뜨린 테스트가 main 설정으로 도는 것을 막는다
+	// (sp-docs/tech-stack.md §5.1)
+	systemProperty 'spring.profiles.active', 'test'
 }
 
