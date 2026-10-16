@@ -25,3 +25,9 @@ logging:
 # (sp-docs/security.md §6)
 member-service:
   internal-api-key: 여기에_내부_API_키
+
+# CORS 허용 오리진. 허용 오리진은 환경이 정하므로 정본에 목록이 없다
+# (sp-docs/security.md §1.1). * 는 쓸 수 없다 — 기동이 실패한다.
+# 여러 개는 쉼표로 구분한다
+cors:
+  allowed-origins: http://localhost:3000

@@ -19,3 +19,24 @@ spring:
       # 스키마 출처를 Flyway 하나로 고정한다. 임베디드 H2 의 기본값 create-drop 을 쓰면
       # 마이그레이션이 아니라 엔티티로부터 스키마가 조용히 생성된다 (sp-docs/tech-stack.md §5.1).
       ddl-auto: validate
+
+# 테스트 전용 값이다. 정책값이 아니다 — 정본(sp-docs/security.md §1.1)은 허용 오리진을
+# 환경이 정하게 두고 목록을 정하지 않았다. 운영·로컬 값은 환경이 준다
+cors:
+  allowed-origins: http://localhost:3000
+
+# 테스트 전용 내부 API 키다. 실제 키가 아니다 — 로컬·운영 값은 환경이 준다
+# (application.yml 의 member-service.internal-api-key 주석, sp-docs/tech-stack.md §4.3).
+# 값이 없으면 MemberClient 빈 생성이 실패해 컨텍스트가 뜨지 않는다.
+#
+# connect-timeout·read-timeout 은 여기서 덮지 않는다. application.yml 의 정본값
+# (1s / 3s, sp-docs/nfr.md §3)이 테스트에도 그대로 쓰여야 그 설정이 실제로 적용되는지
+# 관측할 수 있다 (MemberClientTest).
+member-service:
+  internal-api-key: test-internal-api-key
+
+# spring.security.oauth2.resourceserver.jwt.public-key-location 은 여기서 덮지 않는다.
+# application.yml 의 실제 공개키(classpath:jwt-public.pem)가 그대로 쓰이므로 컨텍스트
+# 로딩이 그 파일을 읽는 것까지 확인된다. 짝이 되는 개인키가 없어 토큰을 서명할 수 없으므로,
+# 서명이 필요한 테스트만 실행 시점에 만든 키 페어로 이 값을 덮는다
+# (com.example.board.support.TestTokenFactory)
