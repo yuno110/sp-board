@@ -295,8 +295,20 @@ class PostRepositoryTest {
 	 * 회귀 테스트다. {@code comment_count} 가 음수가 되지 않아야 한다
 	 * (sp-docs/domain-model.md §5, sp-docs/requirements/board.md §5 규칙 4).
 	 *
-	 * <p>비정규화된 값이라 재계산하지 않으면 어긋남을 알아챌 수 없다. 목록 응답에 음수가 실리고,
-	 * 그 뒤 댓글이 생겨도 0 으로 돌아오지 않는다.
+	 * <p><b>이 테스트가 보는 것은 {@link Post#decreaseCommentCount()} 의 가드다</b> — 엔티티
+	 * 메서드를 직접 부르므로 운영의 댓글 삭제 경로를 지나지 않는다. B-03 의 완료 기준이 그
+	 * 메서드에 거는 요구이고, 메서드가 그 자리에 남아 있는 한 그대로 유효하다
+	 * (sp-docs/plan/phase1.md §6 B-03).
+	 *
+	 * <p><b>운영 경로의 음수 방지는 여기가 아니다.</b> B-10 이 집계 갱신을 좁은 UPDATE 로
+	 * 바꾸면서 가드가 {@code PostRepository.decreaseCommentCount} 의 {@code where} 절
+	 * ({@code comment_count > 0}) 로 옮겨 갔고, 좁은 UPDATE 는 엔티티를 지나지 않는다
+	 * (sp-docs/plan/phase1.md §6 B-10). 그 층은
+	 * {@code CommentServiceTest.집계는_음수가_되지_않는다()} 가 본다.
+	 *
+	 * <p><b>두 층이 각각 자기 반증자를 갖는다</b>(실측). 그 {@code where} 절만 지우면 이
+	 * 테스트는 녹색으로 남고 저쪽만 0 을 기대한 자리에서 {@code -1} 을 관측해 빨개진다 —
+	 * 한쪽을 지워도 다른 쪽이 조용히 덮어 주지 않는다.
 	 */
 	@Test
 	@DisplayName("commentCount 가 0 일 때 decreaseCommentCount() 를 불러도 0 을 유지한다")
