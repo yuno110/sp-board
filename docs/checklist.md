@@ -43,8 +43,8 @@
 - [x] B-06 게시글 목록과 QueryDSL 검색 · 상태 done
 - [x] B-07 게시글 수정·삭제와 권한 · 상태 done
 - [x] B-08 댓글 · 상태 done
-- [x] B-09 내가 쓴 글과 마무리 · 상태 done · 커밋 -
-- [x] B-10 comment_count 소실 갱신 · 상태 done · 커밋 -
+- [x] B-09 내가 쓴 글과 마무리 · 상태 done · 커밋 622a27b
+- [x] B-10 comment_count 소실 갱신 · 상태 done · 커밋 01b6c77
 
 > **B-05·B-08은 `MemberClient`를 호출한다.** 생성 경로에서만이다. B-06(목록)·B-07(수정·삭제)은 호출하지 않는다.
 
