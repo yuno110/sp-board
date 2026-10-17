@@ -16,6 +16,10 @@ import org.springframework.data.repository.query.Param;
  * <p><b>{@code comment_count} 갱신이 여기 있다</b> (sp-docs/domain-model.md §5). 갱신하는 쪽은
  * 댓글 작성·삭제이지만 문장이 바꾸는 테이블은 {@code post} 다 — "{@code comment_count} 는
  * 어디서 바뀌는가" 를 이 인터페이스에서 찾을 수 있어야 한다.
+ *
+ * <p><b>{@code view_count} 증가도 여기 있다</b> (sp-docs/plan/phase1.md §6 B-11). 집계와 같은
+ * 이유다 — 관리 엔티티를 메모리에서 올리면 더티 체킹이 변경되지 않은 컬럼까지 UPDATE 에 실어
+ * 그 트랜잭션이 읽은 값으로 다른 컬럼을 덮어쓴다.
  */
 public interface PostRepository extends JpaRepository<Post, Long> {
 
@@ -72,5 +76,42 @@ public interface PostRepository extends JpaRepository<Post, Long> {
 	@Query("update Post p set p.commentCount = p.commentCount - 1 "
 			+ "where p.id = :id and p.commentCount > 0")
 	int decreaseCommentCount(@Param("id") Long id);
+
+	/**
+	 * {@code view_count} 를 1 올린다. 영향받은 행 수를 돌려준다.
+	 *
+	 * <p><b>좁은 UPDATE 다 — {@code view_count} 한 컬럼만 싣는다</b>
+	 * (sp-docs/plan/phase1.md §6 B-11). 상세 조회가 읽어 둔 엔티티의 조회수를 메모리에서
+	 * 올리면 더티 체킹이 변경되지 않은 컬럼까지 전부 UPDATE 에 싣고, <b>그 트랜잭션이 읽은
+	 * {@code comment_count} 를 그대로 다시 쓴다</b> — SELECT 와 flush 사이에 커밋된 댓글
+	 * 작성의 증가가 조회 하나로 소실된다. 조회수 자체도 같은 성질이어서 동시 조회 둘이 같은
+	 * 값을 읽으면 하나가 소실된다. 더할 대상을 트랜잭션이 읽은 값이 아니라 <b>DB 의 현재
+	 * 값</b>으로 두는 것이 이 문장이 고치는 지점이다.
+	 *
+	 * <p><b>{@code clearAutomatically} 를 켠다.</b> 부르는 쪽
+	 * ({@code PostService.getDetail})이 이 문장 다음에 같은 게시글을 다시 읽어 응답을 만들고,
+	 * 이 문장은 엔티티를 지나지 않으므로 영속성 컨텍스트에 남아 있는 사본은 증가 전 조회수를
+	 * 들고 있다. 비우지 않으면 그 사본이 그대로 돌아와 <b>응답의 {@code viewCount} 가 증가 전
+	 * 값이 된다</b> — 끈 상태로 돌려 측정한 것이다. 비우면 다음 읽기가 새 SELECT 가 되어 DB 가
+	 * 올린 값을 본다.
+	 *
+	 * <p>{@code flushAutomatically} 는 켜지 않는다. 상세 조회는 이 문장 앞에 쓰기가 없어
+	 * 내보낼 것이 없다 — 켤 이유가 있는 것은 호출 시점에 쓰기 대기 중인 변경을 들고 있는
+	 * 경로다 ({@link #increaseCommentCount} 가 그렇다).
+	 *
+	 * <p>{@code deleted} 조건을 이 문장에 두지 않는다. 삭제된 게시글을 없는 것으로 보는 판정은
+	 * {@link com.example.board.post.support.PostReader} 가 하고, 부르는 쪽이 그 판정을 먼저
+	 * 지난 뒤 이 문장을 발행한다 — 조건을 여기 복제하면 같은 규칙이 두 군데에서 각각 늙는다.
+	 *
+	 * <p><b>발행된 {@code update post} 가 정확히 하나인지를 보는 단언이 막는 것은 더티
+	 * 엔티티다.</b> 이 문장을 그대로 두고 엔티티의 {@code increaseViewCount()} 를 함께 부르면
+	 * 전체 컬럼 UPDATE 가 한 문장 더 붙는다 — 그 문장이 그 트랜잭션이 읽은 값을 다시 쓰므로
+	 * 집계가 덮어써지고 조회수도 어긋난다. <b>엔티티를 올리는 자리가 이 문장 앞이어도
+	 * 그렇다</b> — 이 문장은 {@code post} 를 보는 쿼리이므로 발행 전에 대기 중인
+	 * {@code post} 변경이 자동으로 내보내진다 (측정값: 두 문장이 순서만 바뀌어 발행된다).
+	 */
+	@Modifying(clearAutomatically = true)
+	@Query("update Post p set p.viewCount = p.viewCount + 1 where p.id = :id")
+	int increaseViewCount(@Param("id") Long id);
 
 }

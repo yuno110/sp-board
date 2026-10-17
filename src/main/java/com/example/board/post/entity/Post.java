@@ -62,6 +62,10 @@ public class Post extends BaseTimeEntity {
 	@Column(nullable = false, columnDefinition = "TEXT")
 	private String content;
 
+	/**
+	 * 조회수. <b>상세 조회의 증가는 {@code PostRepository.increaseViewCount} 의 좁은 UPDATE 가
+	 * 한다</b> ({@code view_count = view_count + 1}, sp-docs/plan/phase1.md §6 B-11).
+	 */
 	@Column(nullable = false)
 	private long viewCount;
 
@@ -106,6 +110,22 @@ public class Post extends BaseTimeEntity {
 		this.deleted = true;
 	}
 
+	/**
+	 * 메모리 안의 조회수 증가.
+	 *
+	 * <p><b>상세 조회 경로는 이 메서드를 쓰지 않는다</b> — 조회수 증가는
+	 * {@code PostRepository.increaseViewCount} 의 좁은 UPDATE 가 한다
+	 * (sp-docs/plan/phase1.md §6 B-11). 관리 엔티티를 메모리에서 올리면 더티 체킹이 변경되지
+	 * 않은 컬럼까지 UPDATE 에 실어 <b>그 트랜잭션이 읽은 {@code comment_count} 를 그대로 다시
+	 * 쓰고</b>, 그 사이에 커밋된 댓글 작성의 증가가 조회 하나로 소실된다. 조회수 자체도 동시
+	 * 조회가 같은 값을 읽어 하나가 소실된다. <b>조회수 증가를 이 메서드로 바꾸면 그 결함이
+	 * 돌아온다.</b>
+	 *
+	 * <p><b>그래도 메서드가 남아 있는 이유는 B-03 이다</b> —
+	 * {@link #increaseCommentCount()} 와 같다. B-03 의 도메인 메서드 표와 완료 기준이 이
+	 * 메서드를 요구하고, 리포지터리 테스트가 두 번 불러 2 가 되는 것을 본다
+	 * (sp-docs/plan/phase1.md §6 B-03).
+	 */
 	public void increaseViewCount() {
 		this.viewCount++;
 	}

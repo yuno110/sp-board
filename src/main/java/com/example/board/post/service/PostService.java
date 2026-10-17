@@ -130,12 +130,30 @@ public class PostService {
 	 *
 	 * <p>삭제된 게시글·없는 id 는 {@link PostReader} 가 404 {@code P001} 로 만든다 —
 	 * {@code deleted} 조건을 여기서 다시 쓰지 않는다 (sp-docs/requirements/board.md §5 규칙 1).
+	 *
+	 * <p><b>조회수 증가는 {@link PostRepository#increaseViewCount} 의 좁은 UPDATE 다</b>
+	 * (sp-docs/plan/phase1.md §6 B-11). 읽어 둔 엔티티의 조회수를 메모리에서 올리면 더티
+	 * 체킹이 변경되지 않은 컬럼까지 전부 UPDATE 에 실어 <b>이 트랜잭션이 읽은
+	 * {@code comment_count} 를 그대로 다시 쓴다</b> — 그 사이에 커밋된 댓글 작성의 증가가 조회
+	 * 하나로 소실된다. 조회수 자체도 동시 조회가 같은 값을 읽어 하나가 소실된다.
+	 *
+	 * <p><b>그래서 이 메서드는 엔티티를 바꾸지 않는다.</b> 엔티티를 함께 올리면 더티 체킹의
+	 * 전체 컬럼 UPDATE 가 좁은 UPDATE 와 <b>함께</b> 발행되고, 그 문장이 이 트랜잭션이 읽은
+	 * 값을 다시 쓰므로 집계가 덮어써지고 조회수도 어긋난다 — 발행된 {@code update post} 가
+	 * 정확히 하나인지를 보는 단언이 그것을 본다.
+	 *
+	 * <p><b>한 번의 상세 조회가 게시글을 두 번 읽는다.</b> 앞의 읽기는 404 판정이고, 뒤의
+	 * 읽기는 응답에 실을 값이다 — 좁은 UPDATE 는 영속성 컨텍스트를 지나지 않으므로 앞에서
+	 * 읽어 둔 사본은 증가 전 조회수를 들고 있고, 그것으로 응답을 만들면 클라이언트가 옛 값을
+	 * 받는다. {@code increaseViewCount} 의 {@code clearAutomatically} 가 컨텍스트를 비워 뒤의
+	 * 읽기가 새 SELECT 가 된다.
 	 */
 	@Transactional
 	public PostDetailResponse getDetail(Long id) {
-		Post post = this.postReader.getActiveById(id);
-		post.increaseViewCount();
-		return PostDetailResponse.from(post);
+		// 404 판정이 먼저다. 돌아온 엔티티를 응답에 쓰지 않는 이유는 위에 있다
+		this.postReader.getActiveById(id);
+		this.postRepository.increaseViewCount(id);
+		return PostDetailResponse.from(this.postReader.getActiveById(id));
 	}
 
 	/**
