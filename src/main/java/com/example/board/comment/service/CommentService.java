@@ -12,6 +12,7 @@ import com.example.board.global.error.BusinessException;
 import com.example.board.global.error.ErrorCode;
 import com.example.board.global.security.LoginMember;
 import com.example.board.post.entity.Post;
+import com.example.board.post.repository.PostRepository;
 import com.example.board.post.support.PostReader;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
@@ -36,10 +37,17 @@ import org.springframework.transaction.support.TransactionTemplate;
  * 와 하위 댓글 {@code deleted} 를 각각 한 트랜잭션으로 묶는다 (sp-docs/domain-model.md §5).
  * 방향을 끊으려면 그 원자성을 깨거나 두 패키지를 합쳐야 한다.
  *
- * <p><b>면제 범위는 §1.3 의 두 줄까지다.</b> 이 클래스는 {@link PostReader} 와 {@link Post} 만
- * 읽고 <b>{@code PostService} 를 참조하지 않는다</b> — 서로의 Service 를 참조하면 업무 규칙이
- * 두 곳으로 갈리고 트랜잭션 경계가 어느 쪽 것인지 흐려진다. 역방향은 {@code PostService} 가
- * 댓글 연쇄 삭제에 쓰는 {@code CommentRepository} 한 줄이다 (B-07).
+ * <p><b>{@code PostService} 를 참조하지 않는다</b> (sp-docs/conventions.md §1.3) — 서로의
+ * Service 를 참조하면 업무 규칙이 두 곳으로 갈리고 트랜잭션 경계가 어느 쪽 것인지 흐려진다.
+ * 참조하는 것은 {@link PostReader}(게시글 존재 판정)와 {@link Post}(연관관계 매핑), 그리고
+ * {@link PostRepository}({@code comment_count} 갱신)다.
+ *
+ * <p><b>{@link PostRepository} 참조는 §1.3 의 셋째 줄이고 B-10 이 등록했다.</b> 선언을
+ * {@code post.repository} 에 두는 이유가 그 줄의 블록인용에 있다 — 문장이 바꾸는 테이블이
+ * {@code post} 이므로, {@code comment} 쪽에 숨기면 {@link PostRepository} 를 읽는 사람이
+ * {@code comment_count} 가 어디서도 바뀌지 않는다고 결론한다. 방향은 첫 줄
+ * ({@code post.service} → {@code comment.repository.CommentRepository}, B-07 의 댓글 연쇄
+ * 삭제)과 같은 모양이고, 금지된 Service 상호 참조가 아니다.
  *
  * <p>{@code PostReader} 를 쓰는 이유는 "없거나 삭제된 게시글은 404 {@code P001}" 판정이 이미
  * 거기 한 곳에 있기 때문이다 — 조건을 여기 복제하면 한쪽이 바뀔 때 두 경로의 답이 갈린다.
@@ -63,6 +71,14 @@ public class CommentService {
 	 */
 	private final PostReader postReader;
 
+	/**
+	 * {@code comment_count} 를 갱신하는 지점. <b>좁은 UPDATE 다</b> —
+	 * {@code comment_count = comment_count ± 1} 한 컬럼만 싣는다
+	 * (sp-docs/plan/phase1.md §6 B-10). 엔티티를 읽어 메모리에서 바꾸면 더티 체킹이 전체
+	 * 컬럼을 싣고 동시 커밋에서 증가가 소실된다 (sp-docs/nfr.md §1).
+	 */
+	private final PostRepository postRepository;
+
 	private final MemberClient memberClient;
 
 	/**
@@ -76,11 +92,13 @@ public class CommentService {
 	public CommentService(
 			CommentRepository commentRepository,
 			PostReader postReader,
+			PostRepository postRepository,
 			MemberClient memberClient,
 			PlatformTransactionManager transactionManager) {
 
 		this.commentRepository = commentRepository;
 		this.postReader = postReader;
+		this.postRepository = postRepository;
 		this.memberClient = memberClient;
 		this.insertTransaction = new TransactionTemplate(transactionManager);
 	}
@@ -110,13 +128,21 @@ public class CommentService {
 	 * {@code CommentServiceTest} 가 커밋 횟수를 직접 센다
 	 * (sp-docs/process/review-policy.md §4.1).
 	 *
+	 * <p><b>집계 증가는 좁은 UPDATE 다</b> — {@code comment_count = comment_count + 1}
+	 * ({@link PostRepository#increaseCommentCount}, sp-docs/plan/phase1.md §6 B-10). 읽어 둔
+	 * 엔티티를 메모리에서 올리지 않는다: 더티 체킹이 변경되지 않은 컬럼까지 UPDATE 에 실어
+	 * 낡은 스냅샷째 덮어쓰고, <b>동시 커밋에서 증가가 소실된다</b> (sp-docs/nfr.md §1 의 I-03
+	 * 실측 — 201 11건에 증가 10). 더하는 대상이 이 트랜잭션이 읽은 값이 아니라 DB 의 현재
+	 * 값이어야 소실되지 않는다.
+	 *
 	 * <p><b>집계 증가를 INSERT 보다 앞에 둔다.</b> 둘 다 같은 트랜잭션이므로 순서가 결과를
 	 * 바꾸지 않지만, 뒤에 두면 INSERT 에 실패를 주입하는 테스트에서 집계 변경이 아예 일어나지
 	 * 않아 "집계도 롤백된다" 가 반증 불가능해진다 (§4.1).
 	 *
-	 * <p><b>게시글 조회는 트랜잭션 안이다.</b> {@code increaseCommentCount()} 가 관리 엔티티의
-	 * 변경으로 반영되려면 그 조회가 경계 안에 있어야 한다. 밖에서 읽으면 분리 상태가 되어
-	 * 집계가 조용히 반영되지 않는다. 규칙 8이 밖으로 내보내라고 한 것은 <b>원격 호출</b>이다.
+	 * <p><b>게시글 조회는 트랜잭션 안이다.</b> 조회는 "없거나 삭제된 게시글은 404 {@code P001}"
+	 * 판정을 받는 자리이고 (sp-docs/requirements/board.md §5 규칙 1), 그 판정과 집계 갱신·댓글
+	 * INSERT 가 한 트랜잭션이어야 그 사이에 게시글이 삭제되는 틈이 없다. 규칙 8이 밖으로
+	 * 내보내라고 한 것은 <b>원격 호출</b>이다.
 	 *
 	 * @param accountId 검증된 JWT 의 {@code sub}
 	 */
@@ -127,7 +153,7 @@ public class CommentService {
 		// 2) BEGIN -> SELECT post -> UPDATE comment_count -> INSERT comment -> COMMIT
 		Comment saved = this.insertTransaction.execute(status -> {
 			Post post = this.postReader.getActiveById(postId);
-			post.increaseCommentCount();
+			this.postRepository.increaseCommentCount(post.getId());
 			return this.commentRepository.saveAndFlush(Comment.builder()
 					.post(post)
 					.writerId(accountId)
@@ -202,10 +228,14 @@ public class CommentService {
 	 * <p><b>{@code comment_count} 가 1 감소한다</b> (sp-docs/domain-model.md §5). 그 둘이 한
 	 * 트랜잭션인 것은 이 메서드의 {@code @Transactional} 이 보장한다.
 	 *
-	 * <p><b>음수가 되지 않는 것은 {@link Post#decreaseCommentCount()} 의 가드다</b>
-	 * (sp-docs/requirements/board.md §5 규칙 4). 집계를 벌크 UPDATE
-	 * ({@code comment_count = comment_count - 1})로 깎지 않는 이유가 그것이다 — SQL 로 깎으면
-	 * 가드를 지나지 않는다.
+	 * <p><b>감소도 작성과 같은 좁은 UPDATE 다</b>
+	 * ({@link PostRepository#decreaseCommentCount}, sp-docs/plan/phase1.md §6 B-10). 엔티티를
+	 * 메모리에서 깎으면 작성과 같은 소실이 삭제에서도 난다.
+	 *
+	 * <p><b>음수가 되지 않는 것은 그 문장의 {@code where} 절이다</b>
+	 * ({@code comment_count > 0}, sp-docs/requirements/board.md §5 규칙 4). 좁은 UPDATE 는
+	 * 엔티티를 지나지 않으므로 가드가 엔티티 메서드에 있으면 지나가지 않는다 — 그래서 가드가
+	 * 문장으로 옮겨 갔다.
 	 *
 	 * <p><b>이미 삭제된 댓글은 404 {@code CM001} 이다.</b> 그래서 같은 댓글을 두 번 지워도
 	 * 집계가 두 번 깎이지 않는다.
@@ -223,7 +253,7 @@ public class CommentService {
 		validateWriterOrAdmin(comment, loginMember);
 
 		comment.softDelete();
-		comment.getPost().decreaseCommentCount();
+		this.postRepository.decreaseCommentCount(comment.getPost().getId());
 	}
 
 	/**

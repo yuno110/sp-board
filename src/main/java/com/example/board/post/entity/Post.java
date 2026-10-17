@@ -65,7 +65,14 @@ public class Post extends BaseTimeEntity {
 	@Column(nullable = false)
 	private long viewCount;
 
-	/** 목록 N+1 방지용 비정규화. <b>음수가 되지 않는다</b> ({@link #decreaseCommentCount()}). */
+	/**
+	 * 목록 N+1 방지용 비정규화. <b>음수가 되지 않는다</b> (sp-docs/domain-model.md §5,
+	 * sp-docs/requirements/board.md §5 규칙 4).
+	 *
+	 * <p><b>댓글 작성·삭제의 갱신은 {@code PostRepository} 의 좁은 UPDATE 가 한다</b>
+	 * ({@code comment_count = comment_count ± 1}, sp-docs/plan/phase1.md §6 B-10). 음수
+	 * 방지도 그 문장의 {@code where} 절에 있다.
+	 */
 	@Column(nullable = false)
 	private int commentCount;
 
@@ -103,17 +110,36 @@ public class Post extends BaseTimeEntity {
 		this.viewCount++;
 	}
 
+	/**
+	 * 메모리 안의 댓글 수 증가.
+	 *
+	 * <p><b>댓글 작성 경로는 이 메서드를 쓰지 않는다</b> — 집계 동기화는
+	 * {@code PostRepository.increaseCommentCount} 의 좁은 UPDATE 가 한다
+	 * (sp-docs/plan/phase1.md §6 B-10). 관리 엔티티를 메모리에서 올리면 더티 체킹이 변경되지
+	 * 않은 컬럼까지 UPDATE 에 실어 낡은 스냅샷째 덮어쓰고, <b>동시 커밋에서 증가가
+	 * 소실된다</b> (sp-docs/nfr.md §1 의 I-03 실측). 집계를 이 메서드로 바꾸면 그 결함이
+	 * 돌아온다.
+	 *
+	 * <p><b>그래도 메서드가 남아 있는 이유는 B-03 이다.</b> B-03 의 완료 기준이 "위 표의
+	 * 도메인 메서드 6개가 모두 구현되어 있다" 와 "{@code decreaseCommentCount()} 가 0 에서
+	 * 호출돼도 음수가 되지 않는다" 를 요구하고 그 표가 이 둘을 담는다
+	 * (sp-docs/plan/phase1.md §6 B-03). B-10 은 <b>갱신 수단</b>을 대체하라고 했고 B-03 의
+	 * 완료 기준이 깨지지 않는지 확인하라고 했다 — 지우려면 B-03 의 완료 기준과 검증표를
+	 * 먼저 고쳐야 한다.
+	 */
 	public void increaseCommentCount() {
 		this.commentCount++;
 	}
 
 	/**
-	 * 댓글 수 감소. <b>0 에서 호출돼도 0 을 유지한다.</b>
+	 * 메모리 안의 댓글 수 감소. <b>0 에서 호출돼도 0 을 유지한다.</b>
 	 *
 	 * <p>{@code comment_count} 는 음수가 될 수 없다 (sp-docs/domain-model.md §5,
-	 * sp-docs/requirements/board.md §5 규칙 4). 비정규화된 값이라 재계산 없이는 어긋남을
-	 * 알아챌 수 없으므로 가드를 엔티티에 둔다 — 호출하는 서비스마다 조건을 복제하면 한 군데가
-	 * 빠지는 순간 음수가 저장된다.
+	 * sp-docs/requirements/board.md §5 규칙 4).
+	 *
+	 * <p><b>댓글 삭제 경로는 이 메서드를 쓰지 않는다</b> —
+	 * {@link #increaseCommentCount()} 와 같은 이유다. 그 경로의 음수 방지는
+	 * {@code PostRepository.decreaseCommentCount} 의 {@code where} 절에 있다.
 	 */
 	public void decreaseCommentCount() {
 		if (this.commentCount > 0) {
