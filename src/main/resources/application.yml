@@ -7,6 +7,16 @@ spring:
     url: ${DB_URL:jdbc:mysql://localhost:3306/sp_board?serverTimezone=Asia/Seoul&characterEncoding=UTF-8}
     username: ${DB_USERNAME:root}
     password: ${DB_PASSWORD}
+  # 환경 설정이 아니라 데이터 경계의 계약이라서 세 서비스에 같이 둔다 (sp-docs/adr/0011 "결과").
+  # 이 경로(LocalDateTime + DATETIME)의 저장 변환을 정하는 것이 이 설정이므로 반드시
+  # 둔다 — 값을 UTC 로 바꾸면 저장값이 UTC 가 된다. 지우면 Connector/J 가 MySQL 서버
+  # 존으로 폴백해 그 존이 +09:00 인 환경에서만 우연히 맞는다. "있음 vs 없음" 으로는
+  # 가를 수 없고 값을 바꿔야 갈린다 (sp-docs/tech-stack.md §6 의 I-03 리뷰 실측)
+  jpa:
+    properties:
+      hibernate:
+        jdbc:
+          time_zone: Asia/Seoul
   security:
     oauth2:
       resourceserver:
