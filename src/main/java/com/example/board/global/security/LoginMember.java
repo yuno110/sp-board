@@ -11,8 +11,15 @@ package com.example.board.global.security;
  * 닉네임은 {@link com.example.board.client.MemberClient} 가 member 의 내부 API 에서 얻는다.
  *
  * <p>{@code role} 을 열거 타입으로 두지 않는다. 권한 컬럼은 auth 소유이고 board 는 Claim 의
- * 값을 그대로 옮기기만 한다. 권한 판정은 {@link RoleClaimConverter} 가 만든
- * {@code GrantedAuthority} 로 한다 (sp-docs/security.md §5.1).
+ * 값을 그대로 옮긴다 — 값이 {@link ContractRole} 의 허용값인지는
+ * {@link CurrentMemberArgumentResolver} 가 보고, 아니면 401 {@code A002} 다
+ * (sp-docs/api-contract.md §6).
+ *
+ * <p><b>권한 판정은 Service 계층이 이 {@code role} 문자열을 비교해서 한다</b> —
+ * {@code PostService}·{@code CommentService} 의 삭제 권한이 그 비교로 갈린다
+ * (sp-docs/security.md §5.2 의 매트릭스). <b>{@code GrantedAuthority} 로 판정하지 않는다</b>
+ * (sp-docs/security.md §5.1). {@link RoleClaimConverter} 는 그 권한 이름을 만드는 쪽이고
+ * 판정하는 쪽이 아니다.
  *
  * @param accountId {@code sub}. 전역 식별자(= {@code account.id})
  * @param role {@code role} claim

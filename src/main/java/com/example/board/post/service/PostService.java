@@ -5,6 +5,7 @@ import com.example.board.comment.repository.CommentRepository;
 import com.example.board.global.common.PageResponse;
 import com.example.board.global.error.BusinessException;
 import com.example.board.global.error.ErrorCode;
+import com.example.board.global.security.ContractRole;
 import com.example.board.global.security.LoginMember;
 import com.example.board.post.dto.PostCreateRequest;
 import com.example.board.post.dto.PostDetailResponse;
@@ -32,13 +33,6 @@ import org.springframework.transaction.support.TransactionTemplate;
  */
 @Service
 public class PostService {
-
-	/**
-	 * sp-docs/api-contract.md §6 이 정한 {@code role} claim 의 값이다 ({@code USER} |
-	 * {@code ADMIN}). <b>권한 판정은 이 Claim 만으로 한다</b> — 권한을 다른 서비스에 되묻지
-	 * 않는다 (sp-docs/requirements/board.md §7).
-	 */
-	private static final String ROLE_ADMIN = "ADMIN";
 
 	private final PostRepository postRepository;
 
@@ -288,7 +282,7 @@ public class PostService {
 	 * (sp-docs/security.md §5.3) — 1차가 비용으로 수용한 것이다.
 	 */
 	private static void validateWriterOrAdmin(Post post, LoginMember loginMember) {
-		if (ROLE_ADMIN.equals(loginMember.role())) {
+		if (ContractRole.ADMIN.equals(loginMember.role())) {
 			return;
 		}
 		validateWriter(post, loginMember);

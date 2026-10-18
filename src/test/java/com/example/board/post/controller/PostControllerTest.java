@@ -12,6 +12,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
 import com.example.board.client.MemberClient;
+import com.example.board.global.error.BusinessException;
 import com.example.board.post.entity.Post;
 import com.example.board.post.repository.PostRepository;
 import com.example.board.support.TestTokenFactory;
@@ -227,6 +228,38 @@ class PostControllerTest {
 		assertThat(rowCountByTitle("무토큰")).isZero();
 		assertThat(REQUEST_COUNT.get())
 				.as("인가에서 끊기므로 member 를 호출할 자리가 없다")
+				.isZero();
+	}
+
+	/**
+	 * 검증표 "{@code role = BOGUS} 로 {@code POST /posts} → 401 {@code A002}".
+	 * <b>전에는 201 로 글이 생성됐다</b> — {@code role} 의 값을 보지 않았다 (I-04 리뷰 실측,
+	 * sp-docs/plan/phase1.md §6 B-12). 서명이 유효해도 §6 의 열거 밖 값은 계약 위반 토큰이다
+	 * (sp-docs/api-contract.md §6).
+	 *
+	 * <p>거부는 {@code @CurrentMember} 리졸버가 한다 (sp-docs/tech-stack.md §2.1 의 집행 지점
+	 * 표) — 인자 해석에서 끊기므로 member 를 호출할 자리에 닿지 않는다.
+	 */
+	@Test
+	@DisplayName("role 이 열거 밖인 토큰으로 작성하면 401 A002 이고 저장되지 않는다")
+	void 열거_밖_role_로_작성하면_401_A002() throws Exception {
+		// 프로필을 활성으로 스텁한다 — 그러지 않으면 403 S002 가 나서 401 이 아닌 이유가
+		// role 인지 프로필인지 갈리지 않는다 (고치기 전 이 요청은 201 이었다)
+		respondWithActiveProfile(526L);
+
+		this.mockMvc.perform(post(PATH)
+						.header(HttpHeaders.AUTHORIZATION,
+								"Bearer " + TestTokenFactory.accessToken(526L, "BOGUS"))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("열거 밖 role 로 작성", "본문")))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("A002"));
+
+		assertThat(rowCountByTitle("열거 밖 role 로 작성"))
+				.as("계약 위반 토큰으로 글이 생성되면 안 된다 (sp-docs/api-contract.md §6)")
+				.isZero();
+		assertThat(REQUEST_COUNT.get())
+				.as("리졸버가 인자 해석에서 끊으므로 member 를 호출할 자리가 없다")
 				.isZero();
 	}
 
@@ -781,6 +814,36 @@ class PostControllerTest {
 				.as("필터 체인이 막으면 디스패치가 없으므로 해석된 예외도 없다. "
 						+ "CurrentMemberArgumentResolver 가 낸 401 이면 여기에 BusinessException 이 담긴다")
 				.isNull();
+	}
+
+	/**
+	 * 검증표 "{@code role = BOGUS} 로 {@code GET /posts/me} → 401 {@code A002}".
+	 * <b>전에는 200 이었다</b> (I-04 리뷰 실측, sp-docs/plan/phase1.md §6 B-12).
+	 *
+	 * <p><b>무토큰과 거부한 계층이 다르다.</b> 서명이 유효하므로 필터 체인은 통과하고
+	 * {@code @CurrentMember} 리졸버가 끊는다 (sp-docs/tech-stack.md §2.1) — 그래서 위
+	 * 테스트와 달리 핸들러가 선택되고 해석된 예외가 남는다. <b>그 대비가 집행 지점을
+	 * 고정한다</b> — 디코더에 claim 검증기를 더해 끊으면 필터 체인이 먼저 막아 핸들러가
+	 * {@code null} 이 되고, 코드도 {@code A003}(만료)으로 갈린다
+	 * ({@code JwtDecoderValidatorsTest} 가 그 집합을 고정하는 이유다).
+	 */
+	@Test
+	@DisplayName("role 이 열거 밖인 내 글 목록 요청은 리졸버가 401 A002 로 끊는다")
+	void 열거_밖_role_의_내_글_목록은_401_A002() throws Exception {
+		MvcResult result = this.mockMvc.perform(get(PATH + "/me")
+						.header(HttpHeaders.AUTHORIZATION,
+								"Bearer " + TestTokenFactory.accessToken(868L, "BOGUS")))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("A002"))
+				.andReturn();
+
+		assertThat(result.getHandler())
+				.as("서명이 유효한 토큰은 필터 체인을 통과한다 — 집행 지점은 리졸버다 "
+						+ "(sp-docs/tech-stack.md §2.1)")
+				.isNotNull();
+		assertThat(result.getResolvedException())
+				.as("리졸버가 던진 예외가 여기 담긴다. 디코더에서 끊으면 디스패치가 없어 null 이다")
+				.isInstanceOf(BusinessException.class);
 	}
 
 	/**

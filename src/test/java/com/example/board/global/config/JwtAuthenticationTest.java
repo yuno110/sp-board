@@ -337,6 +337,48 @@ class JwtAuthenticationTest {
 	}
 
 	/**
+	 * 서명이 유효해도 {@code role} 이 sp-docs/api-contract.md §6 의 열거 밖이면 <b>계약 위반
+	 * 토큰</b>이다 — 누락·공백과 같은 401 {@code A002} 다 (§8.5 의 "그 밖의 claim 검증 실패").
+	 * 집행 지점은 {@code CurrentMemberArgumentResolver} 이고, 그래서 {@code @CurrentMember} 를
+	 * 받는 핸들러를 지나야 관측된다 (sp-docs/tech-stack.md §2.1).
+	 *
+	 * <p><b>대소문자와 {@code ROLE_} 접두어를 관용하지 않는다.</b> 관용하면 검증 측이 발급 측
+	 * 계약보다 넓은 값을 받아들이게 되고, 권한 이름({@code ROLE_ADMIN})과 claim 값
+	 * ({@code ADMIN})의 구별이 흐려진다 — {@link RoleClaimConverter} 가 접두어를 붙이는 쪽이다.
+	 */
+	@ParameterizedTest(name = "role = \"{0}\"")
+	@ValueSource(strings = {"BOGUS", "user", "ROLE_ADMIN"})
+	@DisplayName("role 이 열거 밖인 토큰은 401 A002 다")
+	void 열거_밖_role_은_A002(String role) throws Exception {
+		assertAuthFailure("Bearer " + TestTokenFactory.accessToken(ACCOUNT_ID, role),
+				"A002", "유효하지 않은 토큰입니다.");
+	}
+
+	/**
+	 * <b>거부 사유를 응답으로 구별하지 않는다</b> (sp-docs/api-contract.md §6) — 누락·공백·열거
+	 * 밖의 응답 본문이 바이트 동일이다.
+	 *
+	 * <p><b>비교 앞에 {@code isNotEmpty()} 가드를 둔다.</b> 본문이 비면 어떤 바이트 비교도
+	 * 통과하므로 가드가 없으면 이 단언이 조용히 공허해진다. 셋이 모두 비는 경우를 그 하나로
+	 * 막는다 — 기준이 비지 않으면서 나머지 둘과 같다면 셋 다 비지 않았다.
+	 */
+	@Test
+	@DisplayName("열거 밖 role 의 401 응답 본문이 누락·공백과 바이트 동일하다")
+	void 열거_밖_role_의_응답이_누락과_같다() throws Exception {
+		byte[] missing = authFailureBody(TestTokenFactory.tokenWithoutRole(ACCOUNT_ID));
+		byte[] blank = authFailureBody(TestTokenFactory.tokenWithBlankRole(ACCOUNT_ID));
+		byte[] offEnum = authFailureBody(TestTokenFactory.accessToken(ACCOUNT_ID, "BOGUS"));
+
+		assertThat(missing)
+				.as("빈 본문끼리는 어떤 바이트 비교도 통과한다 — 비교의 기준이 비어 있으면 안 된다")
+				.isNotEmpty();
+		assertThat(offEnum)
+				.as("거부 사유가 응답에 드러나면 안 된다 (sp-docs/api-contract.md §6 §8.5)")
+				.isEqualTo(missing)
+				.isEqualTo(blank);
+	}
+
+	/**
 	 * JWT 검증 필터를 직접 만들지 않았다 (B-04 완료 기준, sp-docs/tech-stack.md §2).
 	 *
 	 * <p>표준 {@code BearerTokenAuthenticationFilter} 가 체인에 있고, 체인의 어느 필터도 이
@@ -439,6 +481,16 @@ class JwtAuthenticationTest {
 				.andExpect(jsonPath("$.success").value(false))
 				.andExpect(jsonPath("$.error.code").value(code))
 				.andExpect(jsonPath("$.error.message").value(message));
+	}
+
+	/** 401 응답 본문의 바이트. 401 이 아니면 그 자리에서 깨지므로 빈 배열이 비교에 들어오지 않는다. */
+	private byte[] authFailureBody(String token) throws Exception {
+		return this.mockMvc.perform(get("/test/current-member")
+						.header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+				.andExpect(status().isUnauthorized())
+				.andReturn()
+				.getResponse()
+				.getContentAsByteArray();
 	}
 
 	private void assertNoSession(MvcResult result) {
