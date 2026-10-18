@@ -47,7 +47,7 @@
 - [x] B-10 comment_count 소실 갱신 · 상태 done · 커밋 01b6c77
 - [x] B-11 조회수 증가가 comment_count 를 덮어쓴다 · 상태 done · 커밋 a40e8bc
 - [x] B-12 열거 밖 role 을 거부한다 [1차 후] · 상태 done
-- [ ] B-13 board javadoc 의 인용 범위 [1차 후] · 상태 todo
+- [x] B-13 board javadoc 의 인용 범위 [1차 후] · 상태 done
 
 > **B-05·B-08은 `MemberClient`를 호출한다.** 생성 경로에서만이다. B-06(목록)·B-07(수정·삭제)은 호출하지 않는다.
 
