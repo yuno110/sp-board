@@ -40,7 +40,7 @@ public enum ErrorCode {
 	// S001 은 내부 API 호출 실패(4xx·5xx·타임아웃·파싱 실패)에, S002 는 글·댓글 생성 시 활성
 	// 프로필이 없을 때 쓴다. 판정 규칙은 §5.1 이 정본이고, 쓰는 쪽은 B-05 이후다.
 	EXTERNAL_SERVICE_ERROR(HttpStatus.SERVICE_UNAVAILABLE, "S001", "일시적으로 서비스 연동에 실패했습니다."),
-	PROFILE_REQUIRED(HttpStatus.FORBIDDEN, "S002", "프로필 등록이 필요합니다.");
+	PROFILE_REQUIRED(HttpStatus.FORBIDDEN, "S002", "활성 프로필이 필요합니다.");
 
 	private final HttpStatus status;
 	private final String code;

@@ -42,7 +42,7 @@ class ErrorCodeTest {
 		contract.put("CM001", "404 댓글을 찾을 수 없습니다.");
 		contract.put("CM002", "403 댓글에 대한 권한이 없습니다.");
 		contract.put("S001", "503 일시적으로 서비스 연동에 실패했습니다.");
-		contract.put("S002", "403 프로필 등록이 필요합니다.");
+		contract.put("S002", "403 활성 프로필이 필요합니다.");
 
 		Map<String, String> implemented = Stream.of(ErrorCode.values())
 				.collect(Collectors.toMap(
@@ -76,11 +76,11 @@ class ErrorCodeTest {
 	 * 없을 때). 쓰는 곳이 없는 동안에도 값이 정본과 어긋나지 않게 못박는다.
 	 */
 	@Test
-	@DisplayName("S002 가 403 이고 메시지가 \"프로필 등록이 필요합니다.\" 다")
+	@DisplayName("S002 가 403 이고 메시지가 \"활성 프로필이 필요합니다.\" 다")
 	void S002_는_403_이다() {
 		assertThat(ErrorCode.PROFILE_REQUIRED.getStatus().value()).isEqualTo(403);
 		assertThat(ErrorCode.PROFILE_REQUIRED.getCode()).isEqualTo("S002");
-		assertThat(ErrorCode.PROFILE_REQUIRED.getMessage()).isEqualTo("프로필 등록이 필요합니다.");
+		assertThat(ErrorCode.PROFILE_REQUIRED.getMessage()).isEqualTo("활성 프로필이 필요합니다.");
 	}
 
 	/** {@code S001} 은 내부 API 호출 실패에 쓴다 — 경보 대상이므로 503 이다 (§5.1). */
