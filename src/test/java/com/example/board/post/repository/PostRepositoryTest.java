@@ -7,15 +7,23 @@ import com.example.board.global.config.JpaConfig;
 import com.example.board.global.error.BusinessException;
 import com.example.board.global.error.ErrorCode;
 import com.example.board.post.entity.Post;
+import com.example.board.post.entity.PostCategory;
 import com.example.board.post.support.PostReader;
 import jakarta.persistence.Column;
 import java.util.List;
+import java.util.Locale;
+import java.util.concurrent.CopyOnWriteArrayList;
+import org.hibernate.cfg.AvailableSettings;
+import org.hibernate.resource.jdbc.spi.StatementInspector;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.orm.jpa.HibernatePropertiesCustomizer;
 import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabase;
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Import;
 import org.springframework.test.context.ActiveProfiles;
 
@@ -39,11 +47,14 @@ import org.springframework.test.context.ActiveProfiles;
  * 그러면 {@code created_at} 이 NULL 로 들어가 NOT NULL 위반이 난다
  * (sp-docs/conventions.md §9.3). {@code PostReader} 도 같은 이유로 직접 올린다.
  *
- * <p>픽스처의 {@code writerId} 는 201 대역을 쓴다. {@code DB_CLOSE_DELAY=-1} 과 고정
- * 스키마명 때문에 같은 JVM 의 모든 테스트 클래스가 하나의 DB 를 보므로
- * (sp-docs/tech-stack.md §5.3), 클래스마다 대역을 겹치지 않게 둔다. 지금은 각 테스트가
+ * <p>픽스처의 {@code writerId} 는 201 대역을 쓴다(B-03 이 201~210, B-14 가 211~229).
+ * {@code DB_CLOSE_DELAY=-1} 과 고정 스키마명 때문에 같은 JVM 의 모든 테스트 클래스가 하나의 DB 를
+ * 보므로 (sp-docs/tech-stack.md §5.3), 클래스마다 대역을 겹치지 않게 둔다. 지금은 각 테스트가
  * {@code @DataJpaTest} 의 기본 롤백으로 정리되어 행이 남지 않지만, 대역을 나눠 두면 나중에
  * 정리 방식이 바뀌어도 클래스 간 결합이 생기지 않는다.
+ *
+ * <p>2차의 컬럼·인덱스와 {@code like_count}·{@code attachment_count} 의 좁은 UPDATE 는
+ * sp-docs/plan/phase2-board.md B-14 의 검증 표에서 왔다.
  */
 @DataJpaTest
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
@@ -56,8 +67,13 @@ class PostRepositoryTest {
 
 	private static final int WRITER_NICKNAME_WIDTH = 30;
 
+	private static final int CATEGORY_WIDTH = 20;
+
 	/** sp-docs/requirements/board.md §4 의 게시글 본문 입력 상한이다. */
 	private static final int CONTENT_MAX_LENGTH = 10_000;
+
+	/** sp-docs/requirements/board.md §11 의 글당 활성 첨부 상한이다. */
+	private static final int ATTACHMENT_LIMIT = 10;
 
 	@Autowired
 	private TestEntityManager em;
@@ -67,6 +83,9 @@ class PostRepositoryTest {
 
 	@Autowired
 	private PostReader postReader;
+
+	@Autowired
+	private StatementRecorder statementRecorder;
 
 	@Test
 	@DisplayName("저장 후 조회하면 모든 필드가 일치한다")
@@ -358,6 +377,232 @@ class PostRepositoryTest {
 				.isEqualTo(ErrorCode.POST_NOT_FOUND);
 	}
 
+	@Test
+	@DisplayName("카테고리를 생략하고 만들면 FREE, 고르면 그 값으로 저장된다")
+	void 카테고리_생략은_FREE() {
+		Post omitted = postRepository.saveAndFlush(post(211L, "카테고리생략", "생략", "본문"));
+		Post chosen = postRepository.saveAndFlush(Post.builder()
+				.writerId(212L)
+				.writerNickname("카테고리선택")
+				.title("질문")
+				.content("본문")
+				.category(PostCategory.QNA)
+				.build());
+		em.clear();
+
+		assertThat(postRepository.findById(omitted.getId()).orElseThrow().getCategory())
+				.as("생략하면 FREE (sp-docs/requirements/board.md §8)")
+				.isEqualTo(PostCategory.FREE);
+		assertThat(postRepository.findById(chosen.getId()).orElseThrow().getCategory())
+				.isEqualTo(PostCategory.QNA);
+	}
+
+	/**
+	 * 수정 본문의 {@code category} 는 선택이고 생략하면 지금 값을 유지한다
+	 * (sp-docs/requirements/board.md §8). {@code update(title, content)} 는 카테고리를 건드리지
+	 * 않는다 — 그 모양은 B-03 이 요구한다 (sp-docs/plan/phase2-board.md B-14).
+	 */
+	@Test
+	@DisplayName("changeCategory() 는 null 이면 지금 값을 유지하고, update() 는 카테고리를 바꾸지 않는다")
+	void 카테고리_바꾸기() {
+		Post saved = postRepository.saveAndFlush(post(213L, "카테고리변경", "변경", "본문"));
+		Long id = saved.getId();
+		em.clear();
+
+		Post target = postRepository.findById(id).orElseThrow();
+		target.changeCategory(PostCategory.NOTICE);
+		target.update("바뀐 제목", "바뀐 본문");
+		em.flush();
+		em.clear();
+		assertThat(postRepository.findById(id).orElseThrow().getCategory())
+				.as("update() 가 changeCategory() 의 값을 되돌리지 않는다")
+				.isEqualTo(PostCategory.NOTICE);
+
+		postRepository.findById(id).orElseThrow().changeCategory(null);
+		em.flush();
+		em.clear();
+		assertThat(postRepository.findById(id).orElseThrow().getCategory())
+				.as("생략(null)은 지금 값을 유지한다")
+				.isEqualTo(PostCategory.NOTICE);
+	}
+
+	/**
+	 * 새 컬럼의 <b>DB DEFAULT</b> 를 본다. 엔티티 생성자가 값을 넣는 것과 별개로, 기존 행과
+	 * 엔티티를 지나지 않는 INSERT 를 채우는 것은 마이그레이션의 기본값이다
+	 * (sp-docs/domain-model.md §4.1·§7).
+	 */
+	@Test
+	@DisplayName("새 컬럼을 생략한 post INSERT 는 category FREE, like_count 0, attachment_count 0 이다")
+	void 새_컬럼을_생략한_INSERT() {
+		em.getEntityManager()
+				.createNativeQuery("insert into post (writer_id, writer_nickname, title, content, "
+						+ "created_at, updated_at) values (214, '기본값작성자', '기본값', '본문', "
+						+ "current_timestamp, current_timestamp)")
+				.executeUpdate();
+
+		Object[] row = (Object[]) em.getEntityManager()
+				.createNativeQuery("select category, like_count, attachment_count from post "
+						+ "where writer_id = 214")
+				.getSingleResult();
+
+		assertThat(String.valueOf(row[0])).isEqualTo("FREE");
+		assertThat(((Number) row[1]).intValue()).isZero();
+		assertThat(((Number) row[2]).intValue()).isZero();
+	}
+
+	/** {@link #폭이_title_200_writer_nickname_30이다()} 와 같은 이유다 (sp-docs/conventions.md §9.2). */
+	@Test
+	@DisplayName("information_schema 의 category 폭이 20 이고 엔티티 선언과 같다")
+	void 폭이_category_20이다() throws Exception {
+		int categoryWidth = actualWidth("category");
+
+		assertThat(categoryWidth)
+				.as("V3__add_post_category_and_counts.sql 의 category VARCHAR 폭")
+				.isEqualTo(CATEGORY_WIDTH);
+		assertThat(declaredLength("category"))
+				.as("엔티티와 마이그레이션이 어긋나도 validate 는 통과한다. 여기서 막는다")
+				.isEqualTo(categoryWidth);
+	}
+
+	/** 인덱스 이름은 sp-docs/domain-model.md §4.3 이 정본이다. */
+	@Test
+	@DisplayName("post 에 idx_post_category 가 있다")
+	void 카테고리_인덱스가_있다() {
+		List<?> indexes = em.getEntityManager()
+				.createNativeQuery("select index_name from information_schema.indexes "
+						+ "where table_name = 'post'")
+				.getResultList();
+
+		assertThat(indexes).map(name -> String.valueOf(name).toLowerCase())
+				.contains("idx_post_category");
+	}
+
+	/**
+	 * {@code like_count} 의 좁은 UPDATE (sp-docs/domain-model.md §6.1). 1 행인 경우를 함께 봐야
+	 * 0 행 단언이 뜻을 갖는다 — 늘 0 을 돌려주는 문장도 0 행 단언은 통과한다.
+	 */
+	@Test
+	@DisplayName("like_count 는 +1·-1 이 1 행이고, 0 에서 -1 은 0 행이며 음수가 되지 않는다")
+	void like_count_증감() {
+		Long id = postRepository.saveAndFlush(post(215L, "좋아요증감", "좋아요", "본문")).getId();
+
+		assertThat(postRepository.increaseLikeCount(id)).isEqualTo(1);
+		assertThat(column(id, "like_count")).isEqualTo(1);
+		assertThat(postRepository.decreaseLikeCount(id)).isEqualTo(1);
+		assertThat(column(id, "like_count")).isZero();
+
+		assertThat(postRepository.decreaseLikeCount(id)).as("0 에서 -1").isZero();
+		assertThat(column(id, "like_count")).as("음수가 되지 않는다").isZero();
+	}
+
+	/**
+	 * 지워진 글의 좋아요는 0 행이다 — 부르는 쪽이 404 {@code P001} 로 바꾼다
+	 * (sp-docs/domain-model.md §6.1). 감소는 집계를 1 로 둔 뒤 지워서 본다 — 0 에서 보면
+	 * {@code like_count > 0} 조건만으로도 0 행이라 {@code deleted} 조건을 가르지 못한다.
+	 */
+	@Test
+	@DisplayName("지워진 글에 like_count +1·-1 은 0 행이다")
+	void 지워진_글의_like_count() {
+		Long id = postRepository.saveAndFlush(post(216L, "좋아요삭제", "지울 글", "본문")).getId();
+		assertThat(postRepository.increaseLikeCount(id)).isEqualTo(1);
+		markDeleted(id);
+
+		assertThat(postRepository.increaseLikeCount(id)).as("지워진 글에 +1").isZero();
+		assertThat(postRepository.decreaseLikeCount(id)).as("지워진 글에 -1").isZero();
+		assertThat(column(id, "like_count")).isEqualTo(1);
+	}
+
+	/**
+	 * 개수 상한의 판정은 이 문장 하나다 (sp-docs/domain-model.md §6.2). 상한 바로 아래(9 → 10)가
+	 * 1 행이고 상한에서(10 → 11) 0 행이어야 판정이 엄격 부등호({@code < :limit})로 고정된다. 상한
+	 * 값은 이 테스트가 인자로 넘기는 것이고, 운영 코드의 값은 그 값을 쓰는 항목이 고정한다.
+	 */
+	@Test
+	@DisplayName("attachment_count 는 상한까지 +1 이 1 행이고, 상한인 글에 +1 은 0 행이다")
+	void attachment_count_상한() {
+		Long id = postRepository.saveAndFlush(post(217L, "첨부상한", "첨부", "본문")).getId();
+
+		for (int i = 0; i < ATTACHMENT_LIMIT; i++) {
+			assertThat(postRepository.increaseAttachmentCount(id, ATTACHMENT_LIMIT))
+					.as("%d 번째 +1", i + 1)
+					.isEqualTo(1);
+		}
+		assertThat(postRepository.increaseAttachmentCount(id, ATTACHMENT_LIMIT))
+				.as("상한인 글에 +1")
+				.isZero();
+		assertThat(column(id, "attachment_count")).isEqualTo(ATTACHMENT_LIMIT);
+	}
+
+	@Test
+	@DisplayName("지워진 글에 attachment_count +1 은 0 행이다")
+	void 지워진_글의_attachment_count_증가() {
+		Long id = postRepository.saveAndFlush(post(218L, "첨부삭제글", "지울 글", "본문")).getId();
+		markDeleted(id);
+
+		assertThat(postRepository.increaseAttachmentCount(id, ATTACHMENT_LIMIT)).isZero();
+		assertThat(column(id, "attachment_count")).isZero();
+	}
+
+	@Test
+	@DisplayName("attachment_count 는 -1 이 1 행이고, 0 에서 -1 은 0 행이며 음수가 되지 않는다")
+	void attachment_count_감소() {
+		Long id = postRepository.saveAndFlush(post(219L, "첨부감소", "첨부", "본문")).getId();
+		assertThat(postRepository.increaseAttachmentCount(id, ATTACHMENT_LIMIT)).isEqualTo(1);
+
+		assertThat(postRepository.decreaseAttachmentCount(id)).isEqualTo(1);
+		assertThat(column(id, "attachment_count")).isZero();
+
+		assertThat(postRepository.decreaseAttachmentCount(id)).as("0 에서 -1").isZero();
+		assertThat(column(id, "attachment_count")).as("음수가 되지 않는다").isZero();
+	}
+
+	/**
+	 * 새 문장이 그 집계 컬럼 하나만 싣는지 발행된 SQL 로 본다 — B-10 의 관측 방식이다
+	 * (sp-docs/plan/phase1.md §6 B-10). 엔티티 더티 체킹의 UPDATE 는 모든 컬럼을 실으므로
+	 * {@code title}·{@code content} 가 들어 있다.
+	 */
+	@Test
+	@DisplayName("새 문장이 발행한 update post 는 그 집계 컬럼만 싣고 title·content 가 없다")
+	void 새_문장은_그_집계_컬럼만_싣는다() {
+		Long id = postRepository.saveAndFlush(post(220L, "문장모양", "문장", "본문")).getId();
+
+		assertThat(발행된_post_UPDATE(() -> postRepository.increaseLikeCount(id)))
+				.singleElement().satisfies(sql -> 그_컬럼만_싣는다(sql, "like_count"));
+		assertThat(발행된_post_UPDATE(() -> postRepository.decreaseLikeCount(id)))
+				.singleElement().satisfies(sql -> 그_컬럼만_싣는다(sql, "like_count"));
+		assertThat(발행된_post_UPDATE(() -> postRepository.increaseAttachmentCount(id, ATTACHMENT_LIMIT)))
+				.singleElement().satisfies(sql -> 그_컬럼만_싣는다(sql, "attachment_count"));
+		assertThat(발행된_post_UPDATE(() -> postRepository.decreaseAttachmentCount(id)))
+				.singleElement().satisfies(sql -> 그_컬럼만_싣는다(sql, "attachment_count"));
+	}
+
+	private List<String> 발행된_post_UPDATE(Runnable action) {
+		statementRecorder.clear();
+		action.run();
+		return statementRecorder.postUpdates();
+	}
+
+	private static void 그_컬럼만_싣는다(String sql, String column) {
+		String setClause = sql.substring(sql.indexOf(" set ") + " set ".length(), sql.indexOf(" where "));
+		assertThat(setClause).as("SET 절: %s", sql).contains(column).doesNotContain(",");
+		assertThat(sql).doesNotContain("title").doesNotContain("content");
+	}
+
+	private int column(Long id, String columnName) {
+		Number value = (Number) em.getEntityManager()
+				.createNativeQuery("select " + columnName + " from post where id = :id")
+				.setParameter("id", id)
+				.getSingleResult();
+		return value.intValue();
+	}
+
+	private void markDeleted(Long id) {
+		em.getEntityManager()
+				.createNativeQuery("update post set deleted = true where id = :id")
+				.setParameter("id", id)
+				.executeUpdate();
+	}
+
 	private int actualWidth(String columnName) {
 		Number width = (Number) em.getEntityManager()
 				.createNativeQuery("select character_maximum_length from information_schema.columns "
@@ -386,6 +631,52 @@ class PostRepositoryTest {
 				.title(title)
 				.content(content)
 				.build();
+	}
+
+	/**
+	 * 발행된 SQL 을 모은다. Hibernate 의 {@code StatementInspector} 라 문장이 JDBC 로 넘어가기
+	 * 전에 불린다. 로그·통계 설정에 기대지 않는다 — 그 설정이 꺼지면 조용히 빈 결과가 되지만, 이
+	 * 수집기는 테스트가 직접 꽂고 꽂히지 않으면 {@code singleElement()} 가 빈 목록에서 터진다
+	 * ({@code CommentServiceTest.StatementRecorder} 와 같은 수단이다).
+	 */
+	static class StatementRecorder implements StatementInspector {
+
+		private final List<String> statements = new CopyOnWriteArrayList<>();
+
+		@Override
+		public String inspect(String sql) {
+			this.statements.add(sql);
+			return sql;
+		}
+
+		void clear() {
+			this.statements.clear();
+		}
+
+		/** {@code post} 를 바꾸는 UPDATE 만. 소문자·공백이 정규화된 문장이다. */
+		List<String> postUpdates() {
+			return this.statements.stream()
+					.map(sql -> sql.toLowerCase(Locale.ROOT).replaceAll("\\s+", " ").trim())
+					.filter(sql -> sql.startsWith("update post"))
+					.toList();
+		}
+
+	}
+
+	/** {@link StatementRecorder} 를 Hibernate 에 꽂는다. */
+	@TestConfiguration
+	static class StatementRecorderConfig {
+
+		@Bean
+		StatementRecorder statementRecorder() {
+			return new StatementRecorder();
+		}
+
+		@Bean
+		HibernatePropertiesCustomizer statementRecorderRegistration(StatementRecorder recorder) {
+			return properties -> properties.put(AvailableSettings.STATEMENT_INSPECTOR, recorder);
+		}
+
 	}
 
 }

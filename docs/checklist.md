@@ -67,7 +67,7 @@
 
 `B-xx` 의 범위·의존·완료 기준·검증은 `sp-docs/plan/phase2-board.md`, `I-xx` 는 `sp-docs/plan/phase2-frontend-integration.md` 다. 단계와 순서는 각 문서의 §1 이다. 2차의 `I-xx` 는 2차 B·AU·M 항목이 모두 `done` 인 뒤에 순차로 한다.
 
-- [ ] B-14 2차 스키마와 엔티티 · 상태 todo · 커밋 -
+- [x] B-14 2차 스키마와 엔티티 · 상태 done · 커밋 -
 - [ ] B-15 에러 코드와 multipart 예외 매핑 · 상태 todo · 커밋 -
 - [ ] B-16 인가 규칙·선택적 리졸버·환경값 가드 · 상태 todo · 커밋 -
 - [ ] B-17 댓글 삭제를 post 먼저·조건부 전환으로 고친다 · 상태 todo · 커밋 -

@@ -1,6 +1,7 @@
 package com.example.board.comment.repository;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 import com.example.board.comment.entity.Comment;
 import com.example.board.global.config.JpaConfig;
@@ -17,16 +18,19 @@ import org.springframework.boot.test.autoconfigure.jdbc.AutoConfigureTestDatabas
 import org.springframework.boot.test.autoconfigure.orm.jpa.DataJpaTest;
 import org.springframework.boot.test.autoconfigure.orm.jpa.TestEntityManager;
 import org.springframework.context.annotation.Import;
+import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.test.context.ActiveProfiles;
 
 /**
  * sp-docs/plan/phase1.md §6 B-03 의 "검증" 표 중 댓글에 해당하는 것을 테스트로 옮긴 것이다.
+ * 답글의 부모({@code parent_id})는 sp-docs/plan/phase2-board.md B-14 의 검증 표에서 왔다.
  *
  * <p>두 애노테이션의 이유는 {@link com.example.board.post.repository.PostRepositoryTest} 와
  * 같다 (sp-docs/conventions.md §9.3).
  *
- * <p>픽스처의 {@code writerId} 는 301 대역을 쓴다 — 같은 JVM 의 테스트 클래스가 하나의 DB 를
- * 보므로 클래스마다 대역을 겹치지 않게 둔다 (sp-docs/tech-stack.md §5.3).
+ * <p>픽스처의 {@code writerId} 는 301 대역을 쓴다(B-03 이 301~317, B-14 가 318~329) — 같은 JVM
+ * 의 테스트 클래스가 하나의 DB 를 보므로 클래스마다 대역을 겹치지 않게 둔다
+ * (sp-docs/tech-stack.md §5.3).
  */
 @DataJpaTest
 @AutoConfigureTestDatabase(replace = AutoConfigureTestDatabase.Replace.NONE)
@@ -83,10 +87,14 @@ class CommentRepositoryTest {
 	 * {@code post_id} 는 같은 스키마이므로 FK 를 둔다. {@code writer_id} 는 스키마 경계를 넘는
 	 * 논리 참조이므로 두지 않는다 (sp-docs/requirements/board.md §3 규칙 4). 나중
 	 * 마이그레이션이 {@code writer_id} 에 FK 를 붙이는 것을 여기서 막는다.
+	 *
+	 * <p>{@code parent_id} 는 같은 테이블 안의 참조이므로 FK 를 둔다 — 2차의 {@code V4} 가 더했다
+	 * (sp-docs/domain-model.md §4.3). 그 전의 이 단언은 {@code post_id} 하나였고, 그것은 그 시점의
+	 * 계약이다 (sp-docs/plan/phase2-board.md 머리말).
 	 */
 	@Test
-	@DisplayName("comment 의 FOREIGN KEY 는 post_id 하나뿐이고 writer_id 에는 없다")
-	void FK_는_post_id_하나뿐이다() {
+	@DisplayName("comment 의 FOREIGN KEY 는 post_id·parent_id 이고 writer_id 에는 없다")
+	void FK_는_post_id_와_parent_id_다() {
 		List<?> foreignKeyColumns = em.getEntityManager()
 				.createNativeQuery("select k.column_name "
 						+ "from information_schema.table_constraints c "
@@ -96,19 +104,19 @@ class CommentRepositoryTest {
 				.getResultList();
 
 		assertThat(foreignKeyColumns).map(name -> String.valueOf(name).toLowerCase())
-				.containsExactly("post_id");
+				.containsExactlyInAnyOrder("post_id", "parent_id");
 	}
 
 	/**
 	 * FK 제약 이름은 sp-docs/domain-model.md §4.3 이 정본이다 — 그 표가 {@code fk_comment_post_id}
-	 * 를 배정했다. 인덱스 이름 네 개를 이름으로 단언하면서 FK 만 컬럼으로 보면 비대칭이고,
-	 * 이름이 바뀌어도 아무것도 깨지지 않는다.
+	 * 와 {@code fk_comment_parent_id} 를 배정했다. 인덱스 이름을 이름으로 단언하면서 FK 만 컬럼으로
+	 * 보면 비대칭이고, 이름이 바뀌어도 아무것도 깨지지 않는다.
 	 *
 	 * <p>이름은 소문자화해 비교한다 — H2 와 MySQL 의 대소문자 저장이 다를 수 있다
 	 * ({@link #인덱스가_있다()} 와 같은 방식이다).
 	 */
 	@Test
-	@DisplayName("comment 의 FK 이름이 fk_comment_post_id 다")
+	@DisplayName("comment 의 FK 이름이 fk_comment_post_id·fk_comment_parent_id 다")
 	void FK_이름이_정본과_같다() {
 		List<?> constraintNames = em.getEntityManager()
 				.createNativeQuery("select constraint_name from information_schema.table_constraints "
@@ -116,7 +124,7 @@ class CommentRepositoryTest {
 				.getResultList();
 
 		assertThat(constraintNames).map(name -> String.valueOf(name).toLowerCase())
-				.containsExactly("fk_comment_post_id");
+				.containsExactlyInAnyOrder("fk_comment_post_id", "fk_comment_parent_id");
 	}
 
 	/**
@@ -267,6 +275,78 @@ class CommentRepositoryTest {
 		em.clear();
 
 		assertThat(commentRepository.softDeleteByPostId(post.getId())).isZero();
+	}
+
+	/**
+	 * 답글은 부모를 갖고 최상위 댓글은 {@code parent} 가 {@code null} 이다
+	 * (sp-docs/domain-model.md §4.2, sp-docs/requirements/board.md §12).
+	 */
+	@Test
+	@DisplayName("parent 를 주면 답글로, 생략하면 최상위 댓글로 저장된다")
+	void 답글과_최상위_댓글() {
+		Post post = savedPost(318L, "글작성자");
+		Comment top = commentRepository.saveAndFlush(comment(post, 319L, "최상위작성자", "최상위 댓글"));
+		Comment reply = commentRepository.saveAndFlush(Comment.builder()
+				.post(post)
+				.writerId(320L)
+				.writerNickname("답글작성자")
+				.content("답글")
+				.parent(top)
+				.build());
+		em.clear();
+
+		assertThat(commentRepository.findById(top.getId()).orElseThrow().getParent())
+				.as("parent 를 생략하면 최상위다")
+				.isNull();
+		assertThat(commentRepository.findById(reply.getId()).orElseThrow().getParent().getId())
+				.isEqualTo(top.getId());
+	}
+
+	/** {@code fk_comment_parent_id} 가 없는 부모를 막는다 (sp-docs/domain-model.md §4.3). */
+	@Test
+	@DisplayName("없는 parent_id 로 댓글을 저장하면 fk_comment_parent_id 위반이다")
+	void 없는_parent_id_는_FK_위반이다() {
+		Post post = savedPost(321L, "글작성자");
+		Comment missingParent = em.getEntityManager().getReference(Comment.class, 999_999_999L);
+
+		assertThatThrownBy(() -> commentRepository.saveAndFlush(Comment.builder()
+				.post(post)
+				.writerId(322L)
+				.writerNickname("답글작성자")
+				.content("없는 부모의 답글")
+				.parent(missingParent)
+				.build()))
+				.isInstanceOf(DataIntegrityViolationException.class)
+				.satisfies(e -> assertThat(
+						((DataIntegrityViolationException) e).getMostSpecificCause().getMessage())
+						.containsIgnoringCase("fk_comment_parent_id"));
+	}
+
+	/**
+	 * {@code parent} 도 {@code @ManyToOne(LAZY)} 다 (sp-docs/domain-model.md §4.2).
+	 * {@link #post_는_LAZY_다()} 와 같은 이유다 — 답글 목록을 읽을 때마다 부모를 끌어오면 N+1 이
+	 * 되고 기능 테스트는 결과가 같아 통과한다.
+	 */
+	@Test
+	@DisplayName("parent 연관관계가 LAZY 로 매핑된다")
+	void parent_는_LAZY_다() throws Exception {
+		FetchType fetch = Comment.class.getDeclaredField("parent")
+				.getAnnotation(ManyToOne.class).fetch();
+
+		assertThat(fetch).isEqualTo(FetchType.LAZY);
+	}
+
+	/** 인덱스 이름은 sp-docs/domain-model.md §4.3 이 정본이다. */
+	@Test
+	@DisplayName("comment 에 idx_comment_parent_id 가 있다")
+	void 답글_인덱스가_있다() {
+		List<?> indexes = em.getEntityManager()
+				.createNativeQuery("select index_name from information_schema.indexes "
+						+ "where table_name = 'comment'")
+				.getResultList();
+
+		assertThat(indexes).map(name -> String.valueOf(name).toLowerCase())
+				.contains("idx_comment_parent_id");
 	}
 
 	private int actualWidth(String columnName) {

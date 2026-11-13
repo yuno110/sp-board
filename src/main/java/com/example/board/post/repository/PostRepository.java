@@ -20,6 +20,11 @@ import org.springframework.data.repository.query.Param;
  * <p><b>{@code view_count} 증가도 여기 있다</b> (sp-docs/plan/phase1.md §6 B-11). 집계와 같은
  * 이유다 — 관리 엔티티를 메모리에서 올리면 더티 체킹이 변경되지 않은 컬럼까지 UPDATE 에 실어
  * 그 트랜잭션이 읽은 값으로 다른 컬럼을 덮어쓴다.
+ *
+ * <p><b>{@code like_count}·{@code attachment_count} 의 좁은 UPDATE 도 여기 있다</b>
+ * (sp-docs/domain-model.md §6, sp-docs/conventions.md §1.3). 근거 행은 {@code post_like}·
+ * {@code attachment} 지만 문장이 바꾸는 테이블은 {@code post} 다 — {@code comment_count} 와 같은
+ * 이유다.
  */
 public interface PostRepository extends JpaRepository<Post, Long> {
 
@@ -113,5 +118,86 @@ public interface PostRepository extends JpaRepository<Post, Long> {
 	@Modifying(clearAutomatically = true)
 	@Query("update Post p set p.viewCount = p.viewCount + 1 where p.id = :id")
 	int increaseViewCount(@Param("id") Long id);
+
+	/**
+	 * {@code like_count} 를 1 올린다. 영향받은 행 수를 돌려준다 — 글이 없거나 지워졌으면 0 행이다.
+	 *
+	 * <p>문장과 조건은 sp-docs/domain-model.md §6.1 의 {@code PUT} 1) 그대로다. <b>좁은 UPDATE 다
+	 * — {@code like_count} 한 컬럼만 싣는다</b> (§6). 1 행이면 이 문장이 {@code post} 행의 배타
+	 * 락을 쥔다. 좋아요의 락 순서가 이 문장을 {@code post_like} 쓰기보다 먼저 두게 하는 이유다
+	 * (§6.1).
+	 *
+	 * <p><b>{@code clearAutomatically} 를 켠다.</b> 부르는 쪽이 이 문장 다음에 {@code post} 를
+	 * 다시 읽는다 — 응답의 {@code likeCount} 는 쓴 뒤(되돌렸으면 되돌린 뒤) 읽은 값이다 (§6.1).
+	 * 이 문장은 엔티티를 지나지 않으므로 영속성 컨텍스트에 남은 사본은 증가 전 값을 들고 있고,
+	 * 비우지 않으면 다시 읽기가 그 사본을 돌려줄 수 있다 — {@link #increaseViewCount} 를 끈
+	 * 상태로 측정한 결함과 같은 모양이다 (sp-docs/plan/phase1.md §6 B-11). 응답 값으로 이 설정을
+	 * 관측하는 것은 그 응답을 만드는 항목이다 (sp-docs/plan/phase2-board.md B-14).
+	 *
+	 * <p><b>{@code flushAutomatically} 도 켠다.</b> 비우기는 내보내지 않은 변경을 버린다. 먼저
+	 * 내보내야 부르는 쪽이 이 문장 앞에 남긴 쓰기가 비우기에 조용히 사라지지 않는다.
+	 */
+	@Modifying(flushAutomatically = true, clearAutomatically = true)
+	@Query("update Post p set p.likeCount = p.likeCount + 1 where p.id = :id and p.deleted = false")
+	int increaseLikeCount(@Param("id") Long id);
+
+	/**
+	 * {@code like_count} 를 1 내린다. 영향받은 행 수를 돌려준다 — 글이 없거나 지워졌거나 집계가
+	 * 이미 0 이면 0 행이다.
+	 *
+	 * <p>문장과 조건은 sp-docs/domain-model.md §6.1 의 {@code DELETE} 1) 그대로다. <b>음수 방지가
+	 * {@code where} 절에 있다</b> ({@code p.likeCount > 0}, §6). 0 행의 두 경우를 가르는 것은
+	 * 부르는 쪽이다 (§6.1).
+	 *
+	 * <p>{@code @Modifying} 설정과 이유는 {@link #increaseLikeCount} 와 같다. 0 행일 때 글이
+	 * 있는지 다시 읽어 가르는 것도 이 문장 다음의 {@code post} 읽기다.
+	 */
+	@Modifying(flushAutomatically = true, clearAutomatically = true)
+	@Query("update Post p set p.likeCount = p.likeCount - 1 "
+			+ "where p.id = :id and p.deleted = false and p.likeCount > 0")
+	int decreaseLikeCount(@Param("id") Long id);
+
+	/**
+	 * {@code attachment_count} 를 1 올린다. 영향받은 행 수를 돌려준다 — 글이 없거나 지워졌거나 활성
+	 * 첨부가 이미 {@code limit} 개면 0 행이다.
+	 *
+	 * <p>문장과 조건은 sp-docs/domain-model.md §6.2 의 1) 그대로다. <b>개수 상한의 판정은 이 문장
+	 * 하나다</b> — 세어 보고 넣는 두 단계({@code SELECT count} → INSERT)는 동시 업로드에서 상한을
+	 * 넘는다 (§6.2). 1 행이면 이 문장이 {@code post} 행의 배타 락을 먼저 쥐므로 이어지는
+	 * {@code attachment} INSERT 의 FK 공유 락이 문제가 되지 않는다 (§6.2).
+	 *
+	 * <p><b>상한은 인자다.</b> 값(10)은 sp-docs/requirements/board.md §11 의 규칙이고, 이 문장은
+	 * 판정의 모양({@code attachment_count < 상한})만 갖는다.
+	 *
+	 * <p><b>{@code clearAutomatically} 를 켠다.</b> 0 행이면 부르는 쪽이 글을 다시 읽어 404
+	 * {@code P001} 과 409 {@code AT003} 을 가른다 (§6.2). 그 글의 사본이 영속성 컨텍스트에 남아
+	 * 있으면 다시 읽기가 그 사본을 돌려줄 수 있다 — 비우면 다음 읽기가 새 SELECT 다.
+	 * {@code flushAutomatically} 를 함께 켜는 이유는 {@link #increaseLikeCount} 와 같다.
+	 */
+	@Modifying(flushAutomatically = true, clearAutomatically = true)
+	@Query("update Post p set p.attachmentCount = p.attachmentCount + 1 "
+			+ "where p.id = :id and p.deleted = false and p.attachmentCount < :limit")
+	int increaseAttachmentCount(@Param("id") Long id, @Param("limit") int limit);
+
+	/**
+	 * {@code attachment_count} 를 1 내린다. 영향받은 행 수를 돌려준다 — 집계가 이미 0 이면 0 행이다.
+	 *
+	 * <p>문장과 조건은 sp-docs/domain-model.md §6.2 의 첨부 삭제 1) 그대로다. <b>음수 방지가
+	 * {@code where} 절에 있다</b> ({@code p.attachmentCount > 0}). {@code deleted} 조건이 없는 것도
+	 * 그 문장의 모양이다. 0 행은 활성 첨부가 있는데 집계가 이미 0 인, 근거 행과 어긋난 상태이고 그
+	 * 처리는 부르는 쪽이 한다 (§6.2).
+	 *
+	 * <p>{@code clearAutomatically} 를 켜지 않는다. 부르는 쪽이 이 문장 다음에 {@code post} 를 다시
+	 * 읽지 않는다 — 0 행이어도 글을 읽지 않고 다음 단계로 가며 (§6.2), 첨부 삭제의 응답에는
+	 * {@code attachment_count} 가 없다 (sp-docs/plan/phase2-board.md B-14). 그래서 켜든 끄든 응답이
+	 * 같고, 끄는 쪽은 부르는 쪽이 쥔 엔티티를 영속성 컨텍스트에 남긴다.
+	 *
+	 * <p>{@code flushAutomatically} 는 켠다. 호출 시점에 쓰기 대기 중인 변경이 있으면 그것을 먼저
+	 * 내보내 SQL 순서를 프로그램 순서와 맞춘다 — {@link #increaseCommentCount} 와 같은 이유다.
+	 */
+	@Modifying(flushAutomatically = true)
+	@Query("update Post p set p.attachmentCount = p.attachmentCount - 1 "
+			+ "where p.id = :id and p.attachmentCount > 0")
+	int decreaseAttachmentCount(@Param("id") Long id);
 
 }

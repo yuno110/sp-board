@@ -63,12 +63,27 @@ public class Comment extends BaseTimeEntity {
 	@Column(nullable = false)
 	private boolean deleted;
 
+	/**
+	 * 답글이면 그 부모(최상위 댓글), 최상위 댓글이면 {@code null} 이다
+	 * (sp-docs/domain-model.md §4.2, sp-docs/requirements/board.md §12).
+	 *
+	 * <p>같은 테이블 안의 참조이므로 FK({@code fk_comment_parent_id})를 둔다. 깊이가 1단계라는
+	 * 불변식 — 부모의 {@code parent} 는 언제나 {@code null} — 은 제약이 아니라 작성 경로의
+	 * 판정(400 {@code CM003})이 지킨다. 이 엔티티는 그 판정을 하지 않는다.
+	 */
+	@ManyToOne(fetch = FetchType.LAZY)
+	@JoinColumn(name = "parent_id")
+	private Comment parent;
+
+	/** {@code parent} 를 생략하면({@code null}) 최상위 댓글이다. */
 	@Builder
-	private Comment(Post post, Long writerId, String writerNickname, String content) {
+	private Comment(Post post, Long writerId, String writerNickname, String content,
+			Comment parent) {
 		this.post = post;
 		this.writerId = writerId;
 		this.writerNickname = writerNickname;
 		this.content = content;
+		this.parent = parent;
 		this.deleted = false;
 	}
 

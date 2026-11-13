@@ -3,6 +3,8 @@ package com.example.board.post.entity;
 import com.example.board.global.common.BaseTimeEntity;
 import jakarta.persistence.Column;
 import jakarta.persistence.Entity;
+import jakarta.persistence.EnumType;
+import jakarta.persistence.Enumerated;
 import jakarta.persistence.GeneratedValue;
 import jakarta.persistence.GenerationType;
 import jakarta.persistence.Id;
@@ -32,6 +34,11 @@ import lombok.NoArgsConstructor;
  *
  * <p>{@code @Setter}·{@code @Data} 를 두지 않는다. 상태 변경은 아래 도메인 메서드로만 한다
  * (sp-docs/conventions.md §2).
+ *
+ * <p><b>{@code likeCount}·{@code attachmentCount} 를 바꾸는 엔티티 메서드를 두지 않는다</b>
+ * (sp-docs/domain-model.md §6). 두 집계는 {@code PostRepository} 의 좁은 UPDATE 로만 바뀐다.
+ * 1차 집계의 엔티티 메서드가 남아 있는 이유는 B-03 의 요구이고 각 메서드의 주석에 있다 — 그
+ * 이유가 새 집계에는 없다 (sp-docs/plan/phase2-board.md B-14).
  */
 @Getter
 @Entity
@@ -63,6 +70,15 @@ public class Post extends BaseTimeEntity {
 	private String content;
 
 	/**
+	 * 카테고리 (sp-docs/requirements/board.md §8). 컬럼은 {@code VARCHAR(20)} 이다
+	 * (sp-docs/domain-model.md §4.1). {@code ddl-auto: validate} 는 폭을 보지 않으므로
+	 * {@code PostRepositoryTest} 가 {@code information_schema} 의 실제 폭과 대조한다.
+	 */
+	@Enumerated(EnumType.STRING)
+	@Column(length = 20, nullable = false)
+	private PostCategory category;
+
+	/**
 	 * 조회수. <b>상세 조회의 증가는 {@code PostRepository.increaseViewCount} 의 좁은 UPDATE 가
 	 * 한다</b> ({@code view_count = view_count + 1}, sp-docs/plan/phase1.md §6 B-11).
 	 */
@@ -80,17 +96,44 @@ public class Post extends BaseTimeEntity {
 	@Column(nullable = false)
 	private int commentCount;
 
+	/**
+	 * {@code post_like} 행 수의 비정규화 (sp-docs/domain-model.md §4.1·§4.4).
+	 *
+	 * <p><b>{@code PostRepository} 의 좁은 UPDATE 로만 바뀐다</b>
+	 * ({@code like_count = like_count ± 1}, sp-docs/domain-model.md §6.1). 이 필드를 바꾸는 엔티티
+	 * 메서드가 없는 것이 그 규칙이다.
+	 */
+	@Column(nullable = false)
+	private int likeCount;
+
+	/**
+	 * 활성 {@code attachment} 수의 비정규화. 개수 상한의 원자적 판정에 쓴다
+	 * (sp-docs/domain-model.md §4.1·§6.2).
+	 *
+	 * <p><b>{@code PostRepository} 의 좁은 UPDATE 로만 바뀐다</b> — {@link #likeCount} 와 같다.
+	 */
+	@Column(nullable = false)
+	private int attachmentCount;
+
 	@Column(nullable = false)
 	private boolean deleted;
 
+	/**
+	 * {@code category} 를 생략하면({@code null}) {@link PostCategory#FREE} 다
+	 * (sp-docs/requirements/board.md §8 의 작성 규칙).
+	 */
 	@Builder
-	private Post(Long writerId, String writerNickname, String title, String content) {
+	private Post(Long writerId, String writerNickname, String title, String content,
+			PostCategory category) {
 		this.writerId = writerId;
 		this.writerNickname = writerNickname;
 		this.title = title;
 		this.content = content;
+		this.category = category == null ? PostCategory.FREE : category;
 		this.viewCount = 0L;
 		this.commentCount = 0;
+		this.likeCount = 0;
+		this.attachmentCount = 0;
 		this.deleted = false;
 	}
 
@@ -103,6 +146,20 @@ public class Post extends BaseTimeEntity {
 	public void update(String title, String content) {
 		this.title = title;
 		this.content = content;
+	}
+
+	/**
+	 * 카테고리 변경. <b>생략하면({@code null}) 지금 값을 유지한다</b>
+	 * (sp-docs/requirements/board.md §8 의 수정 규칙).
+	 *
+	 * <p>{@link #update(String, String)} 와 따로 둔다 — 그 메서드의 모양은 B-03 의 도메인 메서드
+	 * 표가 요구한다 (sp-docs/plan/phase2-board.md B-14). 공지 권한(403 {@code P003})의 판정은
+	 * 서비스가 하고, 이 메서드는 판정하지 않는다.
+	 */
+	public void changeCategory(PostCategory category) {
+		if (category != null) {
+			this.category = category;
+		}
 	}
 
 	/** 논리 삭제. 행을 남긴다 — 하위 댓글의 연쇄 삭제는 서비스가 한다. */
