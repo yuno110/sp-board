@@ -1,6 +1,6 @@
 # board-service 구현 체크리스트
 
-`B-xx`·`I-xx` 항목 **상태의 단일 원본**이다. 항목의 범위·완료 기준·검증은 `sp-docs/plan/phase1.md` **§6**(B-xx)와 `sp-docs/plan/integration.md`(I-xx)의 같은 ID를 본다.
+`B-xx`·`I-xx` 항목 **상태의 단일 원본**이다. 항목의 범위·완료 기준·검증은 `sp-docs/plan/phase1.md` **§6**(B-xx)와 `sp-docs/plan/integration.md`(I-xx)의 같은 ID를 본다. 2차의 `B-14` 부터는 `sp-docs/plan/phase2-board.md`, `I-06` 부터는 `sp-docs/plan/phase2-frontend-integration.md` 의 같은 ID를 본다.
 
 줄 형식: `- [ ] <ID> <이름> · 상태 <todo|doing|review|blocked|done> · 커밋 <해시 또는 ->`
 `blocked`는 줄 끝에 `· 사유: ...`를 붙인다. 사유는 다음 작업자가 이어받을 수 있을 만큼 구체적으로 적는다.
@@ -53,7 +53,7 @@
 
 ## 통합 검증
 
-**AU-11·M-11·B-09가 모두 done이 된 뒤에 시작한다.** 세 서비스가 기동된 상태를 전제하므로 순차로 진행한다.
+**1차의 I 항목은 AU-11·M-11·B-09가 모두 done이 된 뒤에 시작한다.** 세 서비스가 기동된 상태를 전제하므로 순차로 진행한다.
 
 - [x] I-01 실제 키 교환과 E2E · 상태 done
 - [x] I-02 장애 격리 · 상태 done
@@ -62,6 +62,27 @@
 - [x] I-05 탈퇴 부분 실패 · 상태 done
 
 > **I-02의 기대 결과가 바뀌었다.** "member 중지 중 게시글 작성 → 201"이 **"→ 503 `S001`"**이 됐다. 계획된 변경이지 결함이 아니다 (`sp-docs/adr/0012`). auth 중지 시나리오도 추가됐다.
+
+## 2차 기능 확장
+
+`B-xx` 의 범위·의존·완료 기준·검증은 `sp-docs/plan/phase2-board.md`, `I-xx` 는 `sp-docs/plan/phase2-frontend-integration.md` 다. 단계와 순서는 각 문서의 §1 이다. 2차의 `I-xx` 는 2차 B·AU·M 항목이 모두 `done` 인 뒤에 순차로 한다.
+
+- [ ] B-14 2차 스키마와 엔티티 · 상태 todo · 커밋 -
+- [ ] B-15 에러 코드와 multipart 예외 매핑 · 상태 todo · 커밋 -
+- [ ] B-16 인가 규칙·선택적 리졸버·환경값 가드 · 상태 todo · 커밋 -
+- [ ] B-17 댓글 삭제를 post 먼저·조건부 전환으로 고친다 · 상태 todo · 커밋 -
+- [ ] B-18 글 수정·삭제가 집계 컬럼을 싣지 않게 한다 · 상태 todo · 커밋 -
+- [ ] B-19 카테고리 — P-11 · 상태 todo · 커밋 -
+- [ ] B-20 좋아요 — P-09 · 상태 todo · 커밋 -
+- [ ] B-21 상세 조회의 선택적 인증과 조회수 판정 — P-05 · 상태 todo · 커밋 -
+- [ ] B-22 답글 — C-05 · 상태 todo · 커밋 -
+- [ ] B-23 첨부 올리기와 저장소 — P-10 · 상태 todo · 커밋 -
+- [ ] B-24 첨부 내려받기·지우기와 상세의 첨부 목록 — P-10 · 상태 todo · 커밋 -
+- [ ] I-06 2차 세 서비스와 Mailpit 의 기동 통합 · 상태 todo · 커밋 -
+- [ ] I-07 board 의 실 MySQL 동시성과 격리 수준 · 상태 todo · 커밋 -
+- [ ] I-08 auth·member 의 실 MySQL 동시성과 콜레이션 · 상태 todo · 커밋 -
+- [ ] I-09 실서버에서만 보이는 동작 — multipart 한도·주소 처리·응답 시간 · 상태 todo · 커밋 -
+- [ ] I-10 2차 응답의 서비스 간 비교와 I-04 문장의 시점 · 상태 todo · 커밋 -
 
 ## 선행 조건
 
