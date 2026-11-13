@@ -30,7 +30,8 @@ import org.springframework.web.method.support.ModelAndViewContainer;
  * <p><b>{@code role} 은 값까지 본다</b> — §6 이 허용값을 고정하므로 그 밖의 값은 서명이
  * 유효해도 계약 위반 토큰이다 ({@link ContractRole}). <b>board 의 Claim 계약 집행 지점이
  * 여기다</b> — member 는 디코더에서 한다 (sp-docs/tech-stack.md §2.1). 그래서 이 집행은
- * {@link CurrentMember} 를 받는 핸들러에서만 성립한다.
+ * 이 클래스의 검사({@link #loginMember})를 부르는 리졸버의 애노테이션
+ * ({@link CurrentMember}·{@link OptionalCurrentMember})을 받는 핸들러에서만 성립한다.
  */
 @Component
 public class CurrentMemberArgumentResolver implements HandlerMethodArgumentResolver {
@@ -48,7 +49,19 @@ public class CurrentMemberArgumentResolver implements HandlerMethodArgumentResol
 			NativeWebRequest webRequest,
 			WebDataBinderFactory binderFactory) {
 
-		Authentication authentication = SecurityContextHolder.getContext().getAuthentication();
+		return loginMember(SecurityContextHolder.getContext().getAuthentication());
+	}
+
+	/**
+	 * 인증에서 {@link LoginMember} 를 만든다. 인증이 없거나 principal 이 JWT 가 아니면
+	 * {@code A001}, {@code sub}·{@code role} 이 Claim 계약을 어기면 {@code A002} 다.
+	 *
+	 * <p><b>{@link OptionalCurrentMemberArgumentResolver} 도 토큰이 실린 요청에서 이것을
+	 * 부른다.</b> 선택적 리졸버가 이 리졸버와 같은 claim 검사를 해야 하므로
+	 * (sp-docs/tech-stack.md §2.1 의 2026-11-11 {@code D-18} 블록인용) 검사를 한 자리에 둔다 —
+	 * 두 벌이면 한쪽만 고쳐지는 순간 계약 밖 토큰이 다른 쪽으로 통과한다.
+	 */
+	static LoginMember loginMember(Authentication authentication) {
 		if (authentication == null || !(authentication.getPrincipal() instanceof Jwt jwt)) {
 			throw new BusinessException(ErrorCode.UNAUTHORIZED);
 		}

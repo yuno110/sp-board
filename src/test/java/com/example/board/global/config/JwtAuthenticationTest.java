@@ -134,7 +134,13 @@ class JwtAuthenticationTest {
 			"DELETE,/api/v1/posts/1",
 			"POST,/api/v1/posts/1/comments",
 			"PUT,/api/v1/comments/1",
-			"DELETE,/api/v1/comments/1"
+			"DELETE,/api/v1/comments/1",
+			// 좋아요·첨부 (sp-docs/api-contract.md §4 의 2026-11-11 D-18 줄). 거부한 계층은
+			// 아래 새_인증_경로는_필터_체인이_막는다 가 본다
+			"PUT,/api/v1/posts/1/like",
+			"DELETE,/api/v1/posts/1/like",
+			"POST,/api/v1/posts/1/attachments",
+			"DELETE,/api/v1/attachments/1"
 	})
 	@DisplayName("인증이 필요한 경로는 토큰 없이 401 A001 이다")
 	void 인증이_필요한_경로(String method, String path) throws Exception {
@@ -144,16 +150,75 @@ class JwtAuthenticationTest {
 	}
 
 	/**
+	 * 좋아요·첨부의 인증 경로는 <b>필터 체인이</b> 막는다 — 요청이 디스패치되지 않는다
+	 * (sp-docs/plan/phase2-board.md B-16 의 검증표).
+	 *
+	 * <p><b>상태 코드만으로는 거부한 계층이 보이지 않는다</b> (sp-docs/api-contract.md §4 의
+	 * {@code /posts/me} 블록인용). 공개 규칙이 이 경로를 먼저 잡으면 요청이 디스패치되고, 핸들러의
+	 * {@code @CurrentMember} 가 익명 principal 을 보고 같은 401 {@code A001} 을 낸다. 그래서
+	 * <b>선택된 핸들러와 해석된 예외가 둘 다 비어 있는지</b>를 본다 — 필터 체인이 막으면
+	 * {@code DispatcherServlet} 에 닿지 않아 둘 다 없다.
+	 */
+	@ParameterizedTest(name = "{0} {1}")
+	@CsvSource({
+			"PUT,/api/v1/posts/1/like",
+			"DELETE,/api/v1/posts/1/like",
+			"POST,/api/v1/posts/1/attachments",
+			"DELETE,/api/v1/attachments/1"
+	})
+	@DisplayName("좋아요·첨부의 인증 경로는 토큰 없이 필터 체인이 401 A001 로 막는다")
+	void 새_인증_경로는_필터_체인이_막는다(String method, String path) throws Exception {
+		MvcResult result = this.mockMvc.perform(request(HttpMethod.valueOf(method), path))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("A001"))
+				.andReturn();
+
+		assertFilterChainRejected(result);
+	}
+
+	/**
 	 * 비로그인 허용 경로 (sp-docs/api-contract.md §4, sp-docs/security.md §5.2).
 	 *
 	 * <p>같은 경로의 쓰기 메서드는 위 테스트가 401 로 단언한다 — 메서드를 가르지 않고
-	 * {@code permitAll} 을 주면 그쪽이 빨개진다.
+	 * {@code permitAll} 을 주면 그쪽이 빨개진다. 첨부 내려받기({@code GET /attachments/{id}})와
+	 * 지우기({@code DELETE})가 그 짝이다.
 	 */
 	@ParameterizedTest(name = "GET {0}")
-	@ValueSource(strings = {"/api/v1/posts", "/api/v1/posts/1", "/api/v1/posts/1/comments"})
+	@ValueSource(strings = {"/api/v1/posts", "/api/v1/posts/1", "/api/v1/posts/1/comments",
+			"/api/v1/attachments/1"})
 	@DisplayName("비로그인 허용 경로는 토큰 없이도 401 이 아니다")
 	void 비로그인_허용_경로(String path) throws Exception {
 		this.mockMvc.perform(get(path)).andExpect(notUnauthorized());
+	}
+
+	/**
+	 * 상세 조회는 인증을 선택으로 받지만 <b>실린 토큰은 검증한다</b> — 잘못된 토큰을 익명으로
+	 * 낮추지 않는다 (sp-docs/api-contract.md §4.8). sp-docs/requirements/board.md §9.1 이
+	 * 「{@code permitAll} 경로에 잘못된 토큰을 보내는 테스트」 로 적은 줄이다. 코드는 §8.5 의
+	 * 경계대로 변조가 {@code A002}, 만료가 {@code A003} 이다.
+	 *
+	 * <p><b>거부한 계층까지 본다.</b> 필터 체인이 막아야 핸들러가 토큰 없는 요청처럼 돌지 않는다
+	 * — 같은 경로가 토큰 없이는 401 이 아닌 것({@link #비로그인_허용_경로})이 그 대조다.
+	 */
+	@ParameterizedTest(name = "{0}")
+	@CsvSource({
+			"변조,A002,유효하지 않은 토큰입니다.",
+			"만료,A003,만료된 토큰입니다."
+	})
+	@DisplayName("상세 조회에 잘못된 토큰이 오면 필터 체인이 401 로 막는다")
+	void 상세_조회의_잘못된_토큰은_401(String kind, String code, String message) throws Exception {
+		String token = "변조".equals(kind)
+				? TestTokenFactory.tamperedToken(ACCOUNT_ID, "USER")
+				: TestTokenFactory.expiredToken(ACCOUNT_ID, "USER");
+
+		MvcResult result = this.mockMvc.perform(get("/api/v1/posts/1")
+						.header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value(code))
+				.andExpect(jsonPath("$.error.message").value(message))
+				.andReturn();
+
+		assertFilterChainRejected(result);
 	}
 
 	@Test
@@ -491,6 +556,17 @@ class JwtAuthenticationTest {
 				.andReturn()
 				.getResponse()
 				.getContentAsByteArray();
+	}
+
+	/** 필터 체인이 막았으면 디스패치가 없으므로 선택된 핸들러도 해석된 예외도 없다. */
+	private static void assertFilterChainRejected(MvcResult result) {
+		assertThat(result.getHandler())
+				.as("핸들러가 선택됐다면 요청이 필터 체인을 지나 디스패치된 것이다 — 공개 규칙이 이 경로를 "
+						+ "먼저 잡았는지 SecurityConfig 의 선언을 본다 (sp-docs/api-contract.md §4)")
+				.isNull();
+		assertThat(result.getResolvedException())
+				.as("필터 체인이 막으면 해석된 예외가 없다. 리졸버가 낸 401 이면 BusinessException 이 담긴다")
+				.isNull();
 	}
 
 	private void assertNoSession(MvcResult result) {

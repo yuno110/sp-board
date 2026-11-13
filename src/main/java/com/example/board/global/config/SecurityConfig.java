@@ -97,6 +97,11 @@ public class SecurityConfig {
 						// A001 이 되므로, 그 테스트는 거부한 계층(핸들러가 선택됐는지)을 본다.
 						// 뒤집은 변이에서 그 하나만 빨개지는 것을 측정했다
 						.requestMatchers(HttpMethod.GET, "/api/v1/posts/me").authenticated()
+						// 상세는 인증을 선택으로 받는다 (sp-docs/api-contract.md §4.8). permitAll 은
+						// 토큰 없는 요청을 들일 뿐이고, 실린 토큰은 BearerTokenAuthenticationFilter 가
+						// 경로와 무관하게 검증한다 — 서명 불일치·만료는 필터 체인에서 401 이고 익명으로
+						// 낮아지지 않는다 (sp-docs/requirements/board.md §9.1). 토큰의 계정이 필요한
+						// 핸들러는 @OptionalCurrentMember 로 받는다 — claim 검사를 거기서 한다
 						.requestMatchers(HttpMethod.GET, "/api/v1/posts/{id}").permitAll()
 						.requestMatchers(HttpMethod.GET, "/api/v1/posts/{postId}/comments").permitAll()
 
@@ -106,6 +111,21 @@ public class SecurityConfig {
 						.requestMatchers(HttpMethod.POST, "/api/v1/posts/{postId}/comments").authenticated()
 						.requestMatchers(HttpMethod.PUT, "/api/v1/comments/{id}").authenticated()
 						.requestMatchers(HttpMethod.DELETE, "/api/v1/comments/{id}").authenticated()
+
+						// --- 좋아요·첨부 (sp-docs/api-contract.md §4, sp-docs/security.md §5.2) ---
+						// 글 작성자인가(첨부)는 여기가 아니라 Service 계층이 판정한다 — 위 게시글·댓글
+						// 줄과 같은 이유다. 위의 permitAll 이 이 경로들을 먼저 잡지 않는 것은 메서드와
+						// 경로 모양이 달라서다({id} 는 세그먼트 하나만 잡는다). 먼저 잡혀도 응답은
+						// 핸들러의 @CurrentMember 가 내는 같은 401 일 수 있으므로 (§4 의 /posts/me
+						// 블록인용) JwtAuthenticationTest 가 거부한 계층을 선택된 핸들러와 해석된
+						// 예외로 본다
+						.requestMatchers(HttpMethod.PUT, "/api/v1/posts/{id}/like").authenticated()
+						.requestMatchers(HttpMethod.DELETE, "/api/v1/posts/{id}/like").authenticated()
+						.requestMatchers(HttpMethod.POST, "/api/v1/posts/{postId}/attachments").authenticated()
+						// 내려받기는 비로그인 허용이다 (§5.2 의 첨부 내려받기 줄). 지우기와 경로가
+						// 같으므로 메서드로 가른다
+						.requestMatchers(HttpMethod.GET, "/api/v1/attachments/{id}").permitAll()
+						.requestMatchers(HttpMethod.DELETE, "/api/v1/attachments/{id}").authenticated()
 
 						.anyRequest().authenticated())
 

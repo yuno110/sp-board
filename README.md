@@ -121,11 +121,15 @@ cp src/main/resources/application-local.yml.example src/main/resources/applicati
 | `spring.datasource.password` | MySQL 비밀번호 |
 | `member-service.internal-api-key` | 내부 API 키. **member와 같은 값** |
 | `cors.allowed-origins` | 허용 오리진. 로컬은 `http://localhost:3000` |
+| `attachment.storage-root` | 첨부 저장 루트. **이미 있고 쓸 수 있는 디렉터리**의 경로 — 서버가 만들지 않으므로 먼저 만든다 |
+| `view-count.hmac-secret` | 비로그인 조회자 식별의 HMAC 비밀키. **UTF-8 로 32바이트 이상** — Base64 로 디코드하지 않는다 |
 | `spring.jpa.show-sql` · `logging.level.org.hibernate.orm.jdbc.bind` | 그대로 둔다 (로컬만 SQL 로그 ON) |
 
 > **`cors.allowed-origins`가 없으면 `local` 프로파일로 기동할 수 없다.** 값이 없으면 `SecurityConfig.corsConfigurationSource`의 `@Value` 해석이 실패해 `BeanCreationException`으로 **기동이 멈춘다.** 허용 오리진은 환경이 정하는 정책값이므로 기본값을 두지 않는다 (`sp-docs/security.md` §1.1, `sp-docs/tech-stack.md` §4.3). 비었거나 `*`가 섞여도 같은 가드가 기동을 실패시킨다.
 >
 > `member-service.internal-api-key`도 값이 없으면 `MemberClient` 빈 생성이 실패한다. **다만 빈 문자열은 해석에 성공한다** — 비워 두지 않는다.
+>
+> **`attachment.storage-root`·`view-count.hmac-secret`이 없으면 `local` 프로파일로 기동할 수 없다.** 템플릿은 두 키의 자리만 비워 둔다. 저장 루트가 비었거나 없는 경로·파일·쓸 수 없는 디렉터리이면, 비밀키가 비었거나 UTF-8 로 32바이트보다 짧으면 `AttachmentStorageProperties`·`ViewCountProperties`의 가드가 **기동을 멈춘다** (`sp-docs/tech-stack.md` §4.5). 두 키는 `@ConfigurationProperties`로 묶이므로 값이 없을 때 `${...}` 리터럴이 그대로 들어오는데(§4.3의 측정값), 그것도 가드가 막는다. 화면의 실제 서비스 e2e 는 `local`로 먼저 뜬 board 를 쓰므로 두 값이 이 파일에 있어야 한다.
 
 ### 4. 실행
 
@@ -150,6 +154,8 @@ cp src/main/resources/application-local.yml.example src/main/resources/applicati
 | `DB_PASSWORD` | **없음** | MySQL 비밀번호. 없으면 기동 실패 — 비밀번호가 틀린 것이 아니라 값이 없는 것이다 |
 | `INTERNAL_API_KEY` | **없음** | 내부 API 호출 키. **member와 같은 값이어야 한다** (`sp-docs/security.md` §6) |
 | `CORS_ALLOWED_ORIGINS` | **없음** | 허용 오리진 목록(쉼표 구분). 비었거나 `*`가 섞이면 기동 실패 |
+| `ATTACHMENT_STORAGE_ROOT` | **없음** | 첨부 저장 루트(정책값). 이미 있고 쓸 수 있는 디렉터리가 아니면 기동 실패 — 서버가 만들지 않는다 (`sp-docs/tech-stack.md` §4.5) |
+| `VIEW_COUNT_HMAC_SECRET` | **없음** | 비로그인 조회자의 접속 주소를 가명처리하는 HMAC 비밀키(비밀값). 비었거나 UTF-8 로 32바이트보다 짧으면 기동 실패 (`sp-docs/security.md` §9) |
 | `DB_URL` | `jdbc:mysql://localhost:3306/sp_board?serverTimezone=Asia/Seoul&characterEncoding=UTF-8` | |
 | `DB_USERNAME` | `root` | |
 | `SERVER_PORT` | `8082` | |

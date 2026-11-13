@@ -31,3 +31,17 @@ member-service:
 # 여러 개는 쉼표로 구분한다
 cors:
   allowed-origins: http://localhost:3000
+
+# 첨부 저장 루트 (sp-docs/tech-stack.md §4.5). 이미 있고 쓸 수 있는 디렉터리의 경로를 적는다.
+# 서버가 만들지 않으므로 먼저 만들어 둔다. 비었거나 없는 경로·파일이면 기동이 실패한다.
+# 환경변수 ATTACHMENT_STORAGE_ROOT 가 설정돼 있으면 여기 값보다 앞선다 — 그 이름이 이 키의
+# 완화 바인딩 형식(점·대시를 밑줄로 바꾼 대문자)과 같다
+attachment:
+  storage-root:
+
+# 조회수 판정의 비밀키 (sp-docs/tech-stack.md §4.5, sp-docs/security.md §9). UTF-8 로 32바이트
+# 이상인 값을 적는다 — Base64 로 디코드하지 않고 적은 문자열의 바이트를 그대로 쓴다. 비었거나
+# 짧으면 기동이 실패한다. 환경변수 VIEW_COUNT_HMAC_SECRET 이 설정돼 있으면 여기 값보다
+# 앞선다 — 그 이름이 이 키의 완화 바인딩 형식과 같다
+view-count:
+  hmac-secret:

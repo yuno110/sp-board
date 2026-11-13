@@ -103,6 +103,12 @@ public final class TestTokenFactory {
 		return sign(subject, role, issuedAt, issuedAt.plus(ACCESS_TOKEN_VALIDITY));
 	}
 
+	/** {@code sub} claim 이 없는 토큰 (§6). {@code subject} 에 {@code null} 을 주면 빠진다. */
+	public static String tokenWithoutSubject(String role) {
+		Instant issuedAt = Instant.now().truncatedTo(ChronoUnit.SECONDS);
+		return sign(null, role, issuedAt, issuedAt.plus(ACCESS_TOKEN_VALIDITY));
+	}
+
 	/** {@code role} claim 이 없는 토큰 (§6). {@code role} 에 {@code null} 을 주면 빠진다. */
 	public static String tokenWithoutRole(long accountId) {
 		Instant issuedAt = Instant.now().truncatedTo(ChronoUnit.SECONDS);
@@ -137,10 +143,12 @@ public final class TestTokenFactory {
 
 	private static String sign(String subject, String role, Instant issuedAt, Instant expiresAt) {
 		JwtClaimsSet.Builder claims = JwtClaimsSet.builder()
-				.subject(subject)
 				.issuer(CONTRACT_ISSUER)
 				.issuedAt(issuedAt)
 				.expiresAt(expiresAt);
+		if (subject != null) {
+			claims.subject(subject);
+		}
 		if (role != null) {
 			claims.claim(CONTRACT_CLAIM_ROLE, role);
 		}

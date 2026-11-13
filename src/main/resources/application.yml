@@ -44,6 +44,11 @@ server:
     # 크게 남으면 Tomcat 이 연결을 끊을 수 있다 — 큰 사진을 실수로 고른 사용자가 연결 오류가
     # 아니라 413 을 받게 하려는 값이다
     max-swallow-size: 10MB
+  # X-Forwarded-For 로 remoteAddr 를 바꾸지 않는다 — 비로그인 조회자의 판정 키가 그 값을 쓰고,
+  # 그 헤더는 클라이언트가 임의로 쓴다 (sp-docs/tech-stack.md §4.5, sp-docs/security.md §9).
+  # 클라우드 플랫폼을 감지하지 않는 로컬 기본값과 같지만 의도를 보이려고 적는다 — Boot 는
+  # 클라우드 플랫폼을 감지하면 기본값이 NATIVE 다 (§4.5)
+  forward-headers-strategy: none
 
 # health 만 노출한다. 그 밖의 actuator 경로는 노출 자체를 막는다
 # (sp-docs/security.md §5.1.1). 인가 쪽 차단은 SecurityConfig 가 한다 — 그래서 무토큰은
@@ -70,3 +75,19 @@ member-service:
 # 가드가 기동을 실패시킨다. 로컬 값은 application-local.yml 이 준다
 cors:
   allowed-origins: ${CORS_ALLOWED_ORIGINS}
+
+# 첨부 저장 루트 (sp-docs/tech-stack.md §4.5). 정책값이므로 기본값을 두지 않는다 (§4.3).
+# 이미 있고 쓸 수 있는 디렉터리여야 하고 서버가 만들지 않는다 — 아니면 기동이 실패한다.
+# @ConfigurationProperties 로 묶으므로 환경변수가 없으면 이 placeholder 가 리터럴로 들어온다
+# (§4.3 의 측정값). 그것을 AttachmentStorageProperties 의 가드가 막는다
+attachment:
+  storage-root: ${ATTACHMENT_STORAGE_ROOT}
+
+# 조회수 판정 (sp-docs/tech-stack.md §4.5, sp-docs/security.md §9).
+# hmac-secret 은 비밀값이므로 기본값을 두지 않는다 (§4.3). 설정 문자열의 UTF-8 바이트가 32 이상
+# 이어야 하고 Base64 로 디코드하지 않는다 — 비었거나 짧거나 미해석 placeholder 면
+# ViewCountProperties 의 가드가 기동을 실패시킨다.
+# cleanup-interval 은 편의값이다 — 오래된 판정 행을 지우는 주기이고 보존 기간의 상한을 정한다
+view-count:
+  hmac-secret: ${VIEW_COUNT_HMAC_SECRET}
+  cleanup-interval: PT1H
