@@ -28,9 +28,22 @@ spring:
           # JwtDecoder 를 자동구성하므로 서명 검증·만료 확인·SecurityContext 주입을 직접
           # 만들 것이 없다 — JWT 필터를 직접 만들지 않는다 (§2)
           public-key-location: classpath:jwt-public.pem
+  # 첨부 올리기의 크기 한도다 (sp-docs/tech-stack.md §4.5). 넘으면 413 C008
+  # (sp-docs/api-contract.md §8.1). 개당 한도는 사용자 결정이고 Boot 기본값(1MB)이 그보다
+  # 작으므로 반드시 적는다. 요청 하나에 파일 하나이므로 요청 한도는 개당 한도보다 조금 크게
+  # 둔다(파일 하나 + multipart 머리)
+  servlet:
+    multipart:
+      max-file-size: 5MB
+      max-request-size: 6MB
 
 server:
   port: ${SERVER_PORT:8082}
+  tomcat:
+    # 한도를 넘은 요청의 나머지 본문을 읽어 버리는 양이다 (sp-docs/tech-stack.md §4.5). 이보다
+    # 크게 남으면 Tomcat 이 연결을 끊을 수 있다 — 큰 사진을 실수로 고른 사용자가 연결 오류가
+    # 아니라 413 을 받게 하려는 값이다
+    max-swallow-size: 10MB
 
 # health 만 노출한다. 그 밖의 actuator 경로는 노출 자체를 막는다
 # (sp-docs/security.md §5.1.1). 인가 쪽 차단은 SecurityConfig 가 한다 — 그래서 무토큰은

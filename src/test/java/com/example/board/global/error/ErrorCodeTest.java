@@ -12,7 +12,8 @@ import org.junit.jupiter.api.Test;
 /**
  * sp-docs/api-contract.md §8.1 §8.3 의 표를 그대로 옮긴 것과 enum 전체를 맞춘다. 기대값은
  * 정본에서 읽은 리터럴이다 — {@code ErrorCode} 를 가져다 쓰면 자기 전제를 스스로 공급하게 되어
- * 어떤 값이 들어 있어도 통과한다.
+ * 어떤 값이 들어 있어도 통과한다. 다만 §8.1 의 {@code C009} 는 옮기지 않는다 — 제한기를 가진
+ * 서비스만 갖는 코드라 board 에는 없어야 한다 (§8.1 의 C009 문단).
  *
  * <p>집합 비교이므로 정본에 없는 코드가 하나라도 있으면 실패한다. member 전용 {@code M0xx} 나
  * auth 전용 {@code AU0xx} 를 끌어오는 실수가 여기서 잡힌다 (§8 — 접두어로 어느 서비스에서 난
@@ -32,6 +33,8 @@ class ErrorCodeTest {
 		contract.put("C005", "500 서버 내부 오류가 발생했습니다.");
 		contract.put("C006", "415 지원하지 않는 미디어 타입입니다.");
 		contract.put("C007", "406 응답할 수 있는 형식이 없습니다.");
+		contract.put("C008", "413 요청 크기가 허용 한도를 넘었습니다.");
+		// C009 는 옮기지 않는다(클래스 주석). board 의 enum 에 생기면 이 집합 비교가 실패한다
 		contract.put("A001", "401 인증이 필요합니다.");
 		contract.put("A002", "401 유효하지 않은 토큰입니다.");
 		contract.put("A003", "401 만료된 토큰입니다.");
@@ -39,8 +42,13 @@ class ErrorCodeTest {
 		// §8.3 board-service
 		contract.put("P001", "404 게시글을 찾을 수 없습니다.");
 		contract.put("P002", "403 게시글에 대한 권한이 없습니다.");
+		contract.put("P003", "403 공지를 작성하거나 변경할 권한이 없습니다.");
 		contract.put("CM001", "404 댓글을 찾을 수 없습니다.");
 		contract.put("CM002", "403 댓글에 대한 권한이 없습니다.");
+		contract.put("CM003", "400 답글에는 답글을 달 수 없습니다.");
+		contract.put("AT001", "404 첨부 파일을 찾을 수 없습니다.");
+		contract.put("AT002", "400 허용하지 않는 파일 형식입니다.");
+		contract.put("AT003", "409 게시글당 첨부 파일 수를 넘었습니다.");
 		contract.put("S001", "503 일시적으로 서비스 연동에 실패했습니다.");
 		contract.put("S002", "403 활성 프로필이 필요합니다.");
 

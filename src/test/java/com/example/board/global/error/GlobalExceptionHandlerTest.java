@@ -5,6 +5,7 @@ import static org.hamcrest.Matchers.greaterThan;
 import static org.hamcrest.Matchers.hasSize;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -30,16 +31,22 @@ import org.springframework.http.MediaType;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
+import org.springframework.test.web.servlet.RequestBuilder;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MaxUploadSizeExceededException;
+import org.springframework.web.multipart.MultipartException;
+import org.springframework.web.multipart.MultipartFile;
 
 /**
  * sp-docs/plan/phase1.md §6 B-02 의 "검증" 표와 sp-docs/conventions.md §6.1 의 예외-코드 표를
- * 테스트로 옮긴 것이다. 기대값(코드·HTTP·메시지)은 운영 상수를 가져오지 않고 정본에서 읽은
+ * 테스트로 옮긴 것이다. multipart 줄은 sp-docs/plan/phase2-board.md B-15 의 "검증" 표를 옮겼다.
+ * 기대값(코드·HTTP·메시지)은 운영 상수를 가져오지 않고 정본에서 읽은
  * 리터럴로 적는다 — {@code ErrorCode} 를 참조하면 그 값이 틀렸을 때 함께 틀린다.
  *
  * <p>B-02 에는 아직 컨트롤러가 없으므로 예외를 던질 대상을 이 테스트 안에 둔다. 중첩 클래스는
@@ -345,6 +352,105 @@ class GlobalExceptionHandlerTest {
 				.containsExactly(Level.ERROR);
 	}
 
+	/**
+	 * multipart 크기 한도를 넘었다 — {@code MaxUploadSizeExceededException}.
+	 *
+	 * <p>한도의 집행은 서블릿 컨테이너의 일이라 {@code MockMvc} 로는 413 이 나오는지 재지
+	 * 못한다(sp-docs/tech-stack.md §4.5). 여기서는 예외를 직접 던져 매핑만 본다.
+	 *
+	 * <p><b>크기 위반이 {@code C001} 이 되지 않는다.</b> 이 예외는 {@code MultipartException} 의
+	 * 하위 타입이라 상위 타입의 핸들러만 있으면 400 {@code C001} 이 된다 — 하위 타입의 핸들러가
+	 * 골라야 한다(sp-docs/conventions.md §6.1). 그래서 코드를 정확히 {@code C008} 로 단언한다.
+	 */
+	@Test
+	@DisplayName("MaxUploadSizeExceededException 은 413 C008 이고 fieldErrors 가 빈 배열이다")
+	void 크기_한도_초과는_C008() throws Exception {
+		mockMvc.perform(get("/test/error/max-upload-size"))
+				.andExpect(status().is(413))
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.data").doesNotExist())
+				.andExpect(jsonPath("$.error.code").value("C008"))
+				.andExpect(jsonPath("$.error.message").value("요청 크기가 허용 한도를 넘었습니다."))
+				.andExpect(jsonPath("$.error.fieldErrors", hasSize(0)));
+	}
+
+	/** multipart 를 해석하지 못했다(예: 깨진 경계) — {@code MultipartException}. */
+	@Test
+	@DisplayName("MultipartException 은 400 C001 이고 fieldErrors 가 빈 배열이다")
+	void multipart_해석_실패는_C001() throws Exception {
+		mockMvc.perform(get("/test/error/multipart"))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.data").doesNotExist())
+				.andExpect(jsonPath("$.error.code").value("C001"))
+				.andExpect(jsonPath("$.error.message").value("잘못된 입력값입니다."))
+				.andExpect(jsonPath("$.error.fieldErrors", hasSize(0)));
+	}
+
+	/**
+	 * 필요한 파트가 없다 — {@code MissingServletRequestPartException}.
+	 *
+	 * <p>예외를 직접 던지지 않고 {@code @RequestPart} 가 실제로 내게 한다. 파트 이름은
+	 * sp-docs/api-contract.md §4.7 의 {@code file} 이다.
+	 */
+	@Test
+	@DisplayName("필요한 파트가 없으면 400 C001 이고 fieldErrors 가 빈 배열이다")
+	void 필요한_파트_누락은_C001() throws Exception {
+		mockMvc.perform(multipart("/test/upload").param("other", "value"))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.data").doesNotExist())
+				.andExpect(jsonPath("$.error.code").value("C001"))
+				.andExpect(jsonPath("$.error.message").value("잘못된 입력값입니다."))
+				.andExpect(jsonPath("$.error.fieldErrors", hasSize(0)));
+	}
+
+	/**
+	 * multipart 예외는 클라이언트 오류라 {@code warn} 이다(sp-docs/conventions.md §6.1).
+	 *
+	 * <p>위 로그 수준 테스트와 같이 <b>양쪽을 다 단언한다</b> — {@code warn} 이라는 것만 보면
+	 * 마지막 그물을 낮추는 변경이 열린다. 수준은 {@code ERROR} 가 아니라는 것보다 좁게,
+	 * 요청마다 {@code WARN} 하나로 단언한다 — 핸들러가 빠져 마지막 그물로 떨어진 요청은
+	 * {@code ERROR} 가 되어 여기서 드러난다.
+	 */
+	@Test
+	@DisplayName("multipart 예외는 WARN 로그를 남기고 마지막 그물은 그대로 ERROR 로그를 남긴다")
+	void multipart_예외의_로그_수준은_WARN_이다() throws Exception {
+		List<Level> multipart_수준 = 로그_수준(
+				get("/test/error/max-upload-size"),
+				get("/test/error/multipart"),
+				multipart("/test/upload").param("other", "value"));
+		List<Level> 마지막_그물_수준 = 로그_수준(get("/test/error/unexpected"));
+
+		assertThat(multipart_수준)
+				.as("크기 초과·해석 실패·파트 누락의 순서로 요청마다 WARN 하나다")
+				.containsExactly(Level.WARN, Level.WARN, Level.WARN);
+		assertThat(마지막_그물_수준)
+				.as("마지막 그물을 warn 으로 낮추면 원인이 서버에 있는 500 이 ERROR 경보를 만들지 않는다")
+				.containsExactly(Level.ERROR);
+	}
+
+	/** 요청들을 차례로 보내고 그동안 핸들러가 남긴 로그 수준을 모은다. */
+	private List<Level> 로그_수준(RequestBuilder... requests) throws Exception {
+		Logger handlerLogger = (Logger) LoggerFactory.getLogger(GlobalExceptionHandler.class);
+		ListAppender<ILoggingEvent> appender = new ListAppender<>();
+		appender.start();
+		Level original = handlerLogger.getLevel();
+		// 수집 결과가 주변 설정에 좌우되지 않게 수준을 이 안에서 정한다
+		handlerLogger.setLevel(Level.TRACE);
+		handlerLogger.addAppender(appender);
+		try {
+			for (RequestBuilder request : requests) {
+				mockMvc.perform(request);
+			}
+			return 수집된_수준(appender);
+		} finally {
+			handlerLogger.detachAppender(appender);
+			handlerLogger.setLevel(original);
+			appender.stop();
+		}
+	}
+
 	private static List<Level> 수집된_수준(ListAppender<ILoggingEvent> appender) {
 		return appender.list.stream().map(ILoggingEvent::getLevel).toList();
 	}
@@ -376,6 +482,20 @@ class GlobalExceptionHandlerTest {
 		@GetMapping("/error/unexpected")
 		void unexpected() {
 			throw new IllegalStateException("select writer_nickname from post where id = 1");
+		}
+
+		@GetMapping("/error/max-upload-size")
+		void maxUploadSize() {
+			throw new MaxUploadSizeExceededException(5L * 1024 * 1024);
+		}
+
+		@GetMapping("/error/multipart")
+		void multipartNotParsable() {
+			throw new MultipartException("Failed to parse multipart servlet request");
+		}
+
+		@PostMapping(value = "/upload", consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+		void upload(@RequestPart("file") MultipartFile file) {
 		}
 
 		@GetMapping("/type-mismatch")
