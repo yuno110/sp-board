@@ -219,8 +219,35 @@ public class CommentService {
 	 * 댓글 삭제 (C-04). <b>작성자 본인과 ADMIN 이 할 수 있다</b> (sp-docs/security.md §5.2).
 	 * Soft Delete 이므로 행이 남는다 (sp-docs/requirements/board.md §5 규칙 2).
 	 *
-	 * <p><b>{@code comment_count} 가 1 감소한다</b> (sp-docs/domain-model.md §5). 그 둘이 한
-	 * 트랜잭션인 것은 이 메서드의 {@code @Transactional} 이 보장한다.
+	 * <p><b>{@code comment_count} 가 1 감소한다</b> (sp-docs/domain-model.md §5). 감소와 댓글
+	 * 행의 전환이 한 트랜잭션인 것은 이 메서드의 {@code @Transactional} 이 보장한다.
+	 *
+	 * <p><b>순서는 {@code post} 감소 → 댓글의 조건부 전환이다</b> (sp-docs/plan/phase2-board.md
+	 * B-17, sp-docs/domain-model.md §6.2 의 첨부 삭제와 같은 모양).
+	 * <ol>
+	 * <li>{@link PostRepository#decreaseCommentCount} — 1 행이면 {@code post} 행의 배타 락을
+	 * 쥔다. 0 행이면 집계가 이미 0 이다. 이 댓글이 아직 활성이면 근거 행과 어긋난 상태이고, 1차처럼
+	 * 2) 를 그대로 해 집계를 0 에 둔다. 그새 다른 요청이 이 댓글을 지웠으면 2) 가 0 행을 보고
+	 * 되돌린다. 어긋난 상태에 WARN 로그를 남기지 않는다 — sp-docs/plan/phase2-board.md B-17 이
+	 * 그렇게 정했고, 남길지는 같은 계획의 §4.3 이 정본 개정으로 넘겼다
+	 * <li>{@link CommentRepository#softDeleteIfActive} — 0 행이면 이미 지워진 것이다. 404
+	 * {@code CM001} 을 던져 트랜잭션을 되돌린다 — 1) 의 감소도 함께 되돌아간다
+	 * </ol>
+	 *
+	 * <p><b>{@code post} 가 먼저인 이유는 락 순서다.</b> 댓글 행을 먼저 쓰면 답글 작성
+	 * ({@code post} → 부모 행의 FK 공유 락)과 순서가 반대라 교착할 것으로 본다 —
+	 * sp-docs/domain-model.md §6 의 블록인용(2026-11-11 {@code D-18})이 추정으로 적었다. 작성
+	 * 경로도 집계 증가를 INSERT 보다 먼저 한다({@link #create}).
+	 *
+	 * <p><b>전환의 영향 행 수가 최종 판정이다.</b> 아래 404·403 판정은 락 전의 읽기라 같은 댓글의
+	 * 동시 삭제를 거르지 못한다 — 모두 활성으로 읽고 쓰기에 닿을 수 있다. 그 요청들 가운데 전환이
+	 * 1 행인 요청 하나만 감소를 남기고, 나머지는 0 행을 보고 되돌아간다. 그래서 같은 댓글을 두 번
+	 * 지워도 — 순차든 동시든 — 집계가 한 번만 깎인다. 순차에서는 두 번째 요청이 판정에서 404 를
+	 * 받아 쓰기에 닿지 않는다. 동시는 {@code CommentServiceTest} 의 B-17 중첩 클래스가 H2 에서
+	 * 끼워넣기를 강제해 잰다 — 실 MySQL 의 측정은 sp-docs/plan/phase2-board.md §4.1 이 통합으로
+	 * 넘겼다. <b>1차는 그렇지 않았다</b> — 엔티티의 {@code softDelete()} 를 더티 체킹으로 조건 없이
+	 * 저장해 전환이 언제나 성공했고, 같은 댓글의 동시 삭제 3건이 모두 성공해 집계를 3 줄였다(B-17
+	 * 이 고치기 전의 코드에 같은 테스트를 돌려 잰 값).
 	 *
 	 * <p><b>감소도 작성과 같은 좁은 UPDATE 다</b>
 	 * ({@link PostRepository#decreaseCommentCount}, sp-docs/plan/phase1.md §6 B-10). 엔티티를
@@ -230,9 +257,6 @@ public class CommentService {
 	 * ({@code comment_count > 0}, sp-docs/requirements/board.md §5 규칙 4). 좁은 UPDATE 는
 	 * 엔티티를 지나지 않으므로 가드가 엔티티 메서드에 있으면 지나가지 않는다 — 그래서 가드가
 	 * 문장으로 옮겨 갔다.
-	 *
-	 * <p><b>이미 삭제된 댓글은 404 {@code CM001} 이다.</b> 그래서 같은 댓글을 두 번 지워도
-	 * 집계가 두 번 깎이지 않는다.
 	 *
 	 * <p><b>{@code MemberClient} 를 호출하지 않는다</b> (sp-docs/api-contract.md §4.2).
 	 * {@link #update} 와 같은 이유다.
@@ -246,8 +270,12 @@ public class CommentService {
 		Comment comment = getActiveById(id);
 		validateWriterOrAdmin(comment, loginMember);
 
-		comment.softDelete();
+		// 1) post 먼저. 0행(집계가 이미 0)이어도 2)를 그대로 한다
 		this.postRepository.decreaseCommentCount(comment.getPost().getId());
+		// 2) 조건부 전환이 최종 판정이다. 0행이면 이미 지워진 것 — 던져서 1)의 감소까지 되돌린다
+		if (this.commentRepository.softDeleteIfActive(comment.getId()) == 0) {
+			throw new BusinessException(ErrorCode.COMMENT_NOT_FOUND);
+		}
 	}
 
 	/**

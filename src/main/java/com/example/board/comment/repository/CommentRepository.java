@@ -42,6 +42,36 @@ public interface CommentRepository extends JpaRepository<Comment, Long> {
 	Optional<Comment> findByIdAndDeletedFalse(Long id);
 
 	/**
+	 * 활성 댓글 한 건을 논리 삭제한다. 영향받은 행 수를 돌려준다 — 이미 지워졌으면 0 행이다.
+	 *
+	 * <p>문장과 조건은 sp-docs/plan/phase2-board.md B-17 의 2) 그대로다 — sp-docs/domain-model.md
+	 * §6.2 의 첨부 삭제 2) 와 같은 모양이다. <b>활성인지의 판정과 전환이 한 문장이다</b>
+	 * ({@code deleted = false} 조건, sp-docs/domain-model.md §6 의 표). 삭제의 404 {@code CM001}
+	 * 판정({@link #findByIdAndDeletedFalse})은 락 전의 읽기라 같은 댓글의 동시 삭제를 거르지
+	 * 못한다 — 모두 활성으로 읽을 수 있다. 그래서 이 문장의 영향 행 수가 최종 판정이고, 0 행이면
+	 * 부르는 쪽이 트랜잭션을 되돌린다.
+	 *
+	 * <p><b>엔티티의 {@code softDelete()} 로 바꿔 더티 체킹에 맡기지 않는다.</b> 그 UPDATE 는
+	 * {@code where} 에 {@code id} 만 건다 — 1차의 삭제가 그 모양이었고, B-17 이 고치기 전의 코드에서
+	 * 잰 값으로 다른 트랜잭션이 먼저 지운 댓글의 삭제가 예외 없이 끝났고, 같은 댓글의 동시 삭제
+	 * 3건이 모두 성공해 {@code comment_count} 를 3 줄였다 ({@code CommentServiceTest} 의 B-17 중첩
+	 * 클래스).
+	 *
+	 * <p>{@code updated_at} 을 바꾸지 않는다 — 벌크 UPDATE 는 감사 리스너를 지나지 않는다.
+	 * {@link #softDeleteByPostId} 와 같고, 그 값을 감사 흔적으로 쓰지 않으며
+	 * (sp-docs/domain-model.md §1.1) 댓글 응답에도 없다 (sp-docs/api-contract.md §4.5).
+	 *
+	 * <p>{@code flushAutomatically}·{@code clearAutomatically} 를 켜지 않는다. 부르는 쪽이 이
+	 * 문장 앞에 쓰기 대기 중인 엔티티 변경을 두지 않고, 이 문장 뒤에 그 댓글 엔티티를 다시 읽지
+	 * 않는다는 전제다 — 벌크 UPDATE 는 영속성 컨텍스트를 지나지 않아 거기 남은 사본은
+	 * {@code deleted = false} 를 그대로 들고 있으므로, 다시 읽는 쪽이 생기면
+	 * {@code clearAutomatically} 를 다시 본다.
+	 */
+	@Modifying
+	@Query("update Comment c set c.deleted = true where c.id = :id and c.deleted = false")
+	int softDeleteIfActive(@Param("id") Long id);
+
+	/**
 	 * 한 게시글의 댓글을 모두 논리 삭제한다. 영향받은 행 수를 돌려준다.
 	 *
 	 * <p>게시글 삭제 시 하위 댓글을 함께 논리 삭제한다 (sp-docs/requirements/board.md §5 규칙 3).

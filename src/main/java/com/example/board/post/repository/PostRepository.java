@@ -59,9 +59,17 @@ public interface PostRepository extends JpaRepository<Post, Long> {
 	 * 엔티티의 집계 메서드를 함께 부르면 전체 컬럼 UPDATE 가 한 문장 더 붙어 이 문장을
 	 * 덮어쓴다 — 그 단언이 보는 것은 그것이다.
 	 *
-	 * <p>{@code flushAutomatically} 는 켠다. 호출 시점에 쓰기 대기 중인 변경이 있으면
-	 * ({@code comment.deleted}) 그것을 먼저 내보내 SQL 순서를 프로그램 순서와 맞춘다 —
-	 * {@code softDeleteByPostId} 와 같은 이유다.
+	 * <p>{@code flushAutomatically} 는 켠다. 호출 시점에 쓰기 대기 중인 변경이 있으면 그것을 먼저
+	 * 내보내 SQL 순서를 프로그램 순서와 맞춘다 — {@code softDeleteByPostId} 와 같은 이유다.
+	 * <b>B-17 시점에 이 문장과 {@link #decreaseCommentCount} 를 부르는 쪽(댓글 작성·삭제)은 그것을
+	 * 트랜잭션의 첫 쓰기로 부른다</b> — 작성은 INSERT 보다, 삭제는 댓글의 조건부 전환보다 먼저다
+	 * (sp-docs/plan/phase2-board.md B-17). 그래서 그 호출들에는 내보낼 것이 없다 — B-17 이 두
+	 * 문장에서 이 설정을 빼고 전체 테스트를 돌려 모두 통과했고, 그 시점의 스위트에는 이 설정을
+	 * 관측하는 단언이 없다. 1차의 삭제는 엔티티의 {@code deleted} 를 바꾼 뒤 감소를 불러 이 설정이
+	 * 그 변경을 먼저 내보냈다 — 발행 순서가 댓글 행 → {@code post} 였던 이유이고, B-17 이 순서를
+	 * {@code post} 먼저로 뒤집으며 그 대기 중인 변경이 없어졌다. 켜 두는 것은 부르는 쪽이 이 문장
+	 * 앞에 엔티티 쓰기를 두게 될 때 그 쓰기가 이 문장 뒤로 밀려 발행 순서가 프로그램 순서와
+	 * 어긋나지 않게 하려는 것이다.
 	 */
 	@Modifying(flushAutomatically = true)
 	@Query("update Post p set p.commentCount = p.commentCount + 1 where p.id = :id")
@@ -102,7 +110,7 @@ public interface PostRepository extends JpaRepository<Post, Long> {
 	 *
 	 * <p>{@code flushAutomatically} 는 켜지 않는다. 상세 조회는 이 문장 앞에 쓰기가 없어
 	 * 내보낼 것이 없다 — 켤 이유가 있는 것은 호출 시점에 쓰기 대기 중인 변경을 들고 있는
-	 * 경로다 ({@link #increaseCommentCount} 가 그렇다).
+	 * 경로다 (B-17 전의 댓글 삭제 경로가 그랬다).
 	 *
 	 * <p>{@code deleted} 조건을 이 문장에 두지 않는다. 삭제된 게시글을 없는 것으로 보는 판정은
 	 * {@link com.example.board.post.support.PostReader} 가 하고, 부르는 쪽이 그 판정을 먼저

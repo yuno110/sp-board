@@ -36,6 +36,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.IntConsumer;
 import java.util.function.Predicate;
@@ -79,7 +80,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * "{@code comment_count} 가 1 증가한다" 는 저장된 행을 봐야 확인된다.
  *
  * <p>픽스처의 {@code writerId} 는 801~829 를 쓰고, B-10 의 중첩 클래스
- * ({@link 집계_갱신의_모양과_동시성})가 901~929 를 쓴다. 같은 JVM 의 모든 테스트가 하나의
+ * ({@link 집계_갱신의_모양과_동시성})가 901~929, B-17 의 중첩 클래스
+ * ({@link 삭제의_순서와_조건부_전환})가 971~979 를 쓴다. 같은 JVM 의 모든 테스트가 하나의
  * H2 DB 를 보므로 (sp-docs/tech-stack.md §5.3) 이미 쓰이는 대역과 겹치지 않게 둔다. 이
  * 클래스는 트랜잭션 롤백에 기대지 않고 — 작성 경로가 스스로 커밋한다 —
  * {@code @AfterEach} 가 자기 대역만 지운다. <b>테이블 전체를 지우지 않는다</b> — 다른
@@ -338,6 +340,11 @@ class CommentServiceTest {
 	 * 댓글 둘로 두는 것이 요점이다 — 하나면 두 번째 삭제가 집계를 깎아도 0 에서 가드에 막혀
 	 * 1회 삭제의 결과와 구별되지 않는다. 둘이면 두 번째 삭제가 통과하는 구현에서 집계가 0 이
 	 * 되어 빨개진다.
+	 *
+	 * <p>sp-docs/plan/phase2-board.md B-17 검증표의 「같은 댓글 순차 2회 삭제」 도 이 테스트다.
+	 * 순차에서는 두 번째 요청이 읽기의 판정에서 404 를 받아 쓰기에 닿지 않는다 — 동시 삭제는
+	 * 그렇지 않으므로
+	 * {@link 삭제의_순서와_조건부_전환#같은_댓글의_동시_삭제는_집계를_한_번만_줄인다()} 가 따로 본다.
 	 */
 	@Test
 	@DisplayName("같은 댓글을 두 번 삭제하면 두 번째는 CM001 이고 집계가 두 번 깎이지 않는다")
@@ -369,6 +376,10 @@ class CommentServiceTest {
 	 * 메서드에서 그 문장으로 옮겨 갔다 (sp-docs/plan/phase1.md §6 B-10) — 좁은 UPDATE 는
 	 * 엔티티를 지나지 않으므로 조건이 엔티티에 남아 있으면 지나가지 않는다. <b>조건을 뺀
 	 * 문장은 여기서 {@code -1} 을 커밋해 이 단언이 빨개진다</b>(실측).
+	 *
+	 * <p><b>B-17 뒤로는 이 픽스처에서 감소가 먼저이고 0 행이다.</b> 그래도 댓글의 전환을 그대로
+	 * 하고 성공해야 한다 — sp-docs/plan/phase2-board.md B-17 검증표의 「집계가 이미 0 인 활성 댓글
+	 * 삭제」 가 이 테스트다. 감소의 0 행을 실패로 다뤄 되돌리는 구현은 여기서 예외로 빨개진다.
 	 */
 	@Test
 	@DisplayName("집계가 0 인데 활성 댓글이 있어도 삭제 후 comment_count 가 음수가 되지 않는다")
@@ -1085,6 +1096,395 @@ class CommentServiceTest {
 	}
 
 	/**
+	 * sp-docs/plan/phase2-board.md <b>B-17</b> 의 검증표다. 같은 표의 「집계가 이미 0 인 활성 댓글
+	 * 삭제」 와 「같은 댓글 순차 2회 삭제」 는 1차 테스트가 그대로 본다
+	 * ({@link CommentServiceTest#집계는_음수가_되지_않는다()},
+	 * {@link CommentServiceTest#같은_댓글_두_번_삭제()}).
+	 *
+	 * <h2>무엇을 고쳤나</h2>
+	 *
+	 * <p>1차의 삭제는 활성 댓글을 락 없이 읽고, 엔티티의 {@code deleted} 를 더티 체킹으로 조건 없이
+	 * 저장한 뒤 {@code comment_count} 를 줄였다. 같은 댓글을 지우는 요청들이 모두 활성으로 읽으면
+	 * 모두 줄일 것으로 정본이 추정했다 (sp-docs/domain-model.md §6 의 블록인용, 2026-11-11
+	 * {@code D-18}). 고친 모양은 {@code post} 감소 → 댓글의 조건부 전환이고, 전환이 0행이면
+	 * 트랜잭션을 되돌린다 (같은 절의 표, §6.2 의 첨부 삭제).
+	 *
+	 * <h2>고치기 전의 코드에서 잰 값</h2>
+	 *
+	 * <p>완료 기준 「고치기 전에 검증표 첫 줄이 1차 코드에서 빨개지는 것을 보았다」 의 기록이다.
+	 * 고치기 전의 {@code delete} 에 이 클래스를 두 번 돌렸다 — 둘째 실행은 첫 테스트의 단언 순서만
+	 * 바꿔 집계를 먼저 보게 했다.
+	 * <ul>
+	 * <li>같은 댓글의 동시 삭제 3건 — 실패 목록이 비었고(3건 모두 성공, 첫 실행) 집계가 4 에서 1 로
+	 * 3 줄었다(둘째 실행). 위 추정이 H2 에서 측정이 됐다
+	 * <li>발행 순서 — {@code comment} → {@code post}
+	 * <li>댓글 행의 쓰기 — {@code update comment set content=?,deleted=?,parent_id=?,post_id=?,
+	 * updated_at=?,writer_id=?,writer_nickname=? where id=?} (더티 체킹)
+	 * <li>전환이 0행인 경로 — 다른 트랜잭션이 먼저 지운 댓글의 삭제가 예외 없이 끝났다
+	 * <li>경계 관측 — 녹색. 1차도 한 트랜잭션이었다
+	 * </ul>
+	 *
+	 * <h2>고친 뒤의 변이 — 어느 단언이 무엇을 잡나</h2>
+	 *
+	 * <p>B-17 이 운영 코드를 하나씩 어긋내고 {@code CommentServiceTest} 전체를 돌린 결과다. 잡은
+	 * 테스트만 적는다.
+	 * <ul>
+	 * <li>전환 문장에서 {@code and c.deleted = false} 를 뺀다 — 동시 삭제(집계 3 기대, 1 관측),
+	 * 0행 경로(예외 없음), 전환 모양. H2 에서도 조건이 일한다
+	 * <li>전환을 감소보다 먼저 둔다 — 순서, 0행 경로(감소가 발행되지 않음). <b>동시 삭제는
+	 * 녹색이다</b> — 조건부 전환만으로 이중 감소는 막히므로 순서는 순서 테스트가 따로 본다
+	 * <li>전환의 0행을 무시한다 — 동시 삭제(3 기대, 1), 0행 경로(예외 없음)
+	 * <li>{@code noRollbackFor = BusinessException.class} (sp-docs/process/review-policy.md §4.1 의
+	 * 변이 B) — 동시 삭제(3 기대, 1), 0행 경로(2 기대, 1)
+	 * <li>두 쓰기를 각각 자기 트랜잭션으로 (변이 C) — 경계 관측(커밋 2), 동시 삭제, 0행 경로
+	 * <li>{@code @Transactional} 제거 (변이 A) — {@code flushAutomatically} 의 flush 가 활성
+	 * 트랜잭션을 요구해 삭제마다 예외로 터진다
+	 * <li>감소의 0행을 실패로 다룬다 — {@link CommentServiceTest#집계는_음수가_되지_않는다()},
+	 * {@link CommentServiceTest#수정과_삭제는_member_를_호출하지_않는다()} (둘 다 집계 0 픽스처)
+	 * </ul>
+	 *
+	 * <h2>끼워넣기를 강제하는 지점 — 그 요청의 첫 쓰기 직전</h2>
+	 *
+	 * <p>{@link StatementRecorder} 가 {@code update} 문장을 보면 그 스레드를 집결지에 세운다. 고친
+	 * 구현의 첫 쓰기는 {@code update post} 이고 1차 구현의 첫 쓰기는 {@code update comment} 다 —
+	 * 어느 쪽이든 모두 모인 시점에 모든 읽기가 끝나 있고 아직 아무 쓰기도 없다. 그래서 같은
+	 * 테스트를 두 구현에 그대로 돌려 비교할 수 있다. {@link 집계_갱신의_모양과_동시성} 처럼
+	 * {@code update post} 에 세우면 1차 구현에서는 댓글 행의 쓰기가 집결 전에 일어나므로 「읽기가
+	 * 어느 쓰기보다 먼저」 를 강제하지 못한다.
+	 *
+	 * <p>픽스처의 {@code writerId} 는 971~979 를 쓴다. 바깥 클래스의 {@code @AfterEach} 는
+	 * 801~829 만 지우므로 이 대역은 여기서 지운다. {@code comment.post_id} 에 FK 가 있으므로
+	 * 댓글을 먼저 지운다.
+	 */
+	@Nested
+	@DisplayName("댓글 삭제는 post 감소가 먼저이고 댓글 행의 전환이 조건부 문장 하나다")
+	@ContextConfiguration(classes = CommentServiceTest.StatementRecorderConfig.class)
+	class 삭제의_순서와_조건부_전환 {
+
+		/** 동시 요청 수. 둘 이상이어야 같은 댓글을 여러 요청이 활성으로 읽을 수 있다. */
+		private static final int 동시_요청 = 3;
+
+		private static final long 동시_삭제_대역 = 971L;
+
+		private static final long 순서_대역 = 972L;
+
+		private static final long 전환_모양_대역 = 973L;
+
+		private static final long 영행_전환_대역 = 974L;
+
+		private static final long 경계_대역 = 975L;
+
+		/** 집결지·끼워넣은 쓰기를 기다리는 한도. 넘으면 강제가 일어나지 않은 것이므로 터진다. */
+		private static final int 대기_한도_초 = 10;
+
+		/**
+		 * <b>경계를 관측하는 지점이다.</b> {@link 작성_트랜잭션_경계} 의 같은 필드와 같은 이유다 —
+		 * {@code @Transactional} 의 인터셉터가 이 빈으로 트랜잭션을 열고 닫는다.
+		 */
+		@MockitoSpyBean
+		private PlatformTransactionManager spyTransactionManager;
+
+		@Autowired
+		private CommentService commentService;
+
+		@Autowired
+		private CommentRepository commentRepository;
+
+		@Autowired
+		private PostRepository postRepository;
+
+		/** 바깥 클래스의 {@code @MockitoBean} 이 이 컨텍스트에도 상속된다 (위 중첩 클래스와 같다). */
+		@Autowired
+		private MemberClient memberClient;
+
+		@Autowired
+		private JdbcTemplate jdbcTemplate;
+
+		@Autowired
+		private StatementRecorder 발행된_문장;
+
+		@BeforeEach
+		void member_응답을_둔다() {
+			given(this.memberClient.findActiveNickname(anyLong())).willReturn(MEMBER_NICKNAME);
+		}
+
+		@AfterEach
+		void 픽스처_정리() {
+			this.발행된_문장.비운다();
+			this.jdbcTemplate.update("DELETE FROM comment WHERE post_id IN "
+					+ "(SELECT id FROM post WHERE writer_id BETWEEN 971 AND 979)");
+			this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 971 AND 979");
+		}
+
+		/**
+		 * 검증표 <b>「같은 댓글의 동시 삭제 N건 — 두 읽기가 어느 쓰기보다 먼저 일어나게 강제한다」
+		 * → 성공 1건, 나머지 404 {@code CM001}, {@code comment_count} 가 1 만 준다</b>.
+		 *
+		 * <p>남는 댓글을 {@code 동시_요청} 개 더 두어 시작 집계를 {@code 동시_요청 + 1} 로 만든다.
+		 * 시작 집계가 동시 요청 수 이상이어야 요청마다의 감소가 {@code comment_count > 0} 가드에
+		 * 막히지 않고 모두 집계에 드러난다.
+		 */
+		@Test
+		@DisplayName("같은 댓글의 동시 삭제 3건이면 하나만 성공하고 comment_count 가 한 번만 준다")
+		void 같은_댓글의_동시_삭제는_집계를_한_번만_줄인다() throws InterruptedException {
+			Post post = 게시글을_만든다(동시_삭제_대역);
+			Comment 지울_댓글 = 서비스로_작성한_댓글(post, 동시_삭제_대역, "동시에 지울 댓글");
+			for (int i = 0; i < 동시_요청; i++) {
+				서비스로_작성한_댓글(post, 동시_삭제_대역, "남는 댓글 " + i);
+			}
+			int 시작_집계 = 커밋된_집계(post.getId());
+			assertThat(시작_집계)
+					.as("시작 집계가 동시 요청 수 이상이어야 요청마다의 감소가 0 의 가드에 막히지 않는다")
+					.isEqualTo(동시_요청 + 1);
+			모든_스레드를_첫_쓰기_직전에_모은다();
+
+			List<Throwable> 실패 = 동시에_실행한다(
+					i -> this.commentService.delete(지울_댓글.getId(), user(동시_삭제_대역)));
+
+			int 활성_댓글 = 활성_댓글_수(post.getId());
+			assertThat(활성_댓글).as("지울 댓글만 지워지고 남는 댓글은 그대로다").isEqualTo(동시_요청);
+			int 끝_집계 = 커밋된_집계(post.getId());
+			assertThat(끝_집계)
+					.as("같은 댓글의 동시 삭제가 comment_count 를 한 번만 줄인다 "
+							+ "(sp-docs/domain-model.md §6)")
+					.isEqualTo(시작_집계 - 1);
+			assertThat(끝_집계).as("집계가 활성 댓글 수와 같다 (sp-docs/domain-model.md §5)")
+					.isEqualTo(활성_댓글);
+			assertThat(실패)
+					.as("하나만 성공하고 나머지는 404 CM001 이다 — 전환이 0행인 요청")
+					.hasSize(동시_요청 - 1)
+					.allSatisfy(실패한_요청 -> assertThat(실패한_요청)
+							.isInstanceOf(BusinessException.class)
+							.extracting(e -> ((BusinessException) e).getErrorCode())
+							.isEqualTo(ErrorCode.COMMENT_NOT_FOUND));
+		}
+
+		/** 검증표 <b>「발행된 문장의 순서」 → {@code update post} 가 {@code update comment} 보다 먼저다</b>. */
+		@Test
+		@DisplayName("삭제는 post 감소를 댓글 전환보다 먼저 발행한다")
+		void post_감소가_댓글_전환보다_먼저다() {
+			Post post = 게시글을_만든다(순서_대역);
+			Comment comment = 서비스로_작성한_댓글(post, 순서_대역, "순서를 볼 댓글");
+			this.발행된_문장.비운다();
+
+			this.commentService.delete(comment.getId(), user(순서_대역));
+
+			assertThat(this.발행된_문장.발행된_UPDATE())
+					.as("post 감소 → 댓글 전환 순서다. 거꾸로면 답글 작성(post → 부모 행의 FK 공유 락)과 "
+							+ "락 순서가 반대가 된다 (sp-docs/domain-model.md §6 의 블록인용). "
+							+ "수집기가 꽂히지 않았으면 빈 목록이다")
+					.extracting(StatementRecorder::대상_테이블)
+					.containsExactly("post", "comment");
+		}
+
+		/**
+		 * 완료 기준 <b>「댓글 행의 전환이 조건부 문장 하나다 — 엔티티 더티 체킹의 UPDATE 가
+		 * 아니다」</b>.
+		 *
+		 * <p>더티 체킹의 UPDATE 는 매핑된 컬럼을 모두 싣고 {@code where} 에 {@code id} 만 건다.
+		 * 조건부 전환은 {@code deleted} 만 바꾸고 {@code where} 에 {@code deleted} 를 건다 — 판정과
+		 * 전환이 한 문장이어야 락 전에 읽은 상태로 쓰지 않는다 (sp-docs/domain-model.md §6 의 표).
+		 */
+		@Test
+		@DisplayName("댓글 행의 전환은 deleted 를 조건으로 거는 UPDATE 하나이고 더티 체킹의 UPDATE 가 아니다")
+		void 댓글_전환은_조건부_문장_하나다() {
+			Post post = 게시글을_만든다(전환_모양_대역);
+			Comment comment = 서비스로_작성한_댓글(post, 전환_모양_대역, "전환을 볼 댓글");
+			this.발행된_문장.비운다();
+
+			this.commentService.delete(comment.getId(), user(전환_모양_대역));
+
+			List<String> comment_UPDATE = this.발행된_문장.발행된_UPDATE().stream()
+					.filter(sql -> "comment".equals(StatementRecorder.대상_테이블(sql)))
+					.toList();
+			assertThat(comment_UPDATE)
+					.as("댓글 행을 바꾸는 문장은 하나다. 수집기가 꽂히지 않았으면 빈 목록이다")
+					.hasSize(1);
+			assertThat(comment_UPDATE.get(0))
+					.as("엔티티 더티 체킹의 전체 컬럼 UPDATE 가 아니다")
+					.doesNotContain("content", "writer_", "updated_at")
+					.as("활성일 때만 바꾸는 조건이 그 문장의 where 에 있다")
+					.containsPattern(" where .*deleted");
+		}
+
+		/**
+		 * 검증표 <b>「전환이 0행인 경로」 → 그 요청의 감소가 되돌아간다 — 커밋된
+		 * {@code comment_count} 불변</b>. 완료 기준 「전환이 0행이면 트랜잭션이 되돌아가고 404
+		 * {@code CM001} 이다」 가 여기 있다.
+		 *
+		 * <p><b>0행을 실제로 만든다.</b> 이 요청의 첫 쓰기 직전에 다른 트랜잭션이 같은 댓글을 지우고
+		 * 커밋한다 — 이 요청은 그 전에 댓글을 활성으로 읽었으므로 404·403 판정을 지나 쓰기에 닿고,
+		 * 감소를 발행한 뒤 전환에서 0행을 본다. 스파이로 전환의 반환값만 0 으로 바꾸면 조건이
+		 * 문장에 있는지는 보지 않는다.
+		 *
+		 * <p>시작 집계를 2 로 둔다. 0 이면 감소 자체가 0행이라 되돌릴 것이 없어 마지막 단언이
+		 * 반증 불가능해진다.
+		 */
+		@Test
+		@DisplayName("전환이 0행이면 그 요청의 감소가 되돌아가고 404 CM001 이다")
+		void 전환이_0행이면_감소가_되돌아간다() {
+			Post post = 게시글을_만든다(영행_전환_대역);
+			Comment 지울_댓글 = 서비스로_작성한_댓글(post, 영행_전환_대역, "먼저 지워질 댓글");
+			서비스로_작성한_댓글(post, 영행_전환_대역, "남는 댓글");
+			int 시작_집계 = 커밋된_집계(post.getId());
+			assertThat(시작_집계).as("감소가 1행이어야 되돌아가는지 볼 수 있다").isEqualTo(2);
+			this.발행된_문장.비운다();
+			AtomicInteger 끼워넣은_전환 = new AtomicInteger(-1);
+			this.발행된_문장.훅을_건다(sql -> sql.startsWith("update "),
+					() -> 끼워넣은_전환.set(다른_트랜잭션에서_지운다(지울_댓글.getId())));
+
+			assertThatThrownBy(() -> this.commentService.delete(지울_댓글.getId(), user(영행_전환_대역)))
+					.isInstanceOf(BusinessException.class)
+					.extracting(e -> ((BusinessException) e).getErrorCode())
+					.isEqualTo(ErrorCode.COMMENT_NOT_FOUND);
+
+			assertThat(끼워넣은_전환.get())
+					.as("다른 트랜잭션이 그 댓글을 먼저 지우고 커밋해야 이 요청의 전환이 0행이 된다")
+					.isEqualTo(1);
+			assertThat(this.발행된_문장.발행된_post_UPDATE())
+					.as("이 요청이 감소를 실제로 발행해야 그것이 되돌아가는지 볼 수 있다")
+					.hasSize(1);
+			assertThat(커밋된_집계(post.getId()))
+					.as("그 요청의 감소가 남지 않는다 — 커밋된 comment_count 불변")
+					.isEqualTo(시작_집계);
+		}
+
+		/**
+		 * 완료 기준 「한 로컬 트랜잭션이 1차 그대로다」 의 경계 관측이다
+		 * (sp-docs/process/review-policy.md §4.1 — 완료 기준에 한 로컬 트랜잭션이 있으면 경계를
+		 * 관측한다). 세는 법은 {@link 작성_트랜잭션_경계#커밋이_정확히_한_번이다()} 와 같다.
+		 *
+		 * <p>삭제됐는지는 {@code JdbcTemplate} 으로 본다. 리포지터리의 상속 조회는 자기 트랜잭션을
+		 * 열고 닫아 이 집계에 섞인다.
+		 */
+		@Test
+		@DisplayName("한 번의 삭제에 물리 트랜잭션이 정확히 하나 커밋된다")
+		void 삭제의_커밋이_정확히_한_번이다() {
+			Post post = 게시글을_만든다(경계_대역);
+			Comment comment = 서비스로_작성한_댓글(post, 경계_대역, "경계를 볼 댓글");
+
+			// 준비가 끝난 뒤에 센다. 세는 구간을 delete 한 번으로 좁혀 둔다
+			List<TransactionStatus> 커밋된_물리_트랜잭션 = new ArrayList<>();
+			willAnswer(invocation -> {
+				TransactionStatus status = invocation.getArgument(0);
+				if (status.isNewTransaction()) {
+					커밋된_물리_트랜잭션.add(status);
+				}
+				return invocation.callRealMethod();
+			}).given(this.spyTransactionManager).commit(any(TransactionStatus.class));
+
+			this.commentService.delete(comment.getId(), user(경계_대역));
+
+			assertThat(활성_댓글_수(post.getId()))
+					.as("삭제가 일어나지 않았다면 커밋 수는 아무것도 말하지 않는다")
+					.isZero();
+			assertThat(커밋된_물리_트랜잭션)
+					.as("post 감소와 댓글 전환이 한 로컬 트랜잭션이다 (sp-docs/domain-model.md §6)")
+					.hasSize(1);
+		}
+
+		/**
+		 * <b>끼워넣기를 강제한다.</b> 요청마다 첫 {@code update} 가 발행되기 직전에 스레드를 세워,
+		 * {@code 동시_요청} 개가 모두 모인 뒤에야 첫 쓰기가 실행되게 한다. 한도 안에 모이지 않으면
+		 * {@link IllegalStateException} 으로 터진다.
+		 */
+		private void 모든_스레드를_첫_쓰기_직전에_모은다() {
+			CyclicBarrier 집결지 = new CyclicBarrier(동시_요청);
+			this.발행된_문장.훅을_건다(sql -> sql.startsWith("update "), () -> {
+				try {
+					집결지.await(대기_한도_초, TimeUnit.SECONDS);
+				}
+				catch (InterruptedException | BrokenBarrierException | TimeoutException ex) {
+					throw new IllegalStateException(
+							"첫 쓰기 직전에 모든 스레드가 모이지 않았다 — 읽기가 어느 쓰기보다 먼저라는 "
+									+ "끼워넣기가 강제되지 않았으므로 이 측정은 이중 감소를 볼 수 없다", ex);
+				}
+			});
+		}
+
+		/**
+		 * 다른 커넥션의 자동 커밋으로 댓글을 지우고 영향 행 수를 돌려준다. <b>다른 스레드에서
+		 * 돌린다</b> — 부르는 스레드에는 서비스의 트랜잭션이 묶여 있어 같은 스레드의
+		 * {@code JdbcTemplate} 은 그 트랜잭션에 참여한다.
+		 */
+		private int 다른_트랜잭션에서_지운다(Long commentId) {
+			ExecutorService 다른_스레드 = Executors.newSingleThreadExecutor();
+			try {
+				return 다른_스레드.submit(() -> this.jdbcTemplate.update(
+								"UPDATE comment SET deleted = TRUE WHERE id = ? AND deleted = FALSE",
+								commentId))
+						.get(대기_한도_초, TimeUnit.SECONDS);
+			}
+			catch (InterruptedException | ExecutionException | TimeoutException ex) {
+				throw new IllegalStateException(
+						"끼워넣은 삭제가 커밋되지 않았다 — 이 측정은 0행 전환을 볼 수 없다", ex);
+			}
+			finally {
+				다른_스레드.shutdownNow();
+			}
+		}
+
+		/** 스레드 번호를 받는 작업을 {@code 동시_요청} 개 스레드로 동시에 돌리고 실패를 모은다. */
+		private List<Throwable> 동시에_실행한다(IntConsumer 작업) throws InterruptedException {
+			ExecutorService 풀 = Executors.newFixedThreadPool(동시_요청);
+			try {
+				List<Future<?>> 결과 = new ArrayList<>();
+				for (int i = 0; i < 동시_요청; i++) {
+					int index = i;
+					결과.add(풀.submit(() -> 작업.accept(index)));
+				}
+
+				List<Throwable> 실패 = new ArrayList<>();
+				for (Future<?> future : 결과) {
+					try {
+						future.get(대기_한도_초 * 3L, TimeUnit.SECONDS);
+					}
+					catch (ExecutionException ex) {
+						실패.add(ex.getCause());
+					}
+					catch (TimeoutException ex) {
+						실패.add(ex);
+					}
+				}
+				return 실패;
+			}
+			finally {
+				풀.shutdownNow();
+			}
+		}
+
+		private Post 게시글을_만든다(long writerId) {
+			return this.postRepository.saveAndFlush(Post.builder()
+					.writerId(writerId)
+					.writerNickname("글작성자")
+					.title("삭제 순서 대상")
+					.content("본문")
+					.build());
+		}
+
+		private Comment 서비스로_작성한_댓글(Post post, long writerId, String content) {
+			CommentResponse created = this.commentService.create(
+					post.getId(), writerId, new CommentCreateRequest(content));
+			return this.commentRepository.findById(created.id()).orElseThrow();
+		}
+
+		/** JPA 를 거치지 않고 커밋된 값을 읽는다. 다른 스레드가 커밋한 것을 봐야 한다. */
+		private int 커밋된_집계(Long postId) {
+			Integer count = this.jdbcTemplate.queryForObject(
+					"SELECT comment_count FROM post WHERE id = ?", Integer.class, postId);
+			return count == null ? 0 : count;
+		}
+
+		private int 활성_댓글_수(Long postId) {
+			Integer count = this.jdbcTemplate.queryForObject(
+					"SELECT COUNT(*) FROM comment WHERE post_id = ? AND deleted = FALSE",
+					Integer.class, postId);
+			return count == null ? 0 : count;
+		}
+
+	}
+
+	/**
 	 * 발행된 SQL 을 모으고, 지정한 문장이 <b>발행되기 직전에</b> 훅을 돌린다. Hibernate 의
 	 * {@code StatementInspector} 라 문장이 JDBC 로 넘어가기 전에 불린다.
 	 *
@@ -1134,6 +1534,19 @@ class CommentServiceTest {
 					.map(StatementRecorder::정규화)
 					.filter(sql -> sql.startsWith("update post"))
 					.toList();
+		}
+
+		/** 모든 UPDATE. 수집된 순서 그대로이고 소문자·공백이 정규화된 문장이다. */
+		List<String> 발행된_UPDATE() {
+			return this.발행된_문장.stream()
+					.map(StatementRecorder::정규화)
+					.filter(sql -> sql.startsWith("update "))
+					.toList();
+		}
+
+		/** 정규화된 {@code update <테이블> …} 문장의 테이블 이름. */
+		static String 대상_테이블(String 정규화된_UPDATE) {
+			return 정규화된_UPDATE.split(" ")[1];
 		}
 
 		private static String 정규화(String sql) {
