@@ -68,8 +68,8 @@ public class CommentService {
 	/**
 	 * {@code comment_count} 를 갱신하는 지점. <b>좁은 UPDATE 다</b> —
 	 * {@code comment_count = comment_count ± 1} 한 컬럼만 싣는다
-	 * (sp-docs/plan/phase1.md §6 B-10). 엔티티를 읽어 메모리에서 바꾸면 더티 체킹이 전체
-	 * 컬럼을 싣고 동시 커밋에서 증가가 소실된다 (sp-docs/nfr.md §1).
+	 * (sp-docs/plan/phase1.md §6 B-10). 엔티티를 읽어 메모리에서 바꾸면 그 트랜잭션이 읽은 값으로
+	 * 계산한 값을 써서 동시 커밋에서 증가가 소실된다 (sp-docs/nfr.md §1).
 	 */
 	private final PostRepository postRepository;
 
@@ -124,10 +124,9 @@ public class CommentService {
 	 *
 	 * <p><b>집계 증가는 좁은 UPDATE 다</b> — {@code comment_count = comment_count + 1}
 	 * ({@link PostRepository#increaseCommentCount}, sp-docs/plan/phase1.md §6 B-10). 읽어 둔
-	 * 엔티티를 메모리에서 올리지 않는다: 더티 체킹이 변경되지 않은 컬럼까지 UPDATE 에 실어
-	 * 낡은 스냅샷째 덮어쓰고, <b>동시 커밋에서 증가가 소실된다</b> (sp-docs/nfr.md §1 의 I-03
-	 * 실측 — 201 11건에 증가 10). 더하는 대상이 이 트랜잭션이 읽은 값이 아니라 DB 의 현재
-	 * 값이어야 소실되지 않는다.
+	 * 엔티티를 메모리에서 올리지 않는다: 이 트랜잭션이 읽은 값에 1 을 더한 값을 쓰므로 <b>동시
+	 * 커밋에서 증가가 소실된다</b> (sp-docs/nfr.md §1 의 I-03 실측 — 201 11건에 증가 10). 더하는
+	 * 대상이 이 트랜잭션이 읽은 값이 아니라 DB 의 현재 값이어야 소실되지 않는다.
 	 *
 	 * <p><b>집계 증가를 INSERT 보다 앞에 둔다.</b> 둘 다 같은 트랜잭션이므로 순서가 결과를
 	 * 바꾸지 않지만, 뒤에 두면 INSERT 에 실패를 주입하는 테스트에서 집계 변경이 아예 일어나지

@@ -47,9 +47,11 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.IntConsumer;
 import java.util.function.Predicate;
+import java.util.function.ToIntBiFunction;
 import javax.sql.DataSource;
 import org.hibernate.cfg.AvailableSettings;
 import org.hibernate.resource.jdbc.spi.StatementInspector;
@@ -57,6 +59,8 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EnumSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.orm.jpa.HibernatePropertiesCustomizer;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -71,6 +75,7 @@ import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * sp-docs/plan/phase1.md §6 B-05 의 "검증" 표 중 저장·조회 쪽을 테스트로 옮긴 것이다. HTTP
@@ -98,6 +103,10 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  * 겹치지 않게 둔다. 이 클래스는 트랜잭션 롤백에 기대지 않고 — 작성 경로가 스스로 커밋한다 —
  * {@code @AfterEach} 가 자기 대역을 지운다.
  * <b>테이블 전체를 지우지 않는다</b> — 다른 클래스의 픽스처를 없애면 그쪽이 간헐 실패한다.
+ *
+ * <p>B-18 의 중첩 클래스({@link 수정_삭제와_집계_끼워넣기})는 981~989 를 쓴다. 위 목록에 없는
+ * 대역도 이미 쓰이고 있어(예: {@code CommentServiceTest} 의 971~979), 2026-11-13 에 테스트 소스
+ * 전체에서 981~989 를 찾아 쓰는 곳이 없는 것을 확인하고 골랐다.
  */
 @SpringBootTest
 @ActiveProfiles("test")
@@ -901,12 +910,18 @@ class PostServiceTest {
 	 *
 	 * <h2>무엇이 결함이었나</h2>
 	 *
-	 * <p>{@code getDetail} 이 관리 엔티티의 조회수를 메모리에서 올리면 더티 체킹이 변경되지
-	 * 않은 컬럼까지 전부 UPDATE 에 싣고, <b>그 트랜잭션이 읽은 {@code comment_count} 를 그대로
-	 * 다시 쓴다</b> — SELECT 와 flush 사이에 커밋된 댓글 작성의 증가가 조회 하나로 소실된다
-	 * (sp-docs/api-contract.md §4.5 가 {@code comment_count} 와 댓글 목록의
+	 * <p>B-11 전의 {@code getDetail} 은 관리 엔티티의 조회수를 메모리에서 올렸고, 더티 체킹이
+	 * 변경되지 않은 컬럼까지 전부 UPDATE 에 실어 <b>그 트랜잭션이 읽은 {@code comment_count} 를
+	 * 그대로 다시 썼다</b> — SELECT 와 flush 사이에 커밋된 댓글 작성의 증가가 조회 하나로
+	 * 소실된다 (sp-docs/api-contract.md §4.5 가 {@code comment_count} 와 댓글 목록의
 	 * {@code totalElements} 가 같다고 정한 값이 어긋난다). 조회수 자체도 같은 성질이어서 동시
 	 * 조회가 같은 값을 읽으면 하나가 소실된다.
+	 *
+	 * <p><b>B-18 뒤로 {@code comment_count} 쪽은 {@code Post} 의 {@code @DynamicUpdate} 로도
+	 * 막힌다</b> — 더티 체킹의 UPDATE 가 바뀐 컬럼만 싣는다. 그래서 조회수 증가를 엔티티 변경으로
+	 * 되돌린 변이에서 이 클래스의 테스트 중 빨개지는 것은
+	 * {@link #동시_조회에서_증가가_소실되지_않는다()} 하나였다 (B-18 실측 — 그때 전체 378 개 중
+	 * 실패 1).
 	 *
 	 * <p><b>소실은 DB 가 아니라 애플리케이션에서 일어나므로 H2 에서 재현된다</b> — 실제 MySQL
 	 * 이 필요하지 않다. 다만 <b>읽기가 쓰기보다 먼저 일어나도록 끼워넣기를 강제한다</b>
@@ -1001,8 +1016,15 @@ class PostServiceTest {
 		 * 않는다. 조회수 증가를 엔티티 변경으로 되돌리면 깨진다"</b>.
 		 *
 		 * <p>조회 트랜잭션이 게시글을 읽은 <b>뒤</b>, 그 트랜잭션이 {@code post} 를 바꾸기
-		 * <b>전</b>에 댓글 작성을 끼워 커밋시킨다. 엔티티 증가 구현이면 뒤따르는 전체 컬럼
-		 * UPDATE 가 읽어 둔 {@code comment_count} 를 다시 써서 그 증가를 지운다.
+		 * <b>전</b>에 댓글 작성을 끼워 커밋시킨다. B-18 전에는 엔티티 증가 구현이면 뒤따르는
+		 * 전체 컬럼 UPDATE 가 읽어 둔 {@code comment_count} 를 다시 써서 그 증가를 지웠다.
+		 *
+		 * <p><b>검증표의 「되돌리면 깨진다」 는 이 테스트에 대해 B-18 전의 사실이다.</b> B-18 뒤로
+		 * {@code Post} 가 {@code @DynamicUpdate} 라 엔티티 증가의 UPDATE 가 {@code comment_count}
+		 * 를 싣지 않는다 — 조회수 증가를 엔티티 변경으로 되돌린 변이에서 이 테스트는 녹색이었고,
+		 * 그 변이는 {@link #동시_조회에서_증가가_소실되지_않는다()} 가 잡았다 (B-18 실측). 조회수
+		 * 증가를 엔티티 변경으로 되돌리고 {@code @DynamicUpdate} 까지 뺀 변이에서는 이 테스트가
+		 * 빨개졌다 (B-18 실측).
 		 *
 		 * <p><b>전제를 못박는 단언은 훅 안에서 읽은 값이다.</b> 조회의 쓰기가 나가기 전에
 		 * {@link DataSource} 에서 직접 얻은 커넥션으로 {@code comment_count} 를 읽어 그 값이
@@ -1092,9 +1114,14 @@ class PostServiceTest {
 		 *
 		 * <p><b>{@code hasSize(1)} 이 두 가지를 본다.</b> 수집기가 꽂히지 않으면 빈 목록에서
 		 * 터지므로 문장을 못 보는 수단이 조용히 통과하지 않고
-		 * (sp-docs/process/review-policy.md §4.1), <b>엔티티가 더티로 남으면</b> 전체 컬럼
+		 * (sp-docs/process/review-policy.md §4.1), <b>엔티티가 더티로 남으면</b> 더티 체킹의
 		 * UPDATE 가 한 문장 더 붙어 그 자리에서 터진다 — 좁은 UPDATE 를 두고 엔티티 메서드를
 		 * 함께 부르는 변이가 그것이다.
+		 *
+		 * <p><b>좁은 UPDATE 를 엔티티 증가로 <i>바꾸는</i> 변이는 B-18 뒤로 이 테스트를
+		 * 지난다</b> — {@code Post} 가 {@code @DynamicUpdate} 라 더티 체킹의 UPDATE 도
+		 * {@code comment_count}·{@code title}·{@code content} 를 싣지 않고 문장도 하나다. 그
+		 * 변이는 {@link #동시_조회에서_증가가_소실되지_않는다()} 가 잡았다 (B-18 실측).
 		 *
 		 * <p>{@code writer_} 로 {@code writer_id}·{@code writer_nickname} 을 함께 본다.
 		 */
@@ -1291,6 +1318,477 @@ class PostServiceTest {
 					"SELECT COUNT(*) FROM comment WHERE post_id = ? AND deleted = FALSE",
 					Integer.class, postId);
 			return count == null ? 0 : count;
+		}
+
+	}
+
+	/**
+	 * sp-docs/plan/phase2-board.md B-18 의 "검증" 표다. <b>글 수정·삭제가 발행하는
+	 * {@code update post} 가 집계 컬럼을 싣지 않고, 그래서 읽기와 쓰기 사이에 커밋된 집계 증감을
+	 * 지우지 않는다</b> (sp-docs/domain-model.md §6 의 규칙 「엔티티 갱신이 집계 컬럼을 싣지
+	 * 않는다」). 감소의 끼워넣기는 검증표 밖이고 완료 기준의 「증감」 때문에 둔다.
+	 *
+	 * <h2>고치기 전의 코드에서 잰 값</h2>
+	 *
+	 * <p>완료 기준 「고치기 전에 아래 검증표 첫 줄이 빨개지는 것을 보았다」 의 기록이다. {@code Post} 에
+	 * 갱신 컬럼을 좁히는 설정이 없던 코드에 이 클래스를 돌려 열여섯 개가 모두 빨개졌다 (B-18
+	 * 실측). 끼워넣기는 모두 {@link 끼워넣기#확인한다} 를 지났고 마지막 단언에서 빨개졌다.
+	 * <ul>
+	 * <li>증가의 끼워넣기 여덟(수정 넷, 삭제 넷) — 1 이어야 할 집계가 0 이었다. 검증표 첫
+	 * 줄(수정과 댓글 작성)도 그중 하나다
+	 * <li>감소의 끼워넣기 여섯(수정 셋, 삭제 셋) — 0 이어야 할 집계가 1 이었다
+	 * <li>문장 모양 둘 — 수정과 삭제가 같은 문장을 냈다: {@code update post set attachment_count=?,
+	 * category=?,comment_count=?,content=?,deleted=?,like_count=?,title=?,updated_at=?,
+	 * view_count=?,writer_id=?,writer_nickname=? where id=?}
+	 * </ul>
+	 *
+	 * <p>고친 수단과 그 이유, 택하지 않은 수단을 잰 값은 {@link Post} 의 클래스 주석에 있다.
+	 *
+	 * <h2>강제하는 지점 — 수정·삭제의 {@code update post} 가 발행되기 직전</h2>
+	 *
+	 * <p>{@link 조회수_증가의_모양과_동시성} 과 같은 수단이다. {@link StatementRecorder} 의 훅이
+	 * 수정·삭제의 {@code update post} 직전에 집계를 바꾸는 쓰기를 <b>다른 스레드로 커밋까지</b>
+	 * 돌린다. 그 시점에 수정·삭제는 {@code post} 를 읽었고 아직 쓰지 않았다 — 수정은 커밋의 flush
+	 * 에서, 삭제는 {@code softDeleteByPostId} 의 {@code flushAutomatically} 에서 그 문장을 낸다.
+	 * 같은 스레드로 부르면 끼운 쓰기가 수정·삭제의 트랜잭션에 참여해 따로 커밋되지 않는다.
+	 *
+	 * <p>이 중첩 클래스의 {@code writerId} 는 981~989 를 쓴다. 바깥 클래스의 {@code @AfterEach}
+	 * 는 그 대역을 지우지 않으므로 여기서 지운다. {@code comment.post_id} 에 FK 가 있으므로
+	 * ({@code fk_comment_post_id}) 댓글을 먼저 지운다.
+	 */
+	@Nested
+	@DisplayName("글 수정·삭제가 집계 컬럼을 싣지 않고 끼워넣은 집계 증감을 지우지 않는다")
+	@ContextConfiguration(classes = PostServiceTest.StatementRecorderConfig.class)
+	class 수정_삭제와_집계_끼워넣기 {
+
+		private static final long 작성자 = 981L;
+
+		/** 끼워넣는 댓글 작성의 주체다. 글 작성자와 다른 계정이다. */
+		private static final long 댓글_작성자 = 982L;
+
+		/** 끼운 쓰기를 기다리는 한도. 넘으면 강제가 일어나지 않은 것이므로 시끄럽게 터진다. */
+		private static final int 끼워넣기_한도_초 = 10;
+
+		/** 수정·삭제가 발행한 {@code update post} 에 없어야 하는 컬럼이다 (완료 기준의 넷). */
+		private static final String[] 집계_컬럼 = {
+				"view_count", "comment_count", "like_count", "attachment_count"};
+
+		@Autowired
+		private PostService postService;
+
+		@Autowired
+		private PostRepository postRepository;
+
+		/** 검증표의 수정·댓글 작성 끼워넣기에서 끼우는 쓰기의 주체다. 스스로 커밋한다. */
+		@Autowired
+		private CommentService commentService;
+
+		/** 바깥 클래스의 {@code @MockitoBean} 이 이 컨텍스트에도 상속된다. */
+		@Autowired
+		private MemberClient memberClient;
+
+		@Autowired
+		private JdbcTemplate jdbcTemplate;
+
+		/**
+		 * <b>수정·삭제의 트랜잭션에 묶이지 않은 커넥션</b>을 얻는 자리다 — 이유는
+		 * {@link 조회수_증가의_모양과_동시성} 의 같은 필드에 있다.
+		 */
+		@Autowired
+		private DataSource dataSource;
+
+		/** 좁은 UPDATE 를 끼울 때 그 쓰기가 자기 트랜잭션으로 커밋되게 연다. */
+		@Autowired
+		private PlatformTransactionManager transactionManager;
+
+		@Autowired
+		private StatementRecorder 발행된_문장;
+
+		@AfterEach
+		void 픽스처_정리() {
+			this.발행된_문장.비운다();
+			this.jdbcTemplate.update("DELETE FROM comment WHERE post_id IN "
+					+ "(SELECT id FROM post WHERE writer_id BETWEEN 981 AND 989)");
+			this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 981 AND 989");
+		}
+
+		/**
+		 * 검증표 <b>"글 수정이 {@code post} 를 읽은 뒤, 수정이 flush 되기 전에 댓글 작성(좁은
+		 * UPDATE)이 커밋된다 → {@code comment_count} 가 그 증가를 유지한다. 수단을 빼면
+		 * 깨진다"</b>.
+		 *
+		 * <p>끼우는 쓰기는 실제 댓글 작성 경로({@code CommentService.create})다. 마지막 단언 앞의
+		 * 단언들은 그것이 공허해지는 경우를 막는다 — 끼워넣기가 일어났는지, 끼운 쓰기가 수정의
+		 * 쓰기 전에 따로 커밋됐는지({@link 끼워넣기#확인한다}), 댓글 행이 활성으로 남았는지, 수정이
+		 * 실제로 {@code post} 를 바꾸었는지(바꾸지 않았다면 덮어쓸 수도 없다).
+		 */
+		@Test
+		@DisplayName("글 수정 도중에 댓글 작성이 커밋되어도 comment_count 가 그 증가를 유지한다")
+		void 수정이_끼워넣은_댓글_작성의_증가를_지우지_않는다() {
+			given(this.memberClient.findActiveNickname(댓글_작성자)).willReturn(MEMBER_NICKNAME);
+			Post post = 게시글을_만든다();
+			끼워넣기 기록 = 다음_post_UPDATE_직전에_끼운다(post.getId(), "comment_count", 1,
+					() -> this.commentService.create(post.getId(), 댓글_작성자,
+							new CommentCreateRequest("끼워넣은 댓글")));
+
+			this.postService.update(
+					post.getId(), user(작성자), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+
+			기록.확인한다();
+			assertThat(커밋된_활성_댓글_수(post.getId()))
+					.as("끼워넣은 댓글 행이 활성으로 남아 있다 — 집계가 이 수와 같아야 한다 "
+							+ "(sp-docs/domain-model.md §6)")
+					.isEqualTo(1);
+			assertThat(커밋된_제목(post.getId()))
+					.as("수정이 post 를 바꾸지 않았으면 아래 단언이 공허해진다")
+					.isEqualTo("바뀐 제목");
+			assertThat(커밋된_값(post.getId(), "comment_count"))
+					.as("글 수정이 그 사이에 커밋된 comment_count 증가를 지우지 않는다 "
+							+ "(sp-docs/plan/phase2-board.md B-18)")
+					.isEqualTo(1);
+		}
+
+		/**
+		 * 검증표 <b>"같은 끼워넣기를 {@code view_count}·{@code like_count}·
+		 * {@code attachment_count} 의 좁은 UPDATE 로 → 같음"</b>. 문장은 {@code PostRepository} 의
+		 * 것을 직접 부른다. {@code comment_count} 는
+		 * {@link #수정이_끼워넣은_댓글_작성의_증가를_지우지_않는다()} 가 실제 댓글 작성으로 본다.
+		 */
+		@ParameterizedTest(name = "{0}")
+		@EnumSource(value = 집계.class, names = {"VIEW_COUNT", "LIKE_COUNT", "ATTACHMENT_COUNT"})
+		@DisplayName("글 수정 도중에 집계의 좁은 UPDATE 가 커밋되어도 그 증가가 남는다")
+		void 수정이_끼워넣은_집계_증가를_지우지_않는다(집계 대상) {
+			Post post = 게시글을_만든다();
+			끼워넣기 기록 = 다음_post_UPDATE_직전에_끼운다(post.getId(), 대상.컬럼, 1,
+					() -> 좁은_UPDATE_를_커밋한다(대상.컬럼, 대상.좁은_증가, post.getId()));
+
+			this.postService.update(
+					post.getId(), user(작성자), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+
+			기록.확인한다();
+			assertThat(커밋된_제목(post.getId()))
+					.as("수정이 post 를 바꾸지 않았으면 아래 단언이 공허해진다")
+					.isEqualTo("바뀐 제목");
+			assertThat(커밋된_값(post.getId(), 대상.컬럼))
+					.as("글 수정이 그 사이에 커밋된 " + 대상.컬럼 + " 증가를 지우지 않는다 "
+							+ "(sp-docs/plan/phase2-board.md B-18)")
+					.isEqualTo(1);
+		}
+
+		/**
+		 * 검증표 <b>"글 삭제와 집계 증가의 끼워넣기 → 같음"</b>. 완료 기준이 집계마다를 요구하므로
+		 * 넷 모두 본다.
+		 *
+		 * <p>삭제는 {@code comment_count} 를 그대로 둔다 (sp-docs/domain-model.md §5 의 표) — 그래서
+		 * 끼운 증가가 그대로 남는 것이 기대값이다. {@code like_count}·{@code attachment_count} 의
+		 * 좁은 UPDATE 는 {@code deleted = false} 를 조건으로 갖지만, 끼우는 시점에 삭제는 아직 쓰지
+		 * 않았으므로 1 행이다 — {@link 끼워넣기#확인한다} 가 그것을 본다.
+		 */
+		@ParameterizedTest(name = "{0}")
+		@EnumSource(집계.class)
+		@DisplayName("글 삭제 도중에 집계의 좁은 UPDATE 가 커밋되어도 그 증가가 남는다")
+		void 삭제가_끼워넣은_집계_증가를_지우지_않는다(집계 대상) {
+			Post post = 게시글을_만든다();
+			끼워넣기 기록 = 다음_post_UPDATE_직전에_끼운다(post.getId(), 대상.컬럼, 1,
+					() -> 좁은_UPDATE_를_커밋한다(대상.컬럼, 대상.좁은_증가, post.getId()));
+
+			this.postService.delete(post.getId(), user(작성자));
+
+			기록.확인한다();
+			assertThat(커밋된_삭제_여부(post.getId()))
+					.as("삭제가 post 를 바꾸지 않았으면 아래 단언이 공허해진다")
+					.isTrue();
+			assertThat(커밋된_값(post.getId(), 대상.컬럼))
+					.as("글 삭제가 그 사이에 커밋된 " + 대상.컬럼 + " 증가를 지우지 않는다 "
+							+ "(sp-docs/plan/phase2-board.md B-18)")
+					.isEqualTo(1);
+		}
+
+		/**
+		 * 완료 기준 「수정·삭제와 집계 증감을 끼워넣어도 증감이 남는다」 의 <b>감소</b> 쪽이다.
+		 * 검증표의 끼워넣기는 모두 증가라서 따로 둔다. 감소 문장이 있는 셋을 본다 —
+		 * {@code view_count} 에는 감소 문장이 없다.
+		 *
+		 * <p>집계를 1 로 커밋해 두고 시작한다. 그래야 끼운 감소가 만든 0 과, 수정이 읽어 둔 1 을
+		 * 다시 쓴 결과가 갈린다.
+		 */
+		@ParameterizedTest(name = "{0}")
+		@EnumSource(value = 집계.class, names = {"COMMENT_COUNT", "LIKE_COUNT", "ATTACHMENT_COUNT"})
+		@DisplayName("글 수정 도중에 집계의 좁은 감소가 커밋되어도 그 감소가 남는다")
+		void 수정이_끼워넣은_집계_감소를_되돌리지_않는다(집계 대상) {
+			Post post = 집계가_1_인_게시글을_만든다(대상);
+			끼워넣기 기록 = 다음_post_UPDATE_직전에_끼운다(post.getId(), 대상.컬럼, 0,
+					() -> 좁은_UPDATE_를_커밋한다(대상.컬럼, 대상.좁은_감소, post.getId()));
+
+			this.postService.update(
+					post.getId(), user(작성자), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+
+			기록.확인한다();
+			assertThat(커밋된_제목(post.getId()))
+					.as("수정이 post 를 바꾸지 않았으면 아래 단언이 공허해진다")
+					.isEqualTo("바뀐 제목");
+			assertThat(커밋된_값(post.getId(), 대상.컬럼))
+					.as("글 수정이 그 사이에 커밋된 " + 대상.컬럼 + " 감소를 되돌리지 않는다 "
+							+ "(sp-docs/plan/phase2-board.md B-18)")
+					.isZero();
+		}
+
+		/** {@link #수정이_끼워넣은_집계_감소를_되돌리지_않는다(집계)} 와 같은 감소의 끼워넣기를 글 삭제로. */
+		@ParameterizedTest(name = "{0}")
+		@EnumSource(value = 집계.class, names = {"COMMENT_COUNT", "LIKE_COUNT", "ATTACHMENT_COUNT"})
+		@DisplayName("글 삭제 도중에 집계의 좁은 감소가 커밋되어도 그 감소가 남는다")
+		void 삭제가_끼워넣은_집계_감소를_되돌리지_않는다(집계 대상) {
+			Post post = 집계가_1_인_게시글을_만든다(대상);
+			끼워넣기 기록 = 다음_post_UPDATE_직전에_끼운다(post.getId(), 대상.컬럼, 0,
+					() -> 좁은_UPDATE_를_커밋한다(대상.컬럼, 대상.좁은_감소, post.getId()));
+
+			this.postService.delete(post.getId(), user(작성자));
+
+			기록.확인한다();
+			assertThat(커밋된_삭제_여부(post.getId()))
+					.as("삭제가 post 를 바꾸지 않았으면 아래 단언이 공허해진다")
+					.isTrue();
+			assertThat(커밋된_값(post.getId(), 대상.컬럼))
+					.as("글 삭제가 그 사이에 커밋된 " + 대상.컬럼 + " 감소를 되돌리지 않는다 "
+							+ "(sp-docs/plan/phase2-board.md B-18)")
+					.isZero();
+		}
+
+		/**
+		 * 검증표 <b>"수정·삭제가 발행한 {@code update post} → 집계 컬럼이 없다"</b> 중 수정.
+		 *
+		 * <p>{@code hasSize(1)} 은 수집기가 꽂히지 않아 빈 목록인 경우를 막는다. 바뀐 컬럼이 실린
+		 * 것을 함께 보는 것은 그 문장이 수정의 것인지 확인하려는 것이다.
+		 */
+		@Test
+		@DisplayName("글 수정이 발행한 post UPDATE 에 집계 컬럼이 없다")
+		void 수정의_UPDATE_는_집계를_싣지_않는다() {
+			Post post = 게시글을_만든다();
+			this.발행된_문장.비운다();
+
+			this.postService.update(
+					post.getId(), user(작성자), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+
+			List<String> post_UPDATE = this.발행된_문장.발행된_post_UPDATE();
+			assertThat(post_UPDATE)
+					.as("수집기가 꽂히지 않았으면 빈 목록이다")
+					.hasSize(1);
+			assertThat(post_UPDATE.get(0))
+					.as("수정이 바꾼 컬럼은 실린다")
+					.contains("title", "content");
+			assertThat(post_UPDATE.get(0))
+					.as("엔티티 갱신이 집계 컬럼을 싣지 않는다 (sp-docs/domain-model.md §6)")
+					.doesNotContain(집계_컬럼);
+		}
+
+		/** 검증표 <b>"수정·삭제가 발행한 {@code update post} → 집계 컬럼이 없다"</b> 중 삭제. */
+		@Test
+		@DisplayName("글 삭제가 발행한 post UPDATE 에 집계 컬럼이 없다")
+		void 삭제의_UPDATE_는_집계를_싣지_않는다() {
+			Post post = 게시글을_만든다();
+			this.발행된_문장.비운다();
+
+			this.postService.delete(post.getId(), user(작성자));
+
+			List<String> post_UPDATE = this.발행된_문장.발행된_post_UPDATE();
+			assertThat(post_UPDATE)
+					.as("수집기가 꽂히지 않았으면 빈 목록이다")
+					.hasSize(1);
+			assertThat(post_UPDATE.get(0))
+					.as("삭제가 바꾼 컬럼은 실린다")
+					.contains("deleted");
+			assertThat(post_UPDATE.get(0))
+					.as("엔티티 갱신이 집계 컬럼을 싣지 않는다 (sp-docs/domain-model.md §6)")
+					.doesNotContain(집계_컬럼);
+		}
+
+		/**
+		 * 다음 {@code update post} 가 발행되기 직전에 {@code 끼울_쓰기} 를 다른 스레드로 커밋까지
+		 * 돌리고, 이어서 묶이지 않은 커넥션으로 {@code 컬럼} 을 읽어 둔다. {@code 끼운_뒤_값} 은 끼운
+		 * 쓰기가 커밋된 뒤의 {@code 컬럼} 값이다 — {@link 끼워넣기#확인한다} 가 읽어 둔 값과 대조한다.
+		 *
+		 * <p>끼운 쓰기도 {@code update post} 를 발행하므로 훅을 한 번만 돌린다 —
+		 * {@link 조회수_증가의_모양과_동시성} 의 같은 자리와 같은 이유다.
+		 */
+		private 끼워넣기 다음_post_UPDATE_직전에_끼운다(
+				Long postId, String 컬럼, long 끼운_뒤_값, Runnable 끼울_쓰기) {
+			끼워넣기 기록 = new 끼워넣기(끼운_뒤_값);
+			this.발행된_문장.훅을_건다(sql -> sql.startsWith("update post"), () -> {
+				if (기록.끼워넣었다.compareAndSet(false, true)) {
+					기록.실패.set(다른_스레드에서_커밋까지_돌린다(끼울_쓰기));
+					기록.쓰기_전_값.set(묶이지_않은_커넥션으로_읽는다(postId, 컬럼));
+				}
+			});
+			return 기록;
+		}
+
+		/**
+		 * {@code PostRepository} 의 좁은 UPDATE 하나를 <b>자기 트랜잭션으로</b> 커밋한다. 영향 행
+		 * 수가 1 이 아니면 터진다 — 증감이 일어나지 않았으면 끼워넣기가 아무것도 만들지 않는다.
+		 */
+		private void 좁은_UPDATE_를_커밋한다(
+				String 컬럼, ToIntBiFunction<PostRepository, Long> 문장, Long postId) {
+			Integer 영향_행 = new TransactionTemplate(this.transactionManager)
+					.execute(status -> 문장.applyAsInt(this.postRepository, postId));
+			if (영향_행 == null || 영향_행 != 1) {
+				throw new IllegalStateException(컬럼 + " 의 좁은 UPDATE 가 1 행이 아니다: " + 영향_행);
+			}
+		}
+
+		/** 집계를 좁은 증가로 1 로 커밋해 둔 게시글. 감소의 끼워넣기가 쓴다. */
+		private Post 집계가_1_인_게시글을_만든다(집계 대상) {
+			Post post = 게시글을_만든다();
+			좁은_UPDATE_를_커밋한다(대상.컬럼, 대상.좁은_증가, post.getId());
+			return post;
+		}
+
+		/** 쓰기를 다른 스레드에서 커밋까지 돌리고 실패를 돌려준다 (없으면 {@code null}). */
+		private Throwable 다른_스레드에서_커밋까지_돌린다(Runnable 쓰기) {
+			AtomicReference<Throwable> 실패 = new AtomicReference<>();
+			Thread 스레드 = new Thread(() -> {
+				try {
+					쓰기.run();
+				}
+				catch (Throwable ex) {
+					실패.set(ex);
+				}
+			});
+			스레드.start();
+			try {
+				스레드.join(끼워넣기_한도_초 * 1000L);
+			}
+			catch (InterruptedException ex) {
+				Thread.currentThread().interrupt();
+				return ex;
+			}
+			if (스레드.isAlive()) {
+				스레드.interrupt();
+				return new IllegalStateException("끼운 쓰기가 한도 안에 커밋되지 않았다");
+			}
+			return 실패.get();
+		}
+
+		/**
+		 * {@code 컬럼} 을 <b>수정·삭제의 트랜잭션에 묶이지 않은 커넥션</b>으로 읽는다. 커밋된 값만
+		 * 보여야 "끼운 쓰기가 수정·삭제의 쓰기 전에 따로 커밋했다" 가 관측된다.
+		 */
+		private long 묶이지_않은_커넥션으로_읽는다(Long postId, String 컬럼) {
+			try (Connection 묶이지_않은_커넥션 = this.dataSource.getConnection();
+					PreparedStatement 문장 = 묶이지_않은_커넥션.prepareStatement(
+							"SELECT " + 컬럼 + " FROM post WHERE id = ?")) {
+				문장.setLong(1, postId);
+				try (ResultSet 결과 = 문장.executeQuery()) {
+					if (!결과.next()) {
+						throw new IllegalStateException("픽스처 게시글이 없다: " + postId);
+					}
+					return 결과.getLong(1);
+				}
+			}
+			catch (SQLException ex) {
+				throw new IllegalStateException("묶이지 않은 커넥션으로 " + 컬럼 + " 을 읽지 못했다", ex);
+			}
+		}
+
+		private Post 게시글을_만든다() {
+			return this.postRepository.saveAndFlush(Post.builder()
+					.writerId(작성자)
+					.writerNickname("글작성자")
+					.title("원래 제목")
+					.content("원래 본문")
+					.build());
+		}
+
+		/** JPA 를 거치지 않고 커밋된 값을 읽는다. 다른 스레드가 커밋한 것을 봐야 한다. */
+		private long 커밋된_값(Long postId, String 컬럼) {
+			Long value = this.jdbcTemplate.queryForObject(
+					"SELECT " + 컬럼 + " FROM post WHERE id = ?", Long.class, postId);
+			return value == null ? -1 : value;
+		}
+
+		private String 커밋된_제목(Long postId) {
+			return this.jdbcTemplate.queryForObject(
+					"SELECT title FROM post WHERE id = ?", String.class, postId);
+		}
+
+		private boolean 커밋된_삭제_여부(Long postId) {
+			return Boolean.TRUE.equals(this.jdbcTemplate.queryForObject(
+					"SELECT deleted FROM post WHERE id = ?", Boolean.class, postId));
+		}
+
+		private int 커밋된_활성_댓글_수(Long postId) {
+			Integer count = this.jdbcTemplate.queryForObject(
+					"SELECT COUNT(*) FROM comment WHERE post_id = ? AND deleted = FALSE",
+					Integer.class, postId);
+			return count == null ? 0 : count;
+		}
+
+		/** 한 번의 끼워넣기가 남긴 관측. {@link #확인한다} 가 끼워넣기 자체를 단언한다. */
+		private static final class 끼워넣기 {
+
+			private final AtomicBoolean 끼워넣었다 = new AtomicBoolean();
+
+			private final AtomicReference<Throwable> 실패 = new AtomicReference<>();
+
+			/** 끼운 쓰기가 커밋된 뒤의 값이다. */
+			private final long 끼운_뒤_값;
+
+			/** -1 은 "훅이 읽지 않았다" 다. 읽지 않았으면 그 값으로 빨개진다. */
+			private final AtomicLong 쓰기_전_값 = new AtomicLong(-1);
+
+			끼워넣기(long 끼운_뒤_값) {
+				this.끼운_뒤_값 = 끼운_뒤_값;
+			}
+
+			void 확인한다() {
+				assertThat(this.끼워넣었다)
+						.as("수정·삭제가 post 를 바꾸는 문장을 발행하지 않았으면 끼워넣기가 일어나지 않는다")
+						.isTrue();
+				assertThat(this.실패.get())
+						.as("끼운 쓰기가 실패하면 뒤의 단언은 덮어쓰기를 보는 것이 아니다")
+						.isNull();
+				assertThat(this.쓰기_전_값.get())
+						.as("수정·삭제의 쓰기가 나가기 전에, 그 트랜잭션에 묶이지 않은 커넥션에서 이미 "
+								+ "끼운 쓰기의 결과다 — 그 변경은 다른 트랜잭션이 따로 커밋한 것이다")
+						.isEqualTo(this.끼운_뒤_값);
+			}
+
+		}
+
+	}
+
+	/**
+	 * B-18 의 끼워넣기가 바꾸는 집계와 그 좁은 UPDATE. 문장은 {@code PostRepository} 의 것이다
+	 * (sp-docs/plan/phase2-board.md B-18 의 검증표).
+	 */
+	enum 집계 {
+
+		/** {@code view_count} 에는 감소 문장이 없다. */
+		VIEW_COUNT("view_count", PostRepository::increaseViewCount, null),
+
+		COMMENT_COUNT("comment_count",
+				PostRepository::increaseCommentCount, PostRepository::decreaseCommentCount),
+
+		LIKE_COUNT("like_count", PostRepository::increaseLikeCount, PostRepository::decreaseLikeCount),
+
+		/**
+		 * 상한은 이 끼워넣기의 대상이 아니다 — 판정에 끼지 않게 {@code int} 의 최댓값을 준다.
+		 * 상한의 정책값을 여기 옮겨 적지 않는다.
+		 */
+		ATTACHMENT_COUNT("attachment_count",
+				(repository, id) -> repository.increaseAttachmentCount(id, Integer.MAX_VALUE),
+				PostRepository::decreaseAttachmentCount);
+
+		private final String 컬럼;
+
+		private final ToIntBiFunction<PostRepository, Long> 좁은_증가;
+
+		private final ToIntBiFunction<PostRepository, Long> 좁은_감소;
+
+		집계(String 컬럼, ToIntBiFunction<PostRepository, Long> 좁은_증가,
+				ToIntBiFunction<PostRepository, Long> 좁은_감소) {
+			this.컬럼 = 컬럼;
+			this.좁은_증가 = 좁은_증가;
+			this.좁은_감소 = 좁은_감소;
 		}
 
 	}

@@ -558,8 +558,10 @@ class PostRepositoryTest {
 
 	/**
 	 * 새 문장이 그 집계 컬럼 하나만 싣는지 발행된 SQL 로 본다 — B-10 의 관측 방식이다
-	 * (sp-docs/plan/phase1.md §6 B-10). 엔티티 더티 체킹의 UPDATE 는 모든 컬럼을 실으므로
-	 * {@code title}·{@code content} 가 들어 있다.
+	 * (sp-docs/plan/phase1.md §6 B-10). B-18 뒤로 {@code Post} 가 {@code @DynamicUpdate} 라
+	 * 엔티티 더티 체킹의 UPDATE 도 바뀐 컬럼만 싣고, 같은 초 안이면 SET 절이 그 집계 컬럼 하나다
+	 * (B-18 리뷰 실측). 그래서 이 판정은 좁은 문장과 엔티티 갱신을 가르지 않는다 — 가르는 것은
+	 * {@code col = (… col ± 1)} 꼴이다.
 	 */
 	@Test
 	@DisplayName("새 문장이 발행한 update post 는 그 집계 컬럼만 싣고 title·content 가 없다")

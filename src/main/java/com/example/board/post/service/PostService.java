@@ -126,15 +126,15 @@ public class PostService {
 	 * {@code deleted} 조건을 여기서 다시 쓰지 않는다 (sp-docs/requirements/board.md §5 규칙 1).
 	 *
 	 * <p><b>조회수 증가는 {@link PostRepository#increaseViewCount} 의 좁은 UPDATE 다</b>
-	 * (sp-docs/plan/phase1.md §6 B-11). 읽어 둔 엔티티의 조회수를 메모리에서 올리면 더티
-	 * 체킹이 변경되지 않은 컬럼까지 전부 UPDATE 에 실어 <b>이 트랜잭션이 읽은
-	 * {@code comment_count} 를 그대로 다시 쓴다</b> — 그 사이에 커밋된 댓글 작성의 증가가 조회
-	 * 하나로 소실된다. 조회수 자체도 동시 조회가 같은 값을 읽어 하나가 소실된다.
+	 * (sp-docs/plan/phase1.md §6 B-11). 읽어 둔 엔티티의 조회수를 메모리에서 올리면 동시 조회가
+	 * 같은 값을 읽어 하나가 소실된다. B-11 이 잰 그 UPDATE 는 변경되지 않은 컬럼까지 실어 <b>이
+	 * 트랜잭션이 읽은 {@code comment_count} 도 다시 썼다</b> — 그쪽은 B-18 뒤로 {@code Post} 의
+	 * {@code @DynamicUpdate} 가 막는다.
 	 *
 	 * <p><b>그래서 이 메서드는 엔티티를 바꾸지 않는다.</b> 엔티티를 함께 올리면 더티 체킹의
-	 * 전체 컬럼 UPDATE 가 좁은 UPDATE 와 <b>함께</b> 발행되고, 그 문장이 이 트랜잭션이 읽은
-	 * 값을 다시 쓰므로 집계가 덮어써지고 조회수도 어긋난다 — 발행된 {@code update post} 가
-	 * 정확히 하나인지를 보는 단언이 그것을 본다.
+	 * UPDATE 가 좁은 UPDATE 와 <b>함께</b> 발행되고, 그 문장이 이 트랜잭션이 읽은 조회수로
+	 * 계산한 값을 쓰므로 조회수가 어긋난다 — 발행된 {@code update post} 가 정확히 하나인지를
+	 * 보는 단언이 그것을 본다.
 	 *
 	 * <p><b>한 번의 상세 조회가 게시글을 두 번 읽는다.</b> 앞의 읽기는 404 판정이고, 뒤의
 	 * 읽기는 응답에 실을 값이다 — 좁은 UPDATE 는 영속성 컨텍스트를 지나지 않으므로 앞에서

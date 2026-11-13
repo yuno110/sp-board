@@ -18,8 +18,9 @@ import org.springframework.data.repository.query.Param;
  * 어디서 바뀌는가" 를 이 인터페이스에서 찾을 수 있어야 한다.
  *
  * <p><b>{@code view_count} 증가도 여기 있다</b> (sp-docs/plan/phase1.md §6 B-11). 집계와 같은
- * 이유다 — 관리 엔티티를 메모리에서 올리면 더티 체킹이 변경되지 않은 컬럼까지 UPDATE 에 실어
- * 그 트랜잭션이 읽은 값으로 다른 컬럼을 덮어쓴다.
+ * 이유다 — 관리 엔티티를 메모리에서 올리면 그 트랜잭션이 읽은 값에 더한 값을 쓰므로 동시
+ * 커밋에서 증가가 소실된다. B-11 이 잰 그 UPDATE 는 변경되지 않은 컬럼까지 실어 다른 컬럼도
+ * 덮어썼다 — 그쪽은 B-18 뒤로 {@code Post} 의 {@code @DynamicUpdate} 가 막는다.
  *
  * <p><b>{@code like_count}·{@code attachment_count} 의 좁은 UPDATE 도 여기 있다</b>
  * (sp-docs/domain-model.md §6, sp-docs/conventions.md §1.3). 근거 행은 {@code post_like}·
@@ -41,9 +42,9 @@ public interface PostRepository extends JpaRepository<Post, Long> {
 	 * {@code comment_count} 를 1 올린다. 영향받은 행 수를 돌려준다.
 	 *
 	 * <p><b>좁은 UPDATE 다 — {@code comment_count} 한 컬럼만 싣는다</b>
-	 * (sp-docs/plan/phase1.md §6 B-10). 엔티티를 읽어 메모리에서 올리면 더티 체킹이 변경되지
-	 * 않은 컬럼까지 전부 UPDATE 에 싣고, <b>동시 커밋에서 낡은 스냅샷째 덮어써 증가가
-	 * 소실된다</b> — 아무 오류 없이 틀린 수가 남는다 (sp-docs/nfr.md §1 의 I-03 실측,
+	 * (sp-docs/plan/phase1.md §6 B-10). 엔티티를 읽어 메모리에서 올리면 그 트랜잭션이 읽은 값에
+	 * 1 을 더한 값을 쓰므로 <b>동시 커밋에서 증가가 소실된다</b> — 아무 오류 없이 틀린 수가
+	 * 남는다 (sp-docs/nfr.md §1 의 I-03 실측,
 	 * sp-docs/AGENTS.md 불변식 9). 소실은 DB 가 아니라 애플리케이션에서 일어나므로 이 문장이
 	 * 고치는 지점이다: 더할 대상을 트랜잭션이 읽은 값이 아니라 <b>DB 의 현재 값</b>으로 둔다.
 	 *
@@ -56,8 +57,8 @@ public interface PostRepository extends JpaRepository<Post, Long> {
 	 *
 	 * <p><b>발행된 {@code update post} 가 정확히 하나인지를 보는 단언이 막는 것은 이 설정이
 	 * 아니라 더티 엔티티다</b> (sp-docs/plan/phase1.md §6 B-10). 이 문장을 그대로 두고
-	 * 엔티티의 집계 메서드를 함께 부르면 전체 컬럼 UPDATE 가 한 문장 더 붙어 이 문장을
-	 * 덮어쓴다 — 그 단언이 보는 것은 그것이다.
+	 * 엔티티의 집계 메서드를 함께 부르면 더티 체킹의 UPDATE 가 한 문장 더 붙어 그 트랜잭션이
+	 * 읽은 값으로 계산한 {@code comment_count} 를 쓴다 — 그 단언이 보는 것은 그것이다.
 	 *
 	 * <p>{@code flushAutomatically} 는 켠다. 호출 시점에 쓰기 대기 중인 변경이 있으면 그것을 먼저
 	 * 내보내 SQL 순서를 프로그램 순서와 맞춘다 — {@code softDeleteByPostId} 와 같은 이유다.
@@ -95,11 +96,10 @@ public interface PostRepository extends JpaRepository<Post, Long> {
 	 *
 	 * <p><b>좁은 UPDATE 다 — {@code view_count} 한 컬럼만 싣는다</b>
 	 * (sp-docs/plan/phase1.md §6 B-11). 상세 조회가 읽어 둔 엔티티의 조회수를 메모리에서
-	 * 올리면 더티 체킹이 변경되지 않은 컬럼까지 전부 UPDATE 에 싣고, <b>그 트랜잭션이 읽은
-	 * {@code comment_count} 를 그대로 다시 쓴다</b> — SELECT 와 flush 사이에 커밋된 댓글
-	 * 작성의 증가가 조회 하나로 소실된다. 조회수 자체도 같은 성질이어서 동시 조회 둘이 같은
-	 * 값을 읽으면 하나가 소실된다. 더할 대상을 트랜잭션이 읽은 값이 아니라 <b>DB 의 현재
-	 * 값</b>으로 두는 것이 이 문장이 고치는 지점이다.
+	 * 올리면 동시 조회 둘이 같은 값을 읽을 때 하나가 소실된다. 더할 대상을 트랜잭션이 읽은 값이
+	 * 아니라 <b>DB 의 현재 값</b>으로 두는 것이 이 문장이 고치는 지점이다. B-11 이 잰 그
+	 * UPDATE 는 변경되지 않은 컬럼까지 실어 <b>그 트랜잭션이 읽은 {@code comment_count} 도 다시
+	 * 썼다</b> — 그쪽은 B-18 뒤로 {@code Post} 의 {@code @DynamicUpdate} 가 막는다.
 	 *
 	 * <p><b>{@code clearAutomatically} 를 켠다.</b> 부르는 쪽
 	 * ({@code PostService.getDetail})이 이 문장 다음에 같은 게시글을 다시 읽어 응답을 만들고,
@@ -118,8 +118,8 @@ public interface PostRepository extends JpaRepository<Post, Long> {
 	 *
 	 * <p><b>발행된 {@code update post} 가 정확히 하나인지를 보는 단언이 막는 것은 더티
 	 * 엔티티다.</b> 이 문장을 그대로 두고 엔티티의 {@code increaseViewCount()} 를 함께 부르면
-	 * 전체 컬럼 UPDATE 가 한 문장 더 붙는다 — 그 문장이 그 트랜잭션이 읽은 값을 다시 쓰므로
-	 * 집계가 덮어써지고 조회수도 어긋난다. <b>엔티티를 올리는 자리가 이 문장 앞이어도
+	 * 더티 체킹의 UPDATE 가 한 문장 더 붙는다 — 그 문장이 그 트랜잭션이 읽은 조회수로 계산한
+	 * 값을 쓰므로 조회수가 어긋난다. <b>엔티티를 올리는 자리가 이 문장 앞이어도
 	 * 그렇다</b> — 이 문장은 {@code post} 를 보는 쿼리이므로 발행 전에 대기 중인
 	 * {@code post} 변경이 자동으로 내보내진다 (측정값: 두 문장이 순서만 바뀌어 발행된다).
 	 */

@@ -14,6 +14,7 @@ import lombok.AccessLevel;
 import lombok.Builder;
 import lombok.Getter;
 import lombok.NoArgsConstructor;
+import org.hibernate.annotations.DynamicUpdate;
 
 /**
  * 게시글. 정본: sp-docs/domain-model.md §4.1.
@@ -39,10 +40,32 @@ import lombok.NoArgsConstructor;
  * (sp-docs/domain-model.md §6). 두 집계는 {@code PostRepository} 의 좁은 UPDATE 로만 바뀐다.
  * 1차 집계의 엔티티 메서드가 남아 있는 이유는 B-03 의 요구이고 각 메서드의 주석에 있다 — 그
  * 이유가 새 집계에는 없다 (sp-docs/plan/phase2-board.md B-14).
+ *
+ * <p><b>{@code @DynamicUpdate} — 더티 체킹의 UPDATE 는 바뀐 컬럼만 싣는다</b>
+ * (sp-docs/domain-model.md §6 의 규칙 「엔티티 갱신이 집계 컬럼을 싣지 않는다」,
+ * sp-docs/plan/phase2-board.md B-18). 글 수정·삭제는 이 엔티티를 바꿔 더티 체킹으로 저장한다.
+ * 이 설정이 없으면 그 UPDATE 가 모든 컬럼을 싣는다 — B-18 이 고치기 전에 잰 수정·삭제의 문장이
+ * {@code update post set attachment_count=?,category=?,comment_count=?,content=?,deleted=?,
+ * like_count=?,title=?,updated_at=?,view_count=?,writer_id=?,writer_nickname=? where id=?} 였다.
+ * 그 문장이 트랜잭션이 읽은 집계를 다시 써서, 읽기와 쓰기 사이에 다른 트랜잭션이 커밋한 좁은
+ * UPDATE 의 증감을 지웠다 — {@code PostServiceTest} 의 B-18 끼워넣기에서 수정과 삭제 모두, 증가를
+ * 끼우면 집계 넷 모두 1 이어야 할 값이 0 으로, 감소를 끼우면 감소 문장이 있는 셋 모두 0 이어야 할
+ * 값이 1 로 남았다 (B-18 실측).
+ *
+ * <p><b>집계 컬럼을 갱신 대상에서 빼는 매핑({@code @Column(updatable = false)})은 택하지
+ * 않았다.</b> 엔티티 메서드({@link #increaseViewCount()}·{@link #increaseCommentCount()}·
+ * {@link #decreaseCommentCount()})의 변경도 저장되지 않게 되어, B-03 의 검증표가 요구하는
+ * {@code increaseViewCount()} 2회·{@code increaseCommentCount()} 3회 후 {@code decrease} 1회의
+ * 결과가 컬럼에 남지 않는다. 이 설정 없이 네 집계 필드에 그 매핑을 걸고 전체 테스트(그때
+ * 378 개)를 돌려 다섯이 빨개졌다 — 그 두 행의 {@code PostRepositoryTest} 와, 엔티티 메서드로
+ * 집계를 준비하는 픽스처를 쓰는 셋이다 (B-18 실측). B-18 계획이 「B-03 의 완료 기준을 깨는
+ * 수단이면 멈춘다」 의 예로 든 수단이다 (sp-docs/plan/phase1.md §2.6 의 2번). 바뀐 컬럼만 싣는
+ * 설정은 그 메서드의 변경을 그대로 싣는다.
  */
 @Getter
 @Entity
 @Table(name = "post")
+@DynamicUpdate
 @NoArgsConstructor(access = AccessLevel.PROTECTED)
 public class Post extends BaseTimeEntity {
 
@@ -172,11 +195,15 @@ public class Post extends BaseTimeEntity {
 	 *
 	 * <p><b>상세 조회 경로는 이 메서드를 쓰지 않는다</b> — 조회수 증가는
 	 * {@code PostRepository.increaseViewCount} 의 좁은 UPDATE 가 한다
-	 * (sp-docs/plan/phase1.md §6 B-11). 관리 엔티티를 메모리에서 올리면 더티 체킹이 변경되지
-	 * 않은 컬럼까지 UPDATE 에 실어 <b>그 트랜잭션이 읽은 {@code comment_count} 를 그대로 다시
-	 * 쓰고</b>, 그 사이에 커밋된 댓글 작성의 증가가 조회 하나로 소실된다. 조회수 자체도 동시
-	 * 조회가 같은 값을 읽어 하나가 소실된다. <b>조회수 증가를 이 메서드로 바꾸면 그 결함이
-	 * 돌아온다.</b>
+	 * (sp-docs/plan/phase1.md §6 B-11). 관리 엔티티를 메모리에서 올리면 그 트랜잭션이 읽은
+	 * 조회수에 1 을 더한 값을 쓰므로, 동시 조회가 같은 값을 읽으면 하나가 소실된다. <b>조회수
+	 * 증가를 이 메서드로 바꾸면 그 결함이 돌아온다</b> — 상세 조회를 이 메서드로 되돌리고 전체
+	 * 테스트(그때 378 개)를 돌려 {@code PostServiceTest} 의 동시 조회 테스트 하나만 빨개졌다
+	 * (B-18 실측).
+	 *
+	 * <p>B-11 이 고친 결함에는 하나가 더 있었다 — 더티 체킹의 UPDATE 가 변경되지 않은 컬럼까지
+	 * 실어 그 트랜잭션이 읽은 {@code comment_count} 를 다시 썼다. 그쪽은 B-18 뒤로 클래스의
+	 * {@code @DynamicUpdate} 가 막는다. 그래서 위 변이에서 B-11 의 끼워넣기 테스트는 녹색이었다.
 	 *
 	 * <p><b>그래도 메서드가 남아 있는 이유는 B-03 이다</b> —
 	 * {@link #increaseCommentCount()} 와 같다. B-03 의 도메인 메서드 표와 완료 기준이 이
@@ -192,10 +219,13 @@ public class Post extends BaseTimeEntity {
 	 *
 	 * <p><b>댓글 작성 경로는 이 메서드를 쓰지 않는다</b> — 집계 동기화는
 	 * {@code PostRepository.increaseCommentCount} 의 좁은 UPDATE 가 한다
-	 * (sp-docs/plan/phase1.md §6 B-10). 관리 엔티티를 메모리에서 올리면 더티 체킹이 변경되지
-	 * 않은 컬럼까지 UPDATE 에 실어 낡은 스냅샷째 덮어쓰고, <b>동시 커밋에서 증가가
-	 * 소실된다</b> (sp-docs/nfr.md §1 의 I-03 실측). 집계를 이 메서드로 바꾸면 그 결함이
-	 * 돌아온다.
+	 * (sp-docs/plan/phase1.md §6 B-10). 관리 엔티티를 메모리에서 올리면 그 트랜잭션이 읽은 값에
+	 * 1 을 더한 값을 쓰므로 <b>동시 커밋에서 증가가 소실된다</b> (sp-docs/nfr.md §1 의 I-03
+	 * 실측). 집계를 이 메서드로 바꾸면 그 결함이 돌아온다 — 댓글 작성을 이 메서드로 되돌리고 전체
+	 * 테스트(그때 378 개)를 돌려 {@code CommentServiceTest} 의 동시 작성 테스트 하나만
+	 * 빨개졌다 (B-18 실측). I-03 이 본 UPDATE 는 변경되지 않은 컬럼까지 실었지만
+	 * (sp-docs/plan/phase1.md §6 B-10), 이 소실은 그것과 무관하다 — B-18 뒤로 클래스의
+	 * {@code @DynamicUpdate} 가 바뀐 컬럼만 싣게 했어도 남는다.
 	 *
 	 * <p><b>그래도 메서드가 남아 있는 이유는 B-03 이다.</b> B-03 의 완료 기준이 "위 표의
 	 * 도메인 메서드 6개가 모두 구현되어 있다" 와 "{@code decreaseCommentCount()} 가 0 에서
