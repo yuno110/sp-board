@@ -36,6 +36,14 @@ spring:
     multipart:
       max-file-size: 5MB
       max-request-size: 6MB
+  # Jackson 이 enum 을 숫자(서수)로 읽지 않게 한다. 정본은 본문의 잘못된 category 를 JSON 해석
+  # 실패(400 C001)로 정한다 (sp-docs/requirements/board.md §4, sp-docs/api-contract.md §4.4).
+  # 이 키가 없거나 false 면 Jackson 이 enum 을 서수로도 읽어 따옴표 없는 숫자(1)도 따옴표 친
+  # 숫자("2")도 받아들였다 — 작성 201, 수정 200 이었다 (2026-11-16 실측, PostControllerTest 의
+  # 숫자 category 테스트)
+  jackson:
+    deserialization:
+      fail-on-numbers-for-enums: true
 
 server:
   port: ${SERVER_PORT:8082}

@@ -5,9 +5,9 @@ import java.util.Set;
 /**
  * sp-docs/api-contract.md §6 이 고정한 {@code role} claim 의 허용값.
  *
- * <p>열거 검사({@link CurrentMemberArgumentResolver})와 ADMIN 판정({@code PostService}·
- * {@code CommentService} 의 삭제 권한, sp-docs/security.md §5.2)이 이 상수를 본다 — 값을 자리마다
- * 박으면 읽는 쪽들이 갈린다.
+ * <p>열거 검사({@link CurrentMemberArgumentResolver})와 ADMIN 판정(예: {@code PostService}·
+ * {@code CommentService} 의 삭제 권한, {@code PostService} 의 공지 권한. sp-docs/security.md
+ * §5.2)이 이 상수를 본다 — 값을 자리마다 박으면 읽는 쪽들이 갈린다.
  *
  * <p>이 집합 밖의 값은 <b>서명이 유효해도 계약 위반 토큰</b>이다. §6 이 소비자에게 값 검증을
  * 요구하고 401 {@code A002} 로 거부하게 한다 (sp-docs/plan/phase1.md §6 D-02 가 그렇게 정했다).
@@ -21,7 +21,10 @@ import java.util.Set;
  */
 public final class ContractRole {
 
-	/** 관리자. 타인 글·댓글 삭제가 이 값에서만 허용된다 (sp-docs/security.md §5.2). */
+	/**
+	 * 관리자. 이 값에서만 허용되는 기능은 sp-docs/security.md §5.2 의 매트릭스가 정한다 — 예: 타인
+	 * 글·댓글 삭제, 공지 작성.
+	 */
 	public static final String ADMIN = "ADMIN";
 
 	/** 일반 사용자. 판정에 쓰이지 않고 허용값 집합을 이룬다. */

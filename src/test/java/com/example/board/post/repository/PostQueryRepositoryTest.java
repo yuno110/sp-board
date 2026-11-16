@@ -8,6 +8,7 @@ import com.example.board.post.dto.PostSearchCondition;
 import com.example.board.post.dto.PostSortType;
 import com.example.board.post.dto.SearchType;
 import com.example.board.post.entity.Post;
+import com.example.board.post.entity.PostCategory;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -40,7 +41,9 @@ import org.springframework.test.context.ActiveProfiles;
  * <p>픽스처의 {@code writerId} 는 목록·검색(B-06)이 601~619, 내가 쓴 글(B-09)이 871~879 를
  * 쓴다. 같은 JVM 의 모든 테스트가 하나의 H2 DB 를
  * 보므로 (sp-docs/tech-stack.md §5.3) 이미 쓰이는 대역과 겹치지 않게 둔다. 각 테스트는
- * {@code @DataJpaTest} 의 기본 롤백으로 정리되어 행이 남지 않는다.
+ * {@code @DataJpaTest} 의 기본 롤백으로 정리되어 행이 남지 않는다. B-19 의 카테고리
+ * 테스트는 그 대역 안의 615·616 을 쓴다 — 2026-11-13 에 테스트 소스 전체에서 쓰는 곳이 없는
+ * 것을 확인하고 골랐다.
  *
  * <h2>전체 건수를 보는 단언은 테이블이 비어 있음을 전제한다</h2>
  *
@@ -286,7 +289,7 @@ class PostQueryRepositoryTest {
 				.containsExactlyInAnyOrder(first, second, third);
 
 		Page<Post> fullPage = search(PostSearchCondition.of(
-				0, 2, PostSortType.latest, SearchType.WRITER, "삭제작성자"));
+				0, 2, PostSortType.latest, SearchType.WRITER, "삭제작성자", null));
 
 		assertThat(fullPage.getContent()).hasSize(2);
 		assertThat(fullPage.getTotalElements())
@@ -442,6 +445,54 @@ class PostQueryRepositoryTest {
 		assertThat(page.getTotalElements()).isEqualTo(3);
 	}
 
+	// --- 카테고리 (P-11, sp-docs/requirements/board.md §8, sp-docs/api-contract.md §4.1) ---
+
+	/**
+	 * B-19 검증표 "{@code category=NOTICE} + 검색 + 정렬 → 세 조건이 AND 로 걸린다"
+	 * (sp-docs/plan/phase2-board.md). 목록과 건수를 따로 단언한다.
+	 *
+	 * <p><b>각 조건이 배제하는 행을 하나씩 둔다.</b> 같은 작성자의 {@code FREE} 글은 카테고리만이,
+	 * 다른 작성자의 공지는 검색만이 거른다 — 한 조건이 빠지거나 두 조건이 OR 로 묶이면 그 행이
+	 * 섞인다. 두 행의 조회수를 가장 크게 두어 섞이면 맨 앞에 오게 한다.
+	 *
+	 * <p><b>건수 쿼리는 꽉 찬 페이지로 본다</b> ({@link #삭제분_제외()} 와 같은 두 요건,
+	 * sp-docs/process/review-policy.md §4.1). {@code size} 를 2 로 두면 {@code offset 0 + 2} 가
+	 * 올바른 건수 3 보다 작아 {@code PageImpl} 의 보정이 일어나지 않고, 위의 배제 행들이 건수
+	 * 쿼리의 조건도 가른다. 건수 쿼리에서만 카테고리 조건을 뺀 변이에서 빨개진 것은 이 테스트
+	 * 하나였다 (B-19 실측, {@code totalElements} 가 4).
+	 *
+	 * <p>조회수가 모두 달라 순서가 DB 의 동률 처리에 기대지 않는다.
+	 */
+	@Test
+	@DisplayName("category 는 검색·정렬과 AND 로 걸리고 건수 쿼리도 같다")
+	void 카테고리는_검색_정렬과_AND_로_걸린다() {
+		Long few = viewed(save(615L, PostCategory.NOTICE, "공지필터작성자", "공지 조회 적음"), 1).getId();
+		Long many = viewed(save(615L, PostCategory.NOTICE, "공지필터작성자", "공지 조회 많음"), 3).getId();
+		Long mid = viewed(save(615L, PostCategory.NOTICE, "공지필터작성자", "공지 조회 중간"), 2).getId();
+		// 카테고리만이 거르는 행
+		viewed(save(615L, PostCategory.FREE, "공지필터작성자", "같은 작성자의 자유 글"), 5);
+		// 검색만이 거르는 행
+		viewed(save(616L, PostCategory.NOTICE, "다른공지작성자", "다른 작성자의 공지"), 4);
+		this.em.flush();
+		this.em.clear();
+
+		Page<Post> wholeResult = search(PostSearchCondition.of(0, DEFAULT_SIZE, PostSortType.views,
+				SearchType.WRITER, "공지필터작성자", PostCategory.NOTICE));
+
+		assertThat(wholeResult.getContent()).extracting(Post::getId)
+				.as("세 조건이 AND 다 — 같은 작성자의 자유 글도, 다른 작성자의 공지도 없다")
+				.containsExactly(many, mid, few);
+
+		Page<Post> fullPage = search(PostSearchCondition.of(0, 2, PostSortType.views,
+				SearchType.WRITER, "공지필터작성자", PostCategory.NOTICE));
+
+		assertThat(fullPage.getContent()).hasSize(2);
+		assertThat(fullPage.getTotalElements())
+				.as("건수 쿼리에도 category 와 keyword 조건이 AND 로 붙어야 한다")
+				.isEqualTo(3);
+		assertThat(fullPage.getTotalPages()).isEqualTo(2);
+	}
+
 	// --- 헬퍼 ---
 
 	private Page<Post> search(PostSearchCondition condition) {
@@ -463,7 +514,7 @@ class PostQueryRepositoryTest {
 	 */
 	private void assertStablePageBoundary(String nickname, PostSortType sort, List<Long> all) {
 		assertStablePageBoundary(page -> search(PostSearchCondition.of(
-				page, TIED_PAGE_SIZE, sort, SearchType.WRITER, nickname)), all);
+				page, TIED_PAGE_SIZE, sort, SearchType.WRITER, nickname, null)), all);
 	}
 
 	/**
@@ -497,13 +548,13 @@ class PostQueryRepositoryTest {
 	}
 
 	private static PostSearchCondition condition(int page, int size) {
-		return PostSearchCondition.of(page, size, PostSortType.latest, null, null);
+		return PostSearchCondition.of(page, size, PostSortType.latest, null, null, null);
 	}
 
 	/** 다른 테스트 픽스처와 섞이지 않게 작성자로 범위를 좁히는 조건이다. */
 	private static PostSearchCondition condition(
 			SearchType searchType, String keyword, PostSortType sort) {
-		return PostSearchCondition.of(0, DEFAULT_SIZE, sort, searchType, keyword);
+		return PostSearchCondition.of(0, DEFAULT_SIZE, sort, searchType, keyword, null);
 	}
 
 	private Post save(long writerId, String writerNickname, String title, String content) {
@@ -512,6 +563,16 @@ class PostQueryRepositoryTest {
 				.writerNickname(writerNickname)
 				.title(title)
 				.content(content)
+				.build());
+	}
+
+	private Post save(long writerId, PostCategory category, String writerNickname, String title) {
+		return this.postRepository.saveAndFlush(Post.builder()
+				.writerId(writerId)
+				.writerNickname(writerNickname)
+				.title(title)
+				.content("본문")
+				.category(category)
 				.build());
 	}
 

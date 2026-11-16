@@ -24,6 +24,7 @@ import com.example.board.post.dto.PostDetailResponse;
 import com.example.board.post.dto.PostResponse;
 import com.example.board.post.dto.PostUpdateRequest;
 import com.example.board.post.entity.Post;
+import com.example.board.post.entity.PostCategory;
 import com.example.board.post.repository.PostRepository;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -61,6 +62,7 @@ import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.EnumSource;
+import org.junit.jupiter.params.provider.NullSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.autoconfigure.orm.jpa.HibernatePropertiesCustomizer;
 import org.springframework.boot.test.context.SpringBootTest;
@@ -107,6 +109,10 @@ import org.springframework.transaction.support.TransactionTemplate;
  * <p>B-18 의 중첩 클래스({@link 수정_삭제와_집계_끼워넣기})는 981~989 를 쓴다. 위 목록에 없는
  * 대역도 이미 쓰이고 있어(예: {@code CommentServiceTest} 의 971~979), 2026-11-13 에 테스트 소스
  * 전체에서 981~989 를 찾아 쓰는 곳이 없는 것을 확인하고 골랐다.
+ *
+ * <p>B-19 의 카테고리 수정 테스트는 수정·삭제 대역 안의 724~726 을 쓰고 그 대역의
+ * {@code @AfterEach} 가 지운다. 2026-11-13 에 테스트 소스 전체에서 724~726 을 쓰는 곳이 없는
+ * 것을 확인하고 골랐다.
  */
 @SpringBootTest
 @ActiveProfiles("test")
@@ -157,7 +163,7 @@ class PostServiceTest {
 		given(this.memberClient.findActiveNickname(WRITER_ID)).willReturn(MEMBER_NICKNAME);
 
 		PostDetailResponse created = this.postService.create(
-				WRITER_ID, new PostCreateRequest("첫 글", "첫 글 본문"));
+				user(WRITER_ID), new PostCreateRequest("첫 글", "첫 글 본문", null));
 
 		Post saved = this.postRepository.findById(created.id()).orElseThrow();
 		assertThat(saved.getTitle()).isEqualTo("첫 글");
@@ -179,7 +185,7 @@ class PostServiceTest {
 		given(this.memberClient.findActiveNickname(WRITER_ID)).willReturn(MEMBER_NICKNAME);
 
 		PostDetailResponse created = this.postService.create(
-				WRITER_ID, new PostCreateRequest("작성자 확인", "본문"));
+				user(WRITER_ID), new PostCreateRequest("작성자 확인", "본문", null));
 
 		assertThat(this.postRepository.findById(created.id()).orElseThrow().getWriterId())
 				.isEqualTo(WRITER_ID);
@@ -196,7 +202,7 @@ class PostServiceTest {
 		given(this.memberClient.findActiveNickname(WRITER_ID)).willReturn(MEMBER_NICKNAME);
 
 		PostDetailResponse created = this.postService.create(
-				WRITER_ID, new PostCreateRequest("닉네임 확인", "본문"));
+				user(WRITER_ID), new PostCreateRequest("닉네임 확인", "본문", null));
 
 		assertThat(this.postRepository.findById(created.id()).orElseThrow().getWriterNickname())
 				.isEqualTo(MEMBER_NICKNAME);
@@ -209,7 +215,7 @@ class PostServiceTest {
 	void 조회_키는_sub_다() {
 		given(this.memberClient.findActiveNickname(WRITER_ID)).willReturn(MEMBER_NICKNAME);
 
-		this.postService.create(WRITER_ID, new PostCreateRequest("조회 키", "본문"));
+		this.postService.create(user(WRITER_ID), new PostCreateRequest("조회 키", "본문", null));
 
 		verify(this.memberClient).findActiveNickname(WRITER_ID);
 		verify(this.memberClient, never()).findActiveNickname(999L);
@@ -240,7 +246,7 @@ class PostServiceTest {
 			return MEMBER_NICKNAME;
 		}).given(this.memberClient).findActiveNickname(WRITER_ID);
 
-		this.postService.create(WRITER_ID, new PostCreateRequest("순서", "본문"));
+		this.postService.create(user(WRITER_ID), new PostCreateRequest("순서", "본문", null));
 
 		assertThat(transactionActiveAtCall.get())
 				.as("MemberClient 가 호출되지 않았다면 이 단언은 아무것도 보지 못한다")
@@ -263,7 +269,7 @@ class PostServiceTest {
 				.given(this.memberClient).findActiveNickname(WRITER_ID);
 
 		assertThatThrownBy(() -> this.postService.create(
-				WRITER_ID, new PostCreateRequest("거부될 글", "본문")))
+				user(WRITER_ID), new PostCreateRequest("거부될 글", "본문", null)))
 				.isInstanceOf(BusinessException.class)
 				.extracting(e -> ((BusinessException) e).getErrorCode())
 				.isEqualTo(ErrorCode.PROFILE_REQUIRED);
@@ -278,7 +284,7 @@ class PostServiceTest {
 				.given(this.memberClient).findActiveNickname(WRITER_ID);
 
 		assertThatThrownBy(() -> this.postService.create(
-				WRITER_ID, new PostCreateRequest("거부될 글", "본문")))
+				user(WRITER_ID), new PostCreateRequest("거부될 글", "본문", null)))
 				.isInstanceOf(BusinessException.class)
 				.extracting(e -> ((BusinessException) e).getErrorCode())
 				.isEqualTo(ErrorCode.EXTERNAL_SERVICE_ERROR);
@@ -370,17 +376,20 @@ class PostServiceTest {
 	// --- 목록 항목의 모양 (sp-docs/api-contract.md §4.3 §9.3) ---
 
 	/**
-	 * {@link PostResponse} 의 키 집합이 <b>정확히 일곱</b>이다 (§4.3, §9.3의 예시).
+	 * {@link PostResponse} 의 키 집합이 §4.3 의 <b>목록 줄과 정확히 같다</b> (§9.3 의 예시).
 	 *
 	 * <p>이 모양은 B-06(목록)·B-09(내가 쓴 글)이 함께 쓴다 (§4.3). 그 두 항목이 생기기 전에
 	 * 어긋나면 모양이 바뀐 채로 두 엔드포인트가 올라가므로 여기서 핀한다. <b>{@code content}
 	 * 가 없다</b> — 본문이 10,000자까지 허용되므로 한 페이지 50건이면 500,000자가 된다.
 	 *
+	 * <p><b>{@code category}·{@code likeCount} 는 B-19 가 더했다.</b> 2026-11-11 {@code D-18} 이
+	 * 계약에 더한 키이고, 그 전의 이 단언은 두 키가 없던 1차 계약이었다 (§4.3 의 블록인용).
+	 *
 	 * <p>기대값은 <b>리터럴</b>이다. DTO 의 레코드 컴포넌트에서 뽑으면 필드가 늘거나 줄 때
 	 * 기대값이 함께 움직여 단언이 아무것도 보지 못한다.
 	 */
 	@Test
-	@DisplayName("목록 항목(PostResponse) 키는 정확히 일곱이고 content·deleted·updatedAt 이 없다")
+	@DisplayName("목록 항목(PostResponse) 키는 §4.3 의 목록 줄과 같고 content·deleted·updatedAt 이 없다")
 	void 목록_항목_키_집합() throws Exception {
 		Post post = savedPost(506L, "목록작성자", "목록 항목", "본문");
 
@@ -389,8 +398,8 @@ class PostServiceTest {
 				new TypeReference<Map<String, Object>>() { });
 
 		assertThat(serialized.keySet()).isEqualTo(Set.of(
-				"id", "title", "writerId", "writerNickname",
-				"viewCount", "commentCount", "createdAt"));
+				"id", "title", "category", "writerId", "writerNickname",
+				"viewCount", "commentCount", "likeCount", "createdAt"));
 	}
 
 	// --- 수정 (P-06, sp-docs/security.md §5.2) ---
@@ -405,7 +414,7 @@ class PostServiceTest {
 		Post post = savedPost(701L, "작성자닉네임", "원래 제목", "원래 본문");
 
 		PostDetailResponse updated = this.postService.update(
-				post.getId(), user(701L), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+				post.getId(), user(701L), new PostUpdateRequest("바뀐 제목", "바뀐 본문", null));
 
 		assertThat(updated.title()).isEqualTo("바뀐 제목");
 		assertThat(updated.content()).isEqualTo("바뀐 본문");
@@ -431,7 +440,7 @@ class PostServiceTest {
 		Post post = savedPost(702L, "작성자닉네임", "원래 제목", "원래 본문");
 
 		this.postService.update(
-				post.getId(), user(702L), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+				post.getId(), user(702L), new PostUpdateRequest("바뀐 제목", "바뀐 본문", null));
 
 		Post saved = this.postRepository.findById(post.getId()).orElseThrow();
 		assertThat(saved.getTitle())
@@ -450,7 +459,7 @@ class PostServiceTest {
 		Post post = savedPost(703L, "작성당시닉네임", "원래 제목", "원래 본문");
 
 		this.postService.update(
-				post.getId(), user(703L), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+				post.getId(), user(703L), new PostUpdateRequest("바뀐 제목", "바뀐 본문", null));
 
 		Post saved = this.postRepository.findById(post.getId()).orElseThrow();
 		assertThat(saved.getContent())
@@ -473,7 +482,7 @@ class PostServiceTest {
 		Post post = savedPost(704L, "작성자닉네임", "원래 제목", "원래 본문");
 
 		assertThatThrownBy(() -> this.postService.update(
-				post.getId(), user(705L), new PostUpdateRequest("탈취 제목", "탈취 본문")))
+				post.getId(), user(705L), new PostUpdateRequest("탈취 제목", "탈취 본문", null)))
 				.isInstanceOf(BusinessException.class)
 				.extracting(e -> ((BusinessException) e).getErrorCode())
 				.isEqualTo(ErrorCode.POST_FORBIDDEN);
@@ -494,7 +503,7 @@ class PostServiceTest {
 		Post post = savedPost(706L, "작성자닉네임", "원래 제목", "원래 본문");
 
 		assertThatThrownBy(() -> this.postService.update(
-				post.getId(), admin(707L), new PostUpdateRequest("관리자 수정", "관리자 본문")))
+				post.getId(), admin(707L), new PostUpdateRequest("관리자 수정", "관리자 본문", null)))
 				.isInstanceOf(BusinessException.class)
 				.extracting(e -> ((BusinessException) e).getErrorCode())
 				.isEqualTo(ErrorCode.POST_FORBIDDEN);
@@ -508,7 +517,7 @@ class PostServiceTest {
 	@DisplayName("없는 글 수정은 P001 이다")
 	void 없는_글_수정은_P001() {
 		assertThatThrownBy(() -> this.postService.update(
-				987654323L, user(708L), new PostUpdateRequest("제목", "본문")))
+				987654323L, user(708L), new PostUpdateRequest("제목", "본문", null)))
 				.isInstanceOf(BusinessException.class)
 				.extracting(e -> ((BusinessException) e).getErrorCode())
 				.isEqualTo(ErrorCode.POST_NOT_FOUND);
@@ -545,7 +554,7 @@ class PostServiceTest {
 		this.postRepository.saveAndFlush(post);
 
 		assertThatThrownBy(() -> this.postService.update(
-				post.getId(), user(721L), new PostUpdateRequest("탈취 제목", "탈취 본문")))
+				post.getId(), user(721L), new PostUpdateRequest("탈취 제목", "탈취 본문", null)))
 				.isInstanceOf(BusinessException.class)
 				.extracting(e -> ((BusinessException) e).getErrorCode())
 				.as("없는 글이 먼저다 — 조회를 권한 판정보다 앞에 둔다 "
@@ -688,10 +697,222 @@ class PostServiceTest {
 		Post post = savedPost(718L, "작성자닉네임", "원래 제목", "원래 본문");
 
 		this.postService.update(
-				post.getId(), user(718L), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+				post.getId(), user(718L), new PostUpdateRequest("바뀐 제목", "바뀐 본문", null));
 		this.postService.delete(post.getId(), user(718L));
 
 		verifyNoInteractions(this.memberClient);
+	}
+
+	// --- 카테고리 수정 (P-11, sp-docs/requirements/board.md §8, sp-docs/api-contract.md §4.4) ---
+	//
+	// sp-docs/plan/phase2-board.md B-19 검증표의 수정 행이다. 작성의 P003 과 member 호출 횟수,
+	// 잘못된 값(C001·C002)은 PostControllerTest 가 실제 MemberClient 와 스텁 서버로 보고, 목록
+	// 필터는 PostControllerTest 와 PostQueryRepositoryTest 가 본다. ErrorCode 가 상태와 코드를
+	// 함께 들고 그 대응을 ErrorCodeTest 가 핀하므로, 여기서는 코드만 단언하면 HTTP 답까지
+	// 정해진다.
+
+	/**
+	 * B-19 검증표 "USER 가 자기 {@code FREE} 글을 {@code NOTICE} 로 → 403 {@code P003}, 카테고리
+	 * 불변". 자기 글이라 {@code P002} 를 지나고, 공지로 바꾸는 수정이라 {@code P003} 이다
+	 * (sp-docs/requirements/board.md §8).
+	 *
+	 * <p>공지와 무관한 변경은 USER 도 할 수 있다 — 그 반대 조합은
+	 * {@link #USER_가_공지와_무관하게_바꾸면_반영된다()} 다.
+	 */
+	@Test
+	@DisplayName("USER 가 자기 FREE 글을 NOTICE 로 바꾸면 P003 이고 카테고리가 그대로다")
+	void USER_가_자기_글을_공지로_바꾸면_P003() {
+		Post post = savedPost(724L, PostCategory.FREE);
+
+		assertThatThrownBy(() -> this.postService.update(post.getId(), user(724L),
+				new PostUpdateRequest("바뀐 제목", "바뀐 본문", PostCategory.NOTICE)))
+				.isInstanceOf(BusinessException.class)
+				.extracting(e -> ((BusinessException) e).getErrorCode())
+				.isEqualTo(ErrorCode.NOTICE_FORBIDDEN);
+
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getCategory())
+				.isEqualTo(PostCategory.FREE);
+	}
+
+	/**
+	 * B-19 검증표 "USER 의 {@code NOTICE} 글(테스트 데이터)을 그 USER 가 {@code FREE} 로 → 403
+	 * {@code P003}". <b>공지에서 빼는 것도 공지를 다루는 수정이다</b> (§8 의 "공지 권한 — 수정").
+	 * USER 가 공지를 가질 수 없으므로 픽스처를 저장소로 직접 만든다.
+	 */
+	@Test
+	@DisplayName("USER 가 자기 NOTICE 글을 FREE 로 바꾸면 P003 이고 카테고리가 그대로다")
+	void USER_가_자기_공지를_빼면_P003() {
+		Post post = savedPost(724L, PostCategory.NOTICE);
+
+		assertThatThrownBy(() -> this.postService.update(post.getId(), user(724L),
+				new PostUpdateRequest("바뀐 제목", "바뀐 본문", PostCategory.FREE)))
+				.isInstanceOf(BusinessException.class)
+				.extracting(e -> ((BusinessException) e).getErrorCode())
+				.isEqualTo(ErrorCode.NOTICE_FORBIDDEN);
+
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getCategory())
+				.isEqualTo(PostCategory.NOTICE);
+	}
+
+	/**
+	 * B-19 검증표 "USER 의 {@code NOTICE} 글을 그 USER 가 {@code category} 생략·같은 값으로 수정
+	 * → 200, {@code category} 가 {@code NOTICE} 그대로 — 판정을 거치지 않는다". §8 의 「바뀌지
+	 * 않는 수정(생략하거나 같은 값)은 이 판정을 거치지 않는다」 를 두 입력으로 본다.
+	 *
+	 * <p><b>제목이 바뀐 것을 함께 본다.</b> 거부됐다면 예외가 나므로 수정이 실제로 일어났는지가
+	 * "판정을 거치지 않았다" 의 관측이다. {@link #USER_가_자기_공지를_빼면_P003()} 과 픽스처
+	 * (USER 자기의 {@code NOTICE} 글)·요청자가 같고 카테고리가 바뀌는지만 다르다.
+	 *
+	 * <p><b>두 입력이 서로를 대신하지 않는다.</b> 생략을 거르는 검사를 뺀 변이는 {@code null}
+	 * 입력만, 같은 값을 거르는 검사를 뺀 변이는 {@code NOTICE} 입력만 빨갛게 했다 (B-19 실측).
+	 */
+	@ParameterizedTest
+	@NullSource
+	@EnumSource(value = PostCategory.class, names = "NOTICE")
+	@DisplayName("USER 가 자기 NOTICE 글을 카테고리 생략·같은 값으로 수정하면 반영되고 NOTICE 그대로다")
+	void 바뀌지_않는_수정은_공지_판정을_거치지_않는다(PostCategory requested) {
+		Post post = savedPost(724L, PostCategory.NOTICE);
+
+		PostDetailResponse updated = this.postService.update(post.getId(), user(724L),
+				new PostUpdateRequest("바뀐 제목", "바뀐 본문", requested));
+
+		assertThat(updated.title()).isEqualTo("바뀐 제목");
+		assertThat(updated.category()).isEqualTo(PostCategory.NOTICE);
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getCategory())
+				.isEqualTo(PostCategory.NOTICE);
+	}
+
+	/**
+	 * B-19 검증표 "USER 가 자기 {@code QNA} 글을 {@code category} 생략으로 수정 → 200,
+	 * {@code category: QNA}". 생략은 지금 값을 유지한다 (§8 의 수정 규칙) — 기본값
+	 * {@code FREE} 로 되돌리지 않는다.
+	 */
+	@Test
+	@DisplayName("USER 가 자기 QNA 글을 카테고리 생략으로 수정하면 QNA 그대로다")
+	void 카테고리를_생략한_수정은_지금_값을_유지한다() {
+		Post post = savedPost(724L, PostCategory.QNA);
+
+		PostDetailResponse updated = this.postService.update(post.getId(), user(724L),
+				new PostUpdateRequest("바뀐 제목", "바뀐 본문", null));
+
+		assertThat(updated.category()).isEqualTo(PostCategory.QNA);
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getCategory())
+				.isEqualTo(PostCategory.QNA);
+	}
+
+	/**
+	 * 검증표에 없는 행이다 — 완료 기준의 "카테고리가 {@code NOTICE} 로 바뀌거나 {@code NOTICE}
+	 * 에서 바뀔 때<b>만</b> ADMIN 을 요구하고" 의 "만" 쪽이다. 카테고리가 바뀌어도 공지와
+	 * 무관하면 USER 가 할 수 있다 (§8).
+	 *
+	 * <p>{@link #USER_가_자기_글을_공지로_바꾸면_P003()} 과 픽스처(USER 자기의 {@code FREE} 글)·
+	 * 요청자가 같고 바꾸려는 값만 다르다 — 판정을 "바뀌면 전부 ADMIN" 으로 넓힌 변이에서
+	 * 빨개진 것은 이 테스트 하나였다 (B-19 실측).
+	 */
+	@Test
+	@DisplayName("USER 가 자기 FREE 글을 QNA 로 바꾸면 반영된다 — 공지와 무관한 변경이다")
+	void USER_가_공지와_무관하게_바꾸면_반영된다() {
+		Post post = savedPost(724L, PostCategory.FREE);
+
+		PostDetailResponse updated = this.postService.update(post.getId(), user(724L),
+				new PostUpdateRequest("바뀐 제목", "바뀐 본문", PostCategory.QNA));
+
+		assertThat(updated.category()).isEqualTo(PostCategory.QNA);
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getCategory())
+				.isEqualTo(PostCategory.QNA);
+	}
+
+	/**
+	 * B-19 검증표 "USER 가 남의 글을 {@code NOTICE} 로 → 403 {@code P002} ({@code P003} 아님)".
+	 * <b>소유권이 공지 권한보다 먼저다</b> (§8 의 판정 순서) — 남의 글이면 카테고리를 볼 것도
+	 * 없이 {@code P002} 다. 순서를 뒤집으면 USER 는 공지 판정에서 먼저 걸려 {@code P003} 이
+	 * 된다 — 그 변이에서 빨개진 것은 이 테스트 하나였다 (B-19 실측).
+	 */
+	@Test
+	@DisplayName("USER 가 남의 글을 NOTICE 로 바꾸면 P002 다 — P003 이 아니다")
+	void USER_가_남의_글을_공지로_바꾸면_P002() {
+		Post post = savedPost(725L, PostCategory.FREE);
+
+		assertThatThrownBy(() -> this.postService.update(post.getId(), user(724L),
+				new PostUpdateRequest("바뀐 제목", "바뀐 본문", PostCategory.NOTICE)))
+				.isInstanceOf(BusinessException.class)
+				.extracting(e -> ((BusinessException) e).getErrorCode())
+				.as("소유권이 공지 권한보다 먼저다 (sp-docs/requirements/board.md §8)")
+				.isEqualTo(ErrorCode.POST_FORBIDDEN);
+	}
+
+	/**
+	 * B-19 검증표 "USER 가 지운 자기 글을 {@code NOTICE} 로 → 404 {@code P001} ({@code P003}
+	 * 아님)". <b>없는 글이 가장 먼저다</b> (sp-docs/api-contract.md §4.4). 자기 글이라
+	 * 소유권은 통과하므로, 공지 판정이 조회보다 앞서면 {@code P003} 이 나온다.
+	 *
+	 * <p>행이 없는 id 가 아니라 <b>삭제된 행</b>을 쓴다 — 행을 읽고 공지 판정을 한 뒤에 삭제
+	 * 여부를 보는 구현은 행이 없으면 404 밖에 낼 수 없어, 삭제된 행에서만 순서가 갈린다
+	 * (§4.4 의 블록인용과 같은 이유).
+	 */
+	@Test
+	@DisplayName("USER 가 지운 자기 글을 NOTICE 로 바꾸면 P001 이다 — P003 이 아니다")
+	void USER_가_지운_자기_글을_공지로_바꾸면_P001() {
+		Post post = savedPost(724L, PostCategory.FREE);
+		post.softDelete();
+		this.postRepository.saveAndFlush(post);
+
+		assertThatThrownBy(() -> this.postService.update(post.getId(), user(724L),
+				new PostUpdateRequest("바뀐 제목", "바뀐 본문", PostCategory.NOTICE)))
+				.isInstanceOf(BusinessException.class)
+				.extracting(e -> ((BusinessException) e).getErrorCode())
+				.as("없는 글이 먼저다 (sp-docs/api-contract.md §4.4)")
+				.isEqualTo(ErrorCode.POST_NOT_FOUND);
+	}
+
+	/**
+	 * B-19 검증표 "ADMIN 이 남의 글을 {@code NOTICE} 로 → 403 {@code P002}". §8 의 「ADMIN 도
+	 * 남의 글을 공지로 바꿀 수 없다」 — 수정은 작성자 본인만이다 (sp-docs/security.md §5.2).
+	 * 반대 조합(ADMIN 의 자기 글)은 {@link #ADMIN_은_자기_글을_공지로_바꾸고_되돌린다()} 다.
+	 *
+	 * <p><b>이 행은 판정 순서를 가르지 않는다.</b> ADMIN 은 공지 판정을 통과하므로 어느 순서든
+	 * {@code P002} 다 — 소유권과 공지 판정의 순서를 뒤집은 변이에서 이 테스트는 녹색이었다
+	 * (B-19 실측). 순서는 {@link #USER_가_남의_글을_공지로_바꾸면_P002()} 가 본다.
+	 */
+	@Test
+	@DisplayName("ADMIN 이 남의 글을 NOTICE 로 바꾸면 P002 이고 카테고리가 그대로다")
+	void ADMIN_이_남의_글을_공지로_바꾸면_P002() {
+		Post post = savedPost(724L, PostCategory.FREE);
+
+		assertThatThrownBy(() -> this.postService.update(post.getId(), admin(726L),
+				new PostUpdateRequest("바뀐 제목", "바뀐 본문", PostCategory.NOTICE)))
+				.isInstanceOf(BusinessException.class)
+				.extracting(e -> ((BusinessException) e).getErrorCode())
+				.isEqualTo(ErrorCode.POST_FORBIDDEN);
+
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getCategory())
+				.isEqualTo(PostCategory.FREE);
+	}
+
+	/**
+	 * B-19 검증표 "ADMIN 이 자기 글을 {@code NOTICE} 로, 다시 {@code FREE} 로 → 200
+	 * {@code category: NOTICE}, 200 {@code category: FREE}". 공지로 바꾸는 쪽과 공지에서 빼는
+	 * 쪽이 둘 다 ADMIN 에게 열려 있다 (§8, sp-docs/security.md §5.2 의 "공지로 바꾸기·공지에서
+	 * 빼기").
+	 */
+	@Test
+	@DisplayName("ADMIN 이 자기 글을 NOTICE 로 바꾸고 다시 FREE 로 되돌린다")
+	void ADMIN_은_자기_글을_공지로_바꾸고_되돌린다() {
+		Post post = savedPost(726L, PostCategory.FREE);
+
+		PostDetailResponse toNotice = this.postService.update(post.getId(), admin(726L),
+				new PostUpdateRequest("공지 제목", "공지 본문", PostCategory.NOTICE));
+
+		assertThat(toNotice.category()).isEqualTo(PostCategory.NOTICE);
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getCategory())
+				.isEqualTo(PostCategory.NOTICE);
+
+		PostDetailResponse backToFree = this.postService.update(post.getId(), admin(726L),
+				new PostUpdateRequest("공지 제목", "공지 본문", PostCategory.FREE));
+
+		assertThat(backToFree.category()).isEqualTo(PostCategory.FREE);
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getCategory())
+				.isEqualTo(PostCategory.FREE);
 	}
 
 	/**
@@ -1149,6 +1370,11 @@ class PostServiceTest {
 		 * sp-docs/api-contract.md §4.3 의 여덟 키다"</b>. 수단을 좁은 UPDATE 로 바꾼 뒤에도
 		 * P-05 의 동작과 §4.3 의 모양이 그대로인 것을 본다 (B-05 의 완료 기준).
 		 *
+		 * <p><b>"여덟 키" 는 1차 계약의 수다</b> (sp-docs/plan/phase1.md §6 머리의 블록인용).
+		 * B-19 가 2026-11-11 {@code D-18} 의 {@code category}·{@code likeCount} 를 더했고, §4.3
+		 * 의 상세 줄에 남은 {@code liked}·{@code attachments} 는 계획이 B-21·B-24 에 배정했다
+		 * (sp-docs/plan/phase2-board.md 의 B-19 완료 기준).
+		 *
 		 * <p><b>커밋된 값과 응답의 값을 함께 본다.</b> 좁은 UPDATE 는 영속성 컨텍스트의
 		 * 엔티티를 지나지 않으므로 둘이 어긋날 수 있다 — DB 는 올랐는데 응답이 증가 전 값을
 		 * 싣는 상태가 그것이다.
@@ -1158,7 +1384,7 @@ class PostServiceTest {
 		 * {@code PostControllerTest} 가 본다.
 		 */
 		@Test
-		@DisplayName("상세 조회 1회면 view_count 가 1 증가하고 응답 키가 여덟이다")
+		@DisplayName("상세 조회 1회면 view_count 가 1 증가하고 응답 키가 상세 모양이다")
 		void 상세_조회_1회의_조회수와_응답_모양() throws Exception {
 			Post post = 게시글을_만든다(응답_모양_대역);
 
@@ -1176,11 +1402,11 @@ class PostServiceTest {
 					this.objectMapper.writeValueAsString(detail),
 					new TypeReference<Map<String, Object>>() { });
 			assertThat(serialized.keySet())
-					.as("상세는 목록 일곱에 content 를 더한 여덟이다 "
-							+ "(sp-docs/api-contract.md §4.3)")
+					.as("상세는 목록 항목의 키에 content 를 더한 것이다 — liked·attachments 는 "
+							+ "B-19 가 싣지 않았다 (sp-docs/api-contract.md §4.3)")
 					.isEqualTo(Set.of(
-							"id", "title", "content", "writerId", "writerNickname",
-							"viewCount", "commentCount", "createdAt"));
+							"id", "title", "category", "content", "writerId", "writerNickname",
+							"viewCount", "commentCount", "likeCount", "createdAt"));
 		}
 
 		/**
@@ -1432,7 +1658,7 @@ class PostServiceTest {
 							new CommentCreateRequest("끼워넣은 댓글")));
 
 			this.postService.update(
-					post.getId(), user(작성자), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+					post.getId(), user(작성자), new PostUpdateRequest("바뀐 제목", "바뀐 본문", null));
 
 			기록.확인한다();
 			assertThat(커밋된_활성_댓글_수(post.getId()))
@@ -1463,7 +1689,7 @@ class PostServiceTest {
 					() -> 좁은_UPDATE_를_커밋한다(대상.컬럼, 대상.좁은_증가, post.getId()));
 
 			this.postService.update(
-					post.getId(), user(작성자), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+					post.getId(), user(작성자), new PostUpdateRequest("바뀐 제목", "바뀐 본문", null));
 
 			기록.확인한다();
 			assertThat(커밋된_제목(post.getId()))
@@ -1521,7 +1747,7 @@ class PostServiceTest {
 					() -> 좁은_UPDATE_를_커밋한다(대상.컬럼, 대상.좁은_감소, post.getId()));
 
 			this.postService.update(
-					post.getId(), user(작성자), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+					post.getId(), user(작성자), new PostUpdateRequest("바뀐 제목", "바뀐 본문", null));
 
 			기록.확인한다();
 			assertThat(커밋된_제목(post.getId()))
@@ -1567,7 +1793,7 @@ class PostServiceTest {
 			this.발행된_문장.비운다();
 
 			this.postService.update(
-					post.getId(), user(작성자), new PostUpdateRequest("바뀐 제목", "바뀐 본문"));
+					post.getId(), user(작성자), new PostUpdateRequest("바뀐 제목", "바뀐 본문", null));
 
 			List<String> post_UPDATE = this.발행된_문장.발행된_post_UPDATE();
 			assertThat(post_UPDATE)
@@ -1888,6 +2114,20 @@ class PostServiceTest {
 				.writerNickname(nickname)
 				.title(title)
 				.content(content)
+				.build());
+	}
+
+	/**
+	 * 카테고리를 정해 둔 글. USER 의 {@code NOTICE} 글처럼 API 로는 만들 수 없는 픽스처도
+	 * 여기서 만든다 (B-19 검증표의 "테스트 데이터").
+	 */
+	private Post savedPost(long writerId, PostCategory category) {
+		return this.postRepository.saveAndFlush(Post.builder()
+				.writerId(writerId)
+				.writerNickname("카테고리작성자")
+				.title("원래 제목")
+				.content("원래 본문")
+				.category(category)
 				.build());
 	}
 

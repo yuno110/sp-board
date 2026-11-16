@@ -17,12 +17,16 @@ import org.springframework.data.domain.Pageable;
 import org.springframework.stereotype.Repository;
 
 /**
- * 게시글 목록·검색의 동적 쿼리. 정본: sp-docs/requirements/board.md §6 (P-03),
+ * 게시글 목록·검색의 동적 쿼리. 정본: sp-docs/requirements/board.md §6 (P-03) §8 (카테고리),
  * sp-docs/api-contract.md §4.1.
  *
  * <p>조건 조합은 {@link BooleanExpression} 으로 한다 (§6). 적용할 조건이 없으면 {@code null} 을
  * 돌려주고, QueryDSL 의 {@code where} 는 {@code null} 인수를 무시한다 — 키워드가 없으면 조건이
- * 붙지 않아 전체 목록이 된다 (§6).
+ * 붙지 않아 전체 목록이 된다 (§6). 카테고리도 같다 — 없으면 공지를 포함한 모든 카테고리다 (§8).
+ *
+ * <p><b>조건끼리는 AND 다.</b> {@code category} 는 검색·정렬과 함께 걸린다
+ * (sp-docs/api-contract.md §4.1). 조건마다 {@code where} 의 인수로 넘기면 QueryDSL 이 AND 로
+ * 잇는다 — 조건을 OR 로 묶는 자리를 만들지 않는다.
  *
  * <p><b>{@code deleted = false} 는 조건이 아니라 상수다.</b> 삭제된 게시글은 목록에서 제외한다
  * (sp-docs/requirements/board.md §5 규칙 1). 검색 분기마다 붙이면 한 군데가 빠지는 순간 삭제된
@@ -48,7 +52,7 @@ public class PostQueryRepository {
 	 * 목록·검색. 응답 형식은 sp-docs/api-contract.md §7.1 이고 변환은 서비스가 한다.
 	 */
 	public Page<Post> search(PostSearchCondition condition) {
-		return page(condition, keywordCondition(condition));
+		return page(condition, keywordCondition(condition), categoryCondition(condition));
 	}
 
 	/**
@@ -60,7 +64,7 @@ public class PostQueryRepository {
 	 * sp-docs/api-contract.md §4.1). 둘을 한 레코드에 섞으면 요청에서 온 값과 토큰에서 온 값이
 	 * 같은 자리에 놓인다.
 	 *
-	 * <p>{@code searchType}·{@code keyword} 는 이 경로에 없다 (§4.1) — P-08 이
+	 * <p>{@code searchType}·{@code keyword}·{@code category} 는 이 경로에 없다 (§4.1) — P-08 이
 	 * "{@code writer_id} 기준 페이징" 만 요구한다. 그래서 조건은 작성자 하나다.
 	 */
 	public Page<Post> searchByWriter(long writerId, PostSearchCondition condition) {
@@ -68,22 +72,24 @@ public class PostQueryRepository {
 	}
 
 	/**
-	 * 두 목록이 공유하는 페이징이다. 다른 것은 {@code filter} 하나뿐이다.
+	 * 두 목록이 공유하는 페이징이다. 다른 것은 {@code filters} 뿐이다.
 	 *
 	 * <p><b>{@code deleted = false} 와 정렬이 여기 한 자리에 있다.</b> 목록마다 복제하면 한
 	 * 군데가 빠지는 순간 삭제된 글이 노출되거나 정렬이 전순서를 잃는다 (클래스 주석).
 	 *
 	 * <p>건수는 매번 센다. {@code totalElements}·{@code totalPages} 가 항상 실제 건수에서
-	 * 나오므로 마지막 페이지 판정이 응답마다 일관된다.
+	 * 나오므로 마지막 페이지 판정이 응답마다 일관된다. <b>그래서 목록 쿼리와 건수 쿼리가 같은
+	 * 조건을 건다</b> — 한쪽에서만 조건이 빠지면 항목과 건수가 서로 다른 집합을 센다.
 	 *
-	 * @param filter 목록별 조건. {@code null} 이면 조건이 붙지 않는다 (클래스 주석)
+	 * @param filters 목록별 조건. AND 로 걸리고, {@code null} 인 것은 붙지 않는다 (클래스 주석)
 	 */
-	private Page<Post> page(PostSearchCondition condition, BooleanExpression filter) {
+	private Page<Post> page(PostSearchCondition condition, BooleanExpression... filters) {
 		Pageable pageable = PageRequest.of(condition.page(), condition.size());
 
 		List<Post> content = this.queryFactory
 				.selectFrom(post)
-				.where(post.deleted.isFalse(), filter)
+				.where(post.deleted.isFalse())
+				.where(filters)
 				.orderBy(order(condition))
 				.offset(pageable.getOffset())
 				.limit(pageable.getPageSize())
@@ -92,7 +98,8 @@ public class PostQueryRepository {
 		Long total = this.queryFactory
 				.select(post.count())
 				.from(post)
-				.where(post.deleted.isFalse(), filter)
+				.where(post.deleted.isFalse())
+				.where(filters)
 				.fetchOne();
 
 		return new PageImpl<>(content, pageable, Objects.requireNonNullElse(total, 0L));
@@ -131,6 +138,14 @@ public class PostQueryRepository {
 			case TITLE_CONTENT -> post.title.contains(keyword).or(post.content.contains(keyword));
 			case WRITER -> post.writerNickname.contains(keyword);
 		};
+	}
+
+	/**
+	 * 카테고리 조건. 없으면 {@code null} 이고 {@code where} 가 무시한다 — 기본값을 채우지 않는다
+	 * (sp-docs/api-contract.md §4.1, sp-docs/requirements/board.md §8).
+	 */
+	private BooleanExpression categoryCondition(PostSearchCondition condition) {
+		return condition.category() == null ? null : post.category.eq(condition.category());
 	}
 
 }

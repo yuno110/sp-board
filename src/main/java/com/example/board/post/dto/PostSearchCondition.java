@@ -2,10 +2,11 @@ package com.example.board.post.dto;
 
 import com.example.board.global.error.BusinessException;
 import com.example.board.global.error.ErrorCode;
+import com.example.board.post.entity.PostCategory;
 
 /**
  * 목록·검색 요청 파라미터. 정본: sp-docs/api-contract.md §4.1 (파라미터·기본값),
- * sp-docs/requirements/board.md §4 (허용 범위) §6 (검색).
+ * sp-docs/requirements/board.md §4 (허용 범위) §6 (검색) §8 (카테고리).
  *
  * <p>요청에서 온 날값을 이 레코드가 한 번만 정규화한다. 기본값 채우기는 {@link #of} 가,
  * <b>{@code size} 절삭과 {@code searchType}·{@code keyword} 짝 검증은 정규 생성자</b>가 맡는다 —
@@ -49,18 +50,28 @@ import com.example.board.global.error.ErrorCode;
  * {@code searchType=TITLE&keyword=} 는 400 {@code C001} 이다. "없을 때" 와 "비어 있을 때" 를
  * 정규화로 합치는 것이므로 빈 값 전용 가드를 따로 두지 않는다.
  *
+ * <h2>{@code category} — 없으면 모든 카테고리다</h2>
+ *
+ * <p>생략하면 공지({@code NOTICE})도 들어간다. 다른 조건과 <b>AND</b> 로 걸리고 검색·정렬과 함께
+ * 쓸 수 있다 (sp-docs/api-contract.md §4.1, sp-docs/requirements/board.md §8). 기본값을 채우지
+ * 않는다 — {@code null} 이 "필터 없음" 이다.
+ *
+ * <p>내가 쓴 글 목록은 이 파라미터를 받지 않는다 (§4.1) — 그 경로는 {@code null} 로 만든다.
+ *
  * @param page 0부터 시작한다 (§4.1)
  * @param size 최대 {@value #MAX_SIZE}. 초과분은 절삭된다 (§4.1)
  * @param sort 화이트리스트 enum 이다. 컬럼명을 받지 않는다 (§6)
  * @param searchType 없으면 전체 목록이다
  * @param keyword 부분 일치({@code LIKE '%키워드%'})로 쓰인다 (§4.1)
+ * @param category 없으면 모든 카테고리다 (§4.1)
  */
 public record PostSearchCondition(
 		int page,
 		int size,
 		PostSortType sort,
 		SearchType searchType,
-		String keyword
+		String keyword,
+		PostCategory category
 ) {
 
 	/** 전달되지 않았을 때의 값이다 (sp-docs/api-contract.md §4.1). */
@@ -103,14 +114,16 @@ public record PostSearchCondition(
 	 * {@code sort} 의 기본값은 enum 상수이므로 문자열로 적으면 이름이 바뀔 때 조용히 깨진다.
 	 */
 	public static PostSearchCondition of(
-			Integer page, Integer size, PostSortType sort, SearchType searchType, String keyword) {
+			Integer page, Integer size, PostSortType sort, SearchType searchType, String keyword,
+			PostCategory category) {
 
 		return new PostSearchCondition(
 				page == null ? DEFAULT_PAGE : page,
 				size == null ? DEFAULT_SIZE : size,
 				sort == null ? DEFAULT_SORT : sort,
 				searchType,
-				keyword);
+				keyword,
+				category);
 	}
 
 	/**

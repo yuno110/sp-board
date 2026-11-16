@@ -15,11 +15,11 @@ package com.example.board.global.security;
  * {@link CurrentMemberArgumentResolver} 가 보고, 아니면 401 {@code A002} 다
  * (sp-docs/api-contract.md §6).
  *
- * <p><b>권한 판정은 Service 계층이 이 {@code role} 문자열을 비교해서 한다</b> —
- * {@code PostService}·{@code CommentService} 의 삭제 권한이 그 비교로 갈린다
- * (sp-docs/security.md §5.2 의 매트릭스). <b>{@code GrantedAuthority} 로 판정하지 않는다</b>
- * (sp-docs/security.md §5.1). {@link RoleClaimConverter} 는 그 권한 이름을 만드는 쪽이고
- * 판정하는 쪽이 아니다.
+ * <p><b>권한 판정은 Service 계층이 이 {@code role} 문자열을 비교해서 한다</b> — 예를 들어
+ * {@code PostService}·{@code CommentService} 의 삭제 권한과 {@code PostService} 의 공지 권한이
+ * 그 비교로 갈린다 (sp-docs/security.md §5.2 의 매트릭스). <b>{@code GrantedAuthority} 로
+ * 판정하지 않는다</b> (sp-docs/security.md §5.1). {@link RoleClaimConverter} 는 그 권한 이름을
+ * 만드는 쪽이고 판정하는 쪽이 아니다.
  *
  * @param accountId {@code sub}. 전역 식별자(= {@code account.id})
  * @param role {@code role} claim

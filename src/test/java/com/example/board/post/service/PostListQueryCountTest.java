@@ -186,7 +186,7 @@ class PostListQueryCountTest {
 	/** {@code nickname} 이 {@code null} 이면 검색 조건이 없는 조건이다 (내가 쓴 글 목록용). */
 	private static PostSearchCondition condition(String nickname) {
 		return PostSearchCondition.of(0, PAGE_SIZE, null,
-				nickname == null ? null : SearchType.WRITER, nickname);
+				nickname == null ? null : SearchType.WRITER, nickname, null);
 	}
 
 	private void saveFixtures() {

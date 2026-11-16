@@ -1,5 +1,6 @@
 package com.example.board.post.dto;
 
+import com.example.board.post.entity.PostCategory;
 import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 
@@ -22,8 +23,20 @@ import jakarta.validation.constraints.Size;
  * <p>{@code @NotBlank} 와 {@code @Size} 가 둘 다 필요한 이유는 {@link PostCreateRequest} 에
  * 적혀 있다 — 한쪽만으로는 §4 의 규칙을 표현할 수 없다.
  *
+ * <h2>{@code category} 는 선택이고, 생략하면 지금 값을 유지한다</h2>
+ *
+ * <p>sp-docs/requirements/board.md §8 의 수정 규칙이다 — 필수로 두면 카테고리를 모르는
+ * 클라이언트의 수정이 깨진다 (sp-docs/adr/0008). 유지는 {@code Post.changeCategory} 가
+ * {@code null} 을 받으면 아무것도 바꾸지 않는 것으로 집행한다.
+ *
+ * <p>{@link PostCategory} 밖의 값은 작성과 같이 JSON 해석 실패라 400 {@code C001} 이다 (§4).
+ * 숫자도 그렇다 — 그것을 집행하는 설정은 {@link PostCreateRequest} 에 적혀 있다.
+ * 공지를 다루는 수정의 권한(403 {@code P003})은 지금 값과 요청 값을 함께 봐야 하므로
+ * {@code PostService} 가 판정한다 (§8).
+ *
  * @param title 제목
  * @param content 본문
+ * @param category 카테고리. 생략하면 {@code null}
  */
 public record PostUpdateRequest(
 
@@ -33,6 +46,8 @@ public record PostUpdateRequest(
 
 		@NotBlank(message = PostCreateRequest.CONTENT_MESSAGE)
 		@Size(max = PostCreateRequest.CONTENT_MAX_LENGTH, message = PostCreateRequest.CONTENT_MESSAGE)
-		String content) {
+		String content,
+
+		PostCategory category) {
 
 }

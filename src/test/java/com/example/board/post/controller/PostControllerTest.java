@@ -14,6 +14,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 import com.example.board.client.MemberClient;
 import com.example.board.global.error.BusinessException;
 import com.example.board.post.entity.Post;
+import com.example.board.post.entity.PostCategory;
 import com.example.board.post.repository.PostRepository;
 import com.example.board.support.TestTokenFactory;
 import com.jayway.jsonpath.JsonPath;
@@ -50,6 +51,8 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultMatcher;
 import org.springframework.test.web.servlet.MvcResult;
+import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.support.TransactionTemplate;
 
 /**
  * sp-docs/plan/phase1.md §6 B-05 의 "검증" 표 중 HTTP 쪽을 테스트로 옮긴 것이다. 저장된 값과
@@ -70,9 +73,13 @@ import org.springframework.test.web.servlet.MvcResult;
  *
  * <p>픽스처의 {@code writerId} 는 작성·상세(B-05)가 521~539, 목록·검색(B-06)이 621~639,
  * 수정·삭제(B-07)가 741~759, 내가 쓴 글(B-09)이 861~869 를 쓴다. 이미 쓰이는 대역(201~210,
- * 301~317, 401~402, {@code PostServiceTest} 의 501~519·701~719,
+ * 301~317, 401~402, {@code PostServiceTest} 의 501~519·701~729,
  * {@code PostQueryRepositoryTest} 의 601~619)과 겹치지 않게 둔다
  * (sp-docs/tech-stack.md §5.3 — 같은 JVM 의 모든 테스트가 한 H2 DB 를 본다).
+ *
+ * <p>B-19 의 테스트는 그 대역 안의 527~534·628~630·755~756·869 를 쓰고 각 대역의
+ * {@code @AfterEach} 가 지운다. 533·534·756 은 2026-11-16 에, 나머지는 2026-11-13 에 테스트 소스
+ * 전체에서 그 값을 쓰는 곳이 없는 것을 확인하고 골랐다.
  *
  * <p><b>목록 쪽 단언은 검색 조건으로 범위를 좁힌다.</b> 이 클래스는 롤백에 기대지 않고 커밋하므로
  * 테이블 전체를 세는 단언은 다른 클래스의 픽스처에 흔들린다. 전체 건수를 보는 것은 롤백되는
@@ -99,20 +106,25 @@ class PostControllerTest {
 	private static final String BULK_PATH = "/internal/v1/members/bulk";
 
 	/**
-	 * sp-docs/api-contract.md §4.3 이 정한 상세 응답의 키 집합. <b>리터럴로 적는다</b> — DTO 의
-	 * 필드에서 뽑아 오면 필드가 늘거나 줄 때 기대값이 함께 움직여 단언이 아무것도 보지 못한다.
+	 * 상세 응답의 키 집합. <b>리터럴로 적는다</b> — DTO 의 필드에서 뽑아 오면 필드가 늘거나 줄 때
+	 * 기대값이 함께 움직여 단언이 아무것도 보지 못한다.
+	 *
+	 * <p><b>sp-docs/api-contract.md §4.3 의 상세 줄 전체가 아니다.</b> 목록 항목의 키에
+	 * {@code content} 를 더한 것이고, 그 줄의 {@code liked}·{@code attachments} 는 B-19
+	 * (2026-11-13)가 싣지 않았다 — 계획이 그 둘을 B-21·B-24 에 배정했다
+	 * (sp-docs/plan/phase2-board.md 의 B-19 완료 기준).
 	 */
 	private static final Set<String> DETAIL_KEYS = Set.of(
-			"id", "title", "content", "writerId", "writerNickname",
-			"viewCount", "commentCount", "createdAt");
+			"id", "title", "category", "content", "writerId", "writerNickname",
+			"viewCount", "commentCount", "likeCount", "createdAt");
 
 	/**
-	 * sp-docs/api-contract.md §4.3 §9.3 이 정한 <b>목록 항목</b>의 키 집합. 상세에서
-	 * {@code content} 를 뺀 것이다. {@code DETAIL_KEYS} 와 같은 이유로 리터럴이다.
+	 * <b>목록 항목</b>의 키 집합. sp-docs/api-contract.md §4.3 의 <b>목록 줄 그대로다</b>
+	 * (§9.3 의 예시). {@code DETAIL_KEYS} 와 같은 이유로 리터럴이다.
 	 */
 	private static final Set<String> LIST_ITEM_KEYS = Set.of(
-			"id", "title", "writerId", "writerNickname",
-			"viewCount", "commentCount", "createdAt");
+			"id", "title", "category", "writerId", "writerNickname",
+			"viewCount", "commentCount", "likeCount", "createdAt");
 
 	/** sp-docs/api-contract.md §7.1 의 페이징 봉투 키 집합. 여기도 리터럴이다. */
 	private static final Set<String> PAGE_KEYS = Set.of(
@@ -142,6 +154,9 @@ class PostControllerTest {
 
 	@Autowired
 	private JdbcTemplate jdbcTemplate;
+
+	@Autowired
+	private PlatformTransactionManager transactionManager;
 
 	@BeforeEach
 	void 스텁_초기화() {
@@ -385,14 +400,14 @@ class PostControllerTest {
 	}
 
 	/**
-	 * 상세 응답의 키 집합이 <b>정확히 여덟</b>이다 (§4.3).
+	 * 상세 응답의 키 집합이 {@link #DETAIL_KEYS} 와 정확히 같다 (§4.3).
 	 *
 	 * <p>{@code deleted} 는 돌아온 글이 항상 활성이므로 넣지 않고, {@code updatedAt} 은 감사
 	 * 흔적으로 쓰지 않으며 노출 요구가 없어 넣지 않는다 (§4.3,
 	 * sp-docs/domain-model.md §1.1).
 	 */
 	@Test
-	@DisplayName("상세 응답 키는 정확히 여덟이고 deleted·updatedAt 이 없다")
+	@DisplayName("상세 응답 키는 목록 항목의 키에 content 를 더한 것이고 deleted·updatedAt 이 없다")
 	void 상세_응답_키_집합() throws Exception {
 		Post post = savedPost(523L, "키집합작성자", "키 집합", "본문");
 
@@ -401,6 +416,24 @@ class PostControllerTest {
 				.andReturn();
 
 		assertThat(dataKeys(result)).isEqualTo(DETAIL_KEYS);
+	}
+
+	/**
+	 * 상세 응답의 {@code likeCount} 는 {@code post.like_count} 다 (§4.3). {@link #DETAIL_KEYS}
+	 * 대조는 키만 본다 — 이 테스트가 없을 때 {@code PostDetailResponse} 의 {@code likeCount}
+	 * 자리에 {@code commentCount} 를 실은 변이에서 스위트 전체가 녹색이었다 (2026-11-16 실측).
+	 * {@code like_count} 를 2 로 두어 0 이 아니고 {@code comment_count}(0)·조회 뒤의
+	 * {@code view_count}(1)와도 다르게 한다.
+	 */
+	@Test
+	@DisplayName("상세 응답의 likeCount 는 저장된 like_count 다")
+	void 상세_응답의_likeCount_는_저장된_값이다() throws Exception {
+		Post post = savedPost(534L, "좋아요수작성자", "좋아요 수", "본문");
+		withLikeCount(post, 2);
+
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.likeCount").value(2));
 	}
 
 	@Test
@@ -472,7 +505,7 @@ class PostControllerTest {
 	 * 갖춘 것이 그쪽이다. 이 테스트가 보는 것은 <b>응답의 모양</b>이다.
 	 */
 	@Test
-	@DisplayName("목록 응답은 §7.1 페이징 키를 갖고 항목 키는 정확히 일곱이다")
+	@DisplayName("목록 응답은 §7.1 페이징 키를 갖고 항목 키는 §4.3 의 목록 줄과 같다")
 	void 목록_응답_형식() throws Exception {
 		Post post = savedPost(622L, "형식작성자", "응답형식확인", "본문입니다");
 
@@ -717,7 +750,7 @@ class PostControllerTest {
 	 * {@code PostQueryRepositoryTest.내가_쓴_글의_삭제분_제외()} 다.
 	 */
 	@Test
-	@DisplayName("내가 쓴 글 목록은 내 글만 돌려주고 항목 키가 정확히 일곱이다")
+	@DisplayName("내가 쓴 글 목록은 내 글만 돌려주고 항목 키가 §4.3 의 목록 줄과 같다")
 	void 내가_쓴_글만_돌려준다() throws Exception {
 		for (int i = 0; i < 5; i++) {
 			savedPost(861L, "내글작성자", "내 글 " + i, "본문");
@@ -930,7 +963,7 @@ class PostControllerTest {
 	 * {@code PostServiceTest} 도 본다.
 	 */
 	@Test
-	@DisplayName("본인 글 수정은 200 이고 상세 모양(여덟 키)을 돌려준다")
+	@DisplayName("본인 글 수정은 200 이고 상세 모양을 돌려준다")
 	void 본인_글_수정은_200() throws Exception {
 		Post post = savedPost(741L, "작성자닉네임", "원래 제목", "원래 본문");
 
@@ -1124,6 +1157,336 @@ class PostControllerTest {
 				.isZero();
 	}
 
+	// --- 카테고리 (P-11, sp-docs/requirements/board.md §8, sp-docs/api-contract.md §4.1 §4.4) ---
+	//
+	// sp-docs/plan/phase2-board.md B-19 검증표의 작성·입력·목록 행이다. 수정의 판정 순서와 공지
+	// 권한은 PostServiceTest 가 본다.
+
+	/** B-19 검증표 "{@code category} 없이 작성 → 201, {@code category: FREE}" (§8 의 작성 규칙). */
+	@Test
+	@DisplayName("category 없이 작성하면 201 이고 FREE 다")
+	void category_없이_작성하면_FREE() throws Exception {
+		respondWithActiveProfile(527L);
+
+		MvcResult result = this.mockMvc.perform(post(PATH)
+						.header(HttpHeaders.AUTHORIZATION, bearer(527L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("카테고리 생략", "본문")))
+				.andExpect(status().isCreated())
+				.andExpect(jsonPath("$.data.category").value("FREE"))
+				.andReturn();
+
+		assertThat(this.postRepository.findById(dataId(result)).orElseThrow().getCategory())
+				.isEqualTo(PostCategory.FREE);
+	}
+
+	/**
+	 * B-19 검증표 "USER 가 {@code QNA} 로 작성 → 201, {@code category: QNA}". 공지가 아니면 역할을
+	 * 보지 않는다 (§8).
+	 */
+	@Test
+	@DisplayName("USER 가 QNA 로 작성하면 201 이고 QNA 다")
+	void USER_가_QNA_로_작성하면_201() throws Exception {
+		respondWithActiveProfile(528L);
+
+		MvcResult result = this.mockMvc.perform(post(PATH)
+						.header(HttpHeaders.AUTHORIZATION, bearer(528L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("질문 글", "본문", "QNA")))
+				.andExpect(status().isCreated())
+				.andExpect(jsonPath("$.data.category").value("QNA"))
+				.andReturn();
+
+		assertThat(this.postRepository.findById(dataId(result)).orElseThrow().getCategory())
+				.isEqualTo(PostCategory.QNA);
+	}
+
+	/**
+	 * B-19 검증표 "USER 가 {@code NOTICE} 로 작성 → 403 {@code P003}, 글 0개". 프로필은 활성으로
+	 * 스텁한다 — 거부가 프로필이 아니라 역할 때문인 것을 가르기 위해서다. 역할만 다른 반대
+	 * 조합은 {@link #ADMIN_이_NOTICE_로_작성하면_201()} 이다.
+	 */
+	@Test
+	@DisplayName("USER 가 NOTICE 로 작성하면 403 P003 이고 저장되지 않는다")
+	void USER_가_NOTICE_로_작성하면_403_P003() throws Exception {
+		respondWithActiveProfile(529L);
+
+		this.mockMvc.perform(post(PATH)
+						.header(HttpHeaders.AUTHORIZATION, bearer(529L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("USER 의 공지", "본문", "NOTICE")))
+				.andExpect(status().isForbidden())
+				.andExpect(jsonPath("$.error.code").value("P003"));
+
+		assertThat(rowCount(529L)).isZero();
+	}
+
+	/**
+	 * B-19 검증표 <b>"프로필 없는 USER 가 {@code NOTICE} 로 작성 → 403 {@code P003}
+	 * ({@code S002} 아님), {@code MemberClient} 호출 0회"</b>. 작성은 {@code P003} 을 member
+	 * 호출보다 먼저 판정한다 — 「Claim 만으로 정해지는 거부에 원격 호출을 쓰지 않는다」
+	 * (sp-docs/requirements/board.md §8 의 판정 순서).
+	 *
+	 * <p>스텁은 {@link #프로필_미등록은_403_S002()} 와 같은 응답(200, 결과에서 제외)이다. 그
+	 * 테스트는 member 를 불러 {@code S002} 를 받고, 이 테스트는 부르지 않아 {@code P003} 이다.
+	 * <b>호출 수를 코드와 따로 단언한다</b> — 검증표가 요구한 관측이고, 「원격 호출을 쓰지
+	 * 않는다」 를 거부 코드가 아니라 스텁이 받은 요청으로 직접 본다.
+	 *
+	 * <p><b>판정을 member 호출 뒤로 옮긴 변이에서 빨개진 것은 이 테스트 하나였다</b> (B-19 실측,
+	 * {@code S002} 가 나왔다). 활성 프로필로 스텁한 {@link #USER_가_NOTICE_로_작성하면_403_P003()}
+	 * 은 member 를 부른 뒤에도 {@code P003} 이 나서 녹색이었다. 그 변이에서 순서가 응답에 드러나는
+	 * 것은 member 호출이 예외로 끝날 때다 — 프로필이 없거나 탈퇴했으면 {@code S002}, 그 밖의
+	 * 실패면 {@code S001} 이 {@code P003} 대신 나간다 ({@code MemberClient.findActiveNickname},
+	 * 2026-11-16 코드 읽기).
+	 */
+	@Test
+	@DisplayName("프로필 없는 USER 가 NOTICE 로 작성하면 S002 가 아니라 403 P003 이고 member 호출이 0회다")
+	void 프로필_없는_USER_의_공지_작성은_P003_이고_member_를_부르지_않는다() throws Exception {
+		RESPONDER.set(exchange -> writeResponse(exchange, 200, envelope("")));
+
+		this.mockMvc.perform(post(PATH)
+						.header(HttpHeaders.AUTHORIZATION, bearer(530L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("프로필 없는 공지", "본문", "NOTICE")))
+				.andExpect(status().isForbidden())
+				.andExpect(jsonPath("$.error.code").value("P003"));
+
+		assertThat(REQUEST_COUNT.get())
+				.as("Claim 만으로 정해지는 거부에 원격 호출을 쓰지 않는다 "
+						+ "(sp-docs/requirements/board.md §8)")
+				.isZero();
+		assertThat(rowCount(530L)).isZero();
+	}
+
+	/**
+	 * B-19 검증표 "ADMIN 이 {@code NOTICE} 로 작성 → 201". ADMIN 이 공지로 쓰는 것은 자기 글이다
+	 * (§8 의 "ADMIN 과 남의 글"). {@link #USER_가_NOTICE_로_작성하면_403_P003()} 과 역할만 다르다.
+	 */
+	@Test
+	@DisplayName("ADMIN 이 NOTICE 로 작성하면 201 이고 NOTICE 다")
+	void ADMIN_이_NOTICE_로_작성하면_201() throws Exception {
+		respondWithActiveProfile(531L);
+
+		MvcResult result = this.mockMvc.perform(post(PATH)
+						.header(HttpHeaders.AUTHORIZATION, adminBearer(531L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("관리자 공지", "본문", "NOTICE")))
+				.andExpect(status().isCreated())
+				.andExpect(jsonPath("$.data.category").value("NOTICE"))
+				.andReturn();
+
+		assertThat(this.postRepository.findById(dataId(result)).orElseThrow().getCategory())
+				.isEqualTo(PostCategory.NOTICE);
+	}
+
+	/**
+	 * B-19 검증표 "본문 {@code category: "BOGUS"} → 400 {@code C001}" 의 작성 쪽이다. 본문의
+	 * 잘못된 enum 은 JSON 해석 실패다 (sp-docs/requirements/board.md §4,
+	 * sp-docs/api-contract.md §4.4). 같은 값이 쿼리로 오면
+	 * {@link #쿼리의_잘못된_category_는_400_C002()} 처럼 {@code C002} 다 — 들어온 자리가 코드를
+	 * 가른다 (§4.1).
+	 */
+	@Test
+	@DisplayName("작성 본문의 category 가 BOGUS 면 400 C001 이고 저장되지 않는다")
+	void 작성_본문의_잘못된_category_는_400_C001() throws Exception {
+		respondWithActiveProfile(532L);
+
+		this.mockMvc.perform(post(PATH)
+						.header(HttpHeaders.AUTHORIZATION, bearer(532L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("잘못된 카테고리", "본문", "BOGUS")))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("C001"));
+
+		assertThat(rowCount(532L)).isZero();
+	}
+
+	/** 같은 행의 수정 쪽이다 — §4.4 가 작성·수정 본문을 함께 정한다. 글이 그대로다. */
+	@Test
+	@DisplayName("수정 본문의 category 가 BOGUS 면 400 C001 이고 글이 그대로다")
+	void 수정_본문의_잘못된_category_는_400_C001() throws Exception {
+		Post post = savedPost(755L, "작성자닉네임", "원래 제목", "원래 본문");
+
+		this.mockMvc.perform(put(PATH + "/" + post.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(755L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("바뀐 제목", "바뀐 본문", "BOGUS")))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("C001"));
+
+		Post saved = this.postRepository.findById(post.getId()).orElseThrow();
+		assertThat(saved.getTitle()).isEqualTo("원래 제목");
+		assertThat(saved.getCategory()).isEqualTo(PostCategory.FREE);
+	}
+
+	/**
+	 * 본문의 {@code category} 가 <b>숫자</b>여도 400 {@code C001} 이다 — 따옴표 없는 {@code 1} 도,
+	 * 따옴표 친 {@code "2"} 도. 본문의 {@code category} 는 {@code NOTICE}·{@code FREE}·{@code QNA}
+	 * 중 하나이거나 생략이고, 잘못된 값은 JSON 해석 실패라 400 {@code C001} 이다
+	 * (sp-docs/requirements/board.md §4, sp-docs/api-contract.md §4.4).
+	 *
+	 * <p><b>막는 것은 {@code application.yml} 의
+	 * {@code spring.jackson.deserialization.fail-on-numbers-for-enums} 다.</b> 이 테스트는 test
+	 * 프로필의 컨텍스트에서 그 설정이 적용된 응답을 본다 — 그 키를 지우거나 {@code false} 로 바꾸면
+	 * 이 테스트와 {@link #수정_본문의_숫자_category_는_400_C001(String)} 이 값마다 빨개졌다(작성 201,
+	 * 수정 200. 2026-11-16 실측).
+	 */
+	@ParameterizedTest
+	@ValueSource(strings = {"1", "\"2\""})
+	@DisplayName("작성 본문의 category 가 숫자(1 · \"2\")면 400 C001 이고 저장되지 않는다")
+	void 작성_본문의_숫자_category_는_400_C001(String rawCategory) throws Exception {
+		respondWithActiveProfile(533L);
+
+		this.mockMvc.perform(post(PATH)
+						.header(HttpHeaders.AUTHORIZATION, bearer(533L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(bodyWithRawCategory("숫자 카테고리", "본문", rawCategory)))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("C001"));
+
+		assertThat(rowCount(533L)).isZero();
+	}
+
+	/**
+	 * {@link #작성_본문의_숫자_category_는_400_C001(String)} 의 수정 쪽이다 — §4.4 가 작성·수정 본문을
+	 * 함께 정한다.
+	 *
+	 * <p>글은 <b>ADMIN 자신의 {@code NOTICE} 글</b>이다. 2026-11-16 의 {@link PostCategory} 선언
+	 * 순서에서 서수 1·2 는 {@code FREE}·{@code QNA} 라 둘 다 지금 값과 다르고, ADMIN 은 자기 글을
+	 * 공지에서 뺄 수 있다 (sp-docs/requirements/board.md §8). 숫자를 받아들이는 것은 상태 단언이
+	 * 잡는다. 제목·카테고리 단언은 400 인데 글이 바뀐 경우를 본다 — 작성자가 USER 면 공지에서 빼는
+	 * 수정이 403 {@code P003} 이라 그 단언이 가를 것이 없다.
+	 */
+	@ParameterizedTest
+	@ValueSource(strings = {"1", "\"2\""})
+	@DisplayName("수정 본문의 category 가 숫자(1 · \"2\")면 400 C001 이고 글이 그대로다")
+	void 수정_본문의_숫자_category_는_400_C001(String rawCategory) throws Exception {
+		Post post = savedPost(756L, PostCategory.NOTICE, "관리자닉네임", "원래 공지");
+
+		this.mockMvc.perform(put(PATH + "/" + post.getId())
+						.header(HttpHeaders.AUTHORIZATION, adminBearer(756L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(bodyWithRawCategory("바뀐 제목", "바뀐 본문", rawCategory)))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("C001"));
+
+		Post saved = this.postRepository.findById(post.getId()).orElseThrow();
+		assertThat(saved.getTitle()).isEqualTo("원래 공지");
+		assertThat(saved.getCategory()).isEqualTo(PostCategory.NOTICE);
+	}
+
+	/**
+	 * B-19 검증표 "쿼리 {@code category=BOGUS} → 400 {@code C002}". enum 바인딩의 실패이고
+	 * ({@code MethodArgumentTypeMismatchException}, sp-docs/conventions.md §6.1) {@code sort} 의
+	 * 잘못된 값과 같은 길이다 (sp-docs/api-contract.md §4.1).
+	 */
+	@Test
+	@DisplayName("목록 쿼리의 category 가 BOGUS 면 400 C002 다")
+	void 쿼리의_잘못된_category_는_400_C002() throws Exception {
+		this.mockMvc.perform(get(PATH).param("category", "BOGUS"))
+				.andExpect(status().isBadRequest())
+				.andExpect(jsonPath("$.error.code").value("C002"));
+	}
+
+	/**
+	 * B-19 검증표 "{@code category=NOTICE} + 검색 + 정렬 → 세 조건이 AND 로 걸린다" 의 HTTP
+	 * 쪽이다 — <b>쿼리 파라미터가 조건에 닿는지</b>를 본다. 같은 작성자의 {@code FREE} 글이
+	 * 있으므로 핸들러가 {@code category} 를 넘기지 않으면 그 글이 섞이고, 다른 작성자의 공지가
+	 * 있으므로 검색 조건이 빠지면 그 글이 섞인다. 정렬은 저장 순서와 조회수 순서를 어긋나게
+	 * 두어 순서로 본다 — {@code latest} 로 나오면 단언이 깨진다.
+	 *
+	 * <p>건수 쿼리까지 AND 인지는 꽉 찬 페이지와 각 조건이 배제하는 행이 있어야 관측되고
+	 * (sp-docs/process/review-policy.md §4.1), 그것은
+	 * {@code PostQueryRepositoryTest.카테고리는_검색_정렬과_AND_로_걸린다()} 가 본다. 그쪽은
+	 * 핸들러를 지나지 않으므로 이 테스트를 대신하지 않는다 — 핸들러가 {@code category} 대신
+	 * {@code null} 을 넘기는 변이에서 빨개진 것은 이 테스트 하나였다 (B-19 실측).
+	 *
+	 * <p><b>항목의 {@code category}·{@code likeCount} 값도 여기서 본다</b> —
+	 * {@link #LIST_ITEM_KEYS} 대조는 키만 본다. {@code like_count} 는 '공지 조회수 1' 한 행만 2 로
+	 * 두어 0 이 아니고 그 행의 {@code comment_count}(0)·{@code view_count}(1)와도 다르게 한다.
+	 * {@code PostResponse} 가 {@code category} 를 {@code FREE} 로 고정한 변이와 {@code likeCount}
+	 * 자리에 {@code commentCount} 를 실은 변이가 B-19 1라운드 리뷰에서 녹색이었고, 이 단언들을 더한
+	 * 뒤로는 각각 이 테스트에서 빨개진다 (2026-11-16 실측).
+	 */
+	@Test
+	@DisplayName("목록의 category=NOTICE 는 검색·정렬과 함께 걸리고 항목은 그 글의 category·likeCount 를 싣는다")
+	void 목록의_category_는_검색_정렬과_함께_걸린다() throws Exception {
+		withViewCount(savedPost(628L, PostCategory.NOTICE, "공지필터작성자", "공지 조회수 2"), 2);
+		Post likedNotice = savedPost(628L, PostCategory.NOTICE, "공지필터작성자", "공지 조회수 1");
+		withViewCount(likedNotice, 1);
+		withLikeCount(likedNotice, 2);
+		withViewCount(savedPost(628L, PostCategory.FREE, "공지필터작성자", "자유 조회수 3"), 3);
+		withViewCount(savedPost(629L, PostCategory.NOTICE, "다른공지작성자", "다른 작성자의 공지"), 4);
+
+		MvcResult result = this.mockMvc.perform(get(PATH)
+						.param("category", "NOTICE")
+						.param("searchType", "WRITER")
+						.param("keyword", "공지필터작성자")
+						.param("sort", "views"))
+				.andExpect(status().isOk())
+				.andReturn();
+
+		assertThat(itemTitles(result))
+				.as("세 조건이 함께 걸린다 — 자유 글·다른 작성자의 공지가 섞이면 조건이 빠진 것이고, "
+						+ "나중에 저장한 '공지 조회수 1' 이 앞이면 정렬이 latest 로 떨어진 것이다")
+				.containsExactly("공지 조회수 2", "공지 조회수 1");
+		assertThat(itemCategories(result))
+				.as("항목의 category 는 그 글의 값이다 — NOTICE 로 걸렀으니 전부 NOTICE 다 (§4.3)")
+				.containsOnly("NOTICE");
+		assertThat(itemLikeCounts(result))
+				.as("항목의 likeCount 는 post.like_count 다 (§4.3) — '공지 조회수 1' 만 2 로 두었다")
+				.containsExactly(0, 2);
+	}
+
+	/**
+	 * B-19 검증표 "{@code category} 없는 목록 → 공지가 들어 있다". 생략은 <b>모든 카테고리</b>이고
+	 * 기본값이 없다 (§8 의 목록 필터, sp-docs/api-contract.md §4.1). 세 카테고리를 다 두어 어느
+	 * 하나로 기본값을 채우는 어긋남이 모두 보이게 한다.
+	 */
+	@Test
+	@DisplayName("category 없는 목록에는 공지를 포함한 모든 카테고리가 들어 있다")
+	void category_없는_목록에는_공지가_들어_있다() throws Exception {
+		savedPost(630L, PostCategory.NOTICE, "전체카테고리작성자", "전체 중 공지");
+		savedPost(630L, PostCategory.FREE, "전체카테고리작성자", "전체 중 자유");
+		savedPost(630L, PostCategory.QNA, "전체카테고리작성자", "전체 중 질문");
+
+		MvcResult result = this.mockMvc.perform(get(PATH)
+						.param("searchType", "WRITER")
+						.param("keyword", "전체카테고리작성자"))
+				.andExpect(status().isOk())
+				.andReturn();
+
+		assertThat(itemTitles(result))
+				.containsExactlyInAnyOrder("전체 중 공지", "전체 중 자유", "전체 중 질문");
+		List<String> titles = itemTitles(result);
+		List<String> categories = itemCategories(result);
+		assertThat(java.util.stream.IntStream.range(0, titles.size())
+						.mapToObj(i -> titles.get(i) + "=" + categories.get(i)).toList())
+				.as("항목의 category 는 그 글의 값이다 (§4.3) — 세 카테고리가 섞여 있어 상수로는 맞출 수 없다")
+				.containsExactlyInAnyOrder("전체 중 공지=NOTICE", "전체 중 자유=FREE", "전체 중 질문=QNA");
+	}
+
+	/**
+	 * B-19 완료 기준 "{@code GET /posts/me} 에는 이 필터를 두지 않는다" (sp-docs/api-contract.md
+	 * §4.1, sp-docs/requirements/board.md §8). 자기 {@code FREE} 글 하나를 두고
+	 * {@code category=NOTICE} 를 붙여 부른다 — 핸들러가 그 파라미터를 받아 걸면 글이 빠진다.
+	 * {@link #writerId_파라미터는_무시된다()} 와 같이 Spring 이 선언되지 않은 파라미터를 무시하는
+	 * 것에 기댄다.
+	 */
+	@Test
+	@DisplayName("내가 쓴 글 목록은 category 파라미터를 걸지 않는다")
+	void 내_글_목록은_category_를_걸지_않는다() throws Exception {
+		savedPost(869L, PostCategory.FREE, "내글카테고리작성자", "내 자유 글");
+
+		MvcResult result = this.mockMvc.perform(get(PATH + "/me")
+						.param("category", "NOTICE")
+						.header(HttpHeaders.AUTHORIZATION, bearer(869L)))
+				.andExpect(status().isOk())
+				.andReturn();
+
+		assertThat(itemTitles(result)).containsExactly("내 자유 글");
+	}
+
 	// --- 헬퍼 ---
 
 	private void assertCreateFails(
@@ -1148,6 +1511,20 @@ class PostControllerTest {
 		return "{\"title\":%s,\"content\":%s}".formatted(quote(title), quote(content));
 	}
 
+	/** {@code category} 를 실은 본문. 값은 enum 밖의 문자열도 받는다 — 잘못된 값의 케이스다. */
+	private static String body(String title, String content, String category) {
+		return bodyWithRawCategory(title, content, quote(category));
+	}
+
+	/**
+	 * {@code category} 자리에 JSON 값을 감싸지 않고 그대로 싣는 본문. 따옴표 없는 숫자
+	 * ({@code 1})와 따옴표 친 숫자({@code "2"})를 따로 보내려고 둔다.
+	 */
+	private static String bodyWithRawCategory(String title, String content, String rawCategory) {
+		return "{\"title\":%s,\"content\":%s,\"category\":%s}".formatted(
+				quote(title), quote(content), rawCategory);
+	}
+
 	/** JSON 문자열 리터럴로 감싼다. 제목에 공백·따옴표가 들어가는 케이스가 있다. */
 	private static String quote(String value) {
 		return "\"" + value.replace("\\", "\\\\").replace("\"", "\\\"") + "\"";
@@ -1158,8 +1535,9 @@ class PostControllerTest {
 	}
 
 	/**
-	 * {@code role = ADMIN} 토큰 (sp-docs/api-contract.md §6). ADMIN 은 <b>삭제만</b> 할 수
-	 * 있으므로 수정·삭제 두 쪽에서 쓰인다 (sp-docs/security.md §5.2).
+	 * {@code role = ADMIN} 토큰 (sp-docs/api-contract.md §6). ADMIN 이라서 열리는 것과 ADMIN
+	 * 이어도 닫히는 것을 함께 보는 데 쓴다 (sp-docs/security.md §5.2) — 예: 타인 글의 삭제는
+	 * 열리고 수정은 닫힌다.
 	 */
 	private static String adminBearer(long accountId) {
 		return "Bearer " + TestTokenFactory.accessToken(accountId, ROLE_ADMIN);
@@ -1174,6 +1552,17 @@ class PostControllerTest {
 				.build());
 	}
 
+	/** 카테고리를 정해 둔 글. 목록 필터의 픽스처다. */
+	private Post savedPost(long writerId, PostCategory category, String nickname, String title) {
+		return this.postRepository.saveAndFlush(Post.builder()
+				.writerId(writerId)
+				.writerNickname(nickname)
+				.title(title)
+				.content("본문")
+				.category(category)
+				.build());
+	}
+
 	/**
 	 * 조회수를 박는다. {@code view_count} 기본값이 0 이라 손대지 않으면 전체가 동률이고
 	 * {@code sort=views} 가 적용됐는지 관측되지 않는다 (sp-docs/api-contract.md §7.1).
@@ -1183,6 +1572,26 @@ class PostControllerTest {
 			post.increaseViewCount();
 		}
 		this.postRepository.saveAndFlush(post);
+	}
+
+	/**
+	 * 좋아요 수를 박는다. 좁은 UPDATE({@link PostRepository#increaseLikeCount})를 자기 트랜잭션으로
+	 * 커밋하고, 영향 행이 1 이 아니면 그 자리에서 터진다 — 픽스처가 만들어지지 않은 것을 단언
+	 * 실패와 가른다.
+	 *
+	 * <p>이 문장은 엔티티를 지나지 않으므로 손에 든 {@code Post} 는 증가 전 {@code likeCount} 를
+	 * 들고 있다 — 그 객체를 이 뒤에 다시 저장하지 않는다. {@link #withViewCount} 가 그렇게
+	 * 저장하므로 함께 쓸 때는 그것을 먼저 부른다.
+	 */
+	private void withLikeCount(Post post, int times) {
+		TransactionTemplate transaction = new TransactionTemplate(this.transactionManager);
+		for (int i = 0; i < times; i++) {
+			Integer updated = transaction.execute(
+					status -> this.postRepository.increaseLikeCount(post.getId()));
+			if (updated == null || updated != 1) {
+				throw new IllegalStateException("like_count 의 좁은 UPDATE 가 1 행이 아니다: " + updated);
+			}
+		}
 	}
 
 	private int rowCount(long writerId) {
@@ -1213,6 +1622,20 @@ class PostControllerTest {
 	 */
 	private static List<String> itemTitles(MvcResult result) throws Exception {
 		return JsonPath.read(bodyOf(result), "$.data.content[*].title");
+	}
+
+	/** 목록 항목의 {@code category} 를 응답 순서대로 읽는다. */
+	private static List<String> itemCategories(MvcResult result) throws Exception {
+		return JsonPath.read(bodyOf(result), "$.data.content[*].category");
+	}
+
+	/**
+	 * 목록 항목의 {@code likeCount} 를 응답 순서대로 읽는다. JSON 숫자가 어느 자바 타입으로
+	 * 읽히는지에 기대지 않으려고 {@code int} 로 맞춘다.
+	 */
+	private static List<Integer> itemLikeCounts(MvcResult result) throws Exception {
+		List<Number> likeCounts = JsonPath.read(bodyOf(result), "$.data.content[*].likeCount");
+		return likeCounts.stream().map(Number::intValue).toList();
 	}
 
 	private static long dataId(MvcResult result) throws Exception {

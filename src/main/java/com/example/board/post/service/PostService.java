@@ -13,6 +13,7 @@ import com.example.board.post.dto.PostResponse;
 import com.example.board.post.dto.PostSearchCondition;
 import com.example.board.post.dto.PostUpdateRequest;
 import com.example.board.post.entity.Post;
+import com.example.board.post.entity.PostCategory;
 import com.example.board.post.repository.PostQueryRepository;
 import com.example.board.post.repository.PostRepository;
 import com.example.board.post.support.PostReader;
@@ -22,8 +23,8 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * 게시글 쓰기·조회. 정본: sp-docs/requirements/board.md §1 (P-01 ~ P-07) §3 §3.0 §5 §6 §7,
- * sp-docs/api-contract.md §4 §4.1 §4.2 §4.3 §5.1, sp-docs/security.md §5.
+ * 게시글 쓰기·조회. 정본: sp-docs/requirements/board.md §1 §3 §3.0 §5 §6 §7 §8,
+ * sp-docs/api-contract.md §4 §4.1 §4.2 §4.3 §4.4 §5.1, sp-docs/security.md §5.
  *
  * <p>트랜잭션 경계는 서비스에 둔다 (sp-docs/conventions.md §5).
  *
@@ -79,7 +80,13 @@ public class PostService {
 	 * (sp-docs/requirements/board.md §3 규칙 8). sp-docs/architecture.md §5 가 트랜잭션 안의
 	 * 원격 호출을 금지한다: DB 커넥션이 member 의 네트워크 지연만큼 점유된다.
 	 *
-	 * <p>{@code writer_id} 는 <b>검증된 JWT 의 {@code sub}</b>({@code accountId} 파라미터),
+	 * <p><b>공지 권한(403 {@code P003})은 그 조회보다 먼저 판정한다</b>
+	 * (sp-docs/requirements/board.md §8 의 판정 순서). 「Claim 만으로 정해지는 거부에 원격
+	 * 호출을 쓰지 않는다」 — 그래서 프로필이 없는 USER 가 공지로 쓰면 {@code S002} 가 아니라
+	 * {@code P003} 이고 {@code MemberClient} 를 부르지 않는다. 카테고리를 생략하면
+	 * {@code FREE} 이므로 판정할 것이 없다 — 그 기본값은 {@code Post} 의 생성자가 채운다.
+	 *
+	 * <p>{@code writer_id} 는 <b>검증된 JWT 의 {@code sub}</b>({@code loginMember.accountId()}),
 	 * {@code writer_nickname} 은 <b>{@code MemberClient} 응답</b>에서만 온다 (§3 규칙 1·2).
 	 * JWT Claim 에 {@code nickname} 이 없기 때문이다 (sp-docs/adr/0012 §3). <b>조회 키도 그
 	 * {@code sub} 다</b> — 요청 본문의 {@code writerId} 로 조회하지 않는다 (§3 규칙 3).
@@ -94,19 +101,25 @@ public class PostService {
 	 * 것이고, "탈퇴 후 작성 불가" 는 보장이 아니라 통상 동작이다
 	 * (sp-docs/requirements/board.md §3.0).
 	 *
-	 * @param accountId 검증된 JWT 의 {@code sub}
+	 * @param loginMember 검증된 JWT 의 {@code sub}·{@code role}
 	 */
-	public PostDetailResponse create(Long accountId, PostCreateRequest request) {
+	public PostDetailResponse create(LoginMember loginMember, PostCreateRequest request) {
+		// 0) Claim 만으로 정해지는 거부라 원격 호출보다 먼저다 (§8)
+		if (request.category() == PostCategory.NOTICE) {
+			validateNoticeRole(loginMember);
+		}
+
 		// 1) 트랜잭션 밖. 실패하면 아래로 내려가지 않으므로 BEGIN 자체가 일어나지 않는다
-		String writerNickname = this.memberClient.findActiveNickname(accountId);
+		String writerNickname = this.memberClient.findActiveNickname(loginMember.accountId());
 
 		// 2) BEGIN -> INSERT -> COMMIT
 		Post saved = this.insertTransaction.execute(status -> this.postRepository.saveAndFlush(
 				Post.builder()
-						.writerId(accountId)
+						.writerId(loginMember.accountId())
 						.writerNickname(writerNickname)
 						.title(request.title())
 						.content(request.content())
+						.category(request.category())
 						.build()));
 
 		return PostDetailResponse.from(saved);
@@ -213,13 +226,24 @@ public class PostService {
 	 * 열려 있어 존재 여부는 이미 공개 정보이고 (§4.2), 403 을 먼저 내보내면 공개 조회와
 	 * 어긋난 두 답이 나간다. <b>비공개 자원이라면 반대가 맞다</b> — 1차의 board 에는 그런
 	 * 자원이 없다 (§4.4).
+	 *
+	 * <p><b>공지 권한(403 {@code P003})은 소유권 다음이다</b> — 404 {@code P001} → 403
+	 * {@code P002} → 403 {@code P003} (sp-docs/requirements/board.md §8 의 판정 순서). 그래서
+	 * 남의 글을 공지로 바꾸려는 요청은 ADMIN 이어도 {@code P002} 다 (§8 의 "ADMIN 과 남의 글").
+	 * 판정은 카테고리가 {@code NOTICE} 로 바뀌거나 {@code NOTICE} 에서 바뀔 때만 하고, 바뀌지
+	 * 않는 수정(생략하거나 같은 값)은 거치지 않는다 (§8) — 그 조건이 {@link #movesNotice} 다.
+	 * 생략하면 지금 값을 유지하는 것은 {@code Post.changeCategory} 가 집행한다.
 	 */
 	@Transactional
 	public PostDetailResponse update(Long id, LoginMember loginMember, PostUpdateRequest request) {
 		Post post = this.postReader.getActiveById(id);
 		validateWriter(post, loginMember);
+		if (movesNotice(post.getCategory(), request.category())) {
+			validateNoticeRole(loginMember);
+		}
 
 		post.update(request.title(), request.content());
+		post.changeCategory(request.category());
 
 		return PostDetailResponse.from(post);
 	}
@@ -286,6 +310,36 @@ public class PostService {
 			return;
 		}
 		validateWriter(post, loginMember);
+	}
+
+	/**
+	 * 공지 권한. <b>{@code role} 이 {@code ADMIN} 과 같을 때만 허용한다</b> — 새 ADMIN 판정을
+	 * 그 모양으로 적는다 (sp-docs/security.md §5.1). 권한은 §5.2 매트릭스의 공지 줄이 정하고
+	 * 규칙은 sp-docs/requirements/board.md §8 이다.
+	 *
+	 * <p>판정은 검증된 JWT 의 {@code role} 만으로 한다 — {@link #validateWriterOrAdmin} 와 같이
+	 * 권한을 다른 서비스에 되묻지 않는다 (sp-docs/requirements/board.md §7).
+	 * {@code P002}("남의 글")와 다른 것을 말한다 — {@code P003} 은 "자기 글이지만 공지를 다룰
+	 * 역할이 아니다" 다 (§8).
+	 */
+	private static void validateNoticeRole(LoginMember loginMember) {
+		if (!ContractRole.ADMIN.equals(loginMember.role())) {
+			throw new BusinessException(ErrorCode.NOTICE_FORBIDDEN);
+		}
+	}
+
+	/**
+	 * 수정이 공지를 다루는가 — 카테고리가 {@code NOTICE} 로 바뀌거나 {@code NOTICE} 에서 다른
+	 * 값으로 바뀌는가 (sp-docs/requirements/board.md §8 의 "공지 권한 — 수정").
+	 *
+	 * <p>생략({@code null})과 같은 값은 바뀌지 않는 수정이라 {@code false} 다. 공지와 무관한 변경
+	 * ({@code FREE}·{@code QNA} 사이)도 {@code false} 다 — USER 가 할 수 있다.
+	 */
+	private static boolean movesNotice(PostCategory current, PostCategory requested) {
+		if (requested == null || requested == current) {
+			return false;
+		}
+		return requested == PostCategory.NOTICE || current == PostCategory.NOTICE;
 	}
 
 }

@@ -11,6 +11,7 @@ import com.example.board.post.dto.PostSearchCondition;
 import com.example.board.post.dto.PostSortType;
 import com.example.board.post.dto.PostUpdateRequest;
 import com.example.board.post.dto.SearchType;
+import com.example.board.post.entity.PostCategory;
 import com.example.board.post.service.PostService;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Min;
@@ -45,9 +46,11 @@ public class PostController {
 	/**
 	 * 게시글 작성. <b>201</b> 이다 (sp-docs/api-contract.md §4).
 	 *
-	 * <p>{@code accountId} 는 {@code @CurrentMember} 가 검증된 JWT 의 {@code sub} 에서 꺼낸
-	 * 것이다. <b>요청 본문에서 받지 않는다</b> (sp-docs/requirements/board.md §3 규칙 1) —
-	 * {@link PostCreateRequest} 에 그 필드가 없다.
+	 * <p>{@code loginMember} 는 {@code @CurrentMember} 가 검증된 JWT 의 {@code sub}·{@code role}
+	 * 에서 꺼낸 것이다. <b>요청 본문에서 받지 않는다</b>
+	 * (sp-docs/requirements/board.md §3 규칙 1) — {@link PostCreateRequest} 에 그 필드가 없다.
+	 * {@code role} 은 공지 권한(403 {@code P003}) 판정에 쓰이고 그 판정은 {@code PostService}
+	 * 가 한다 (sp-docs/requirements/board.md §8).
 	 */
 	@PostMapping
 	@ResponseStatus(HttpStatus.CREATED)
@@ -55,7 +58,7 @@ public class PostController {
 			@CurrentMember LoginMember loginMember,
 			@Valid @RequestBody PostCreateRequest request) {
 
-		return ApiResponse.success(this.postService.create(loginMember.accountId(), request));
+		return ApiResponse.success(this.postService.create(loginMember, request));
 	}
 
 	/**
@@ -81,11 +84,12 @@ public class PostController {
 	 * <p>{@code Integer} 에 {@code required = false} 이므로 미전달이면 {@code null} 이고 Bean
 	 * Validation 은 {@code null} 을 건너뛴다. 기본값 채우기는 그대로 레코드가 한다.
 	 *
-	 * <p>{@code sort}·{@code searchType} 이 화이트리스트 밖이면 바인딩이 실패해 400 이 된다
-	 * ({@code C002}, sp-docs/conventions.md §6.1). {@code searchType} 만 오고
-	 * {@code keyword} 가 없으면 {@link PostSearchCondition} 이 400 {@code C001} 로 만든다 —
-	 * 그쪽은 <b>요청 수준</b> 오류라 {@code fieldErrors} 가 빈 배열이고 (§4.1) 하한 위반과
-	 * 갈린다.
+	 * <p>{@code sort}·{@code searchType}·{@code category} 가 화이트리스트 밖이면 바인딩이 실패해
+	 * 400 이 된다 ({@code C002}, sp-docs/conventions.md §6.1, sp-docs/api-contract.md §4.1). 같은
+	 * {@code category} 가 작성·수정 <b>본문</b>에 오면 JSON 해석 실패라 {@code C001} 이다 (§4.4).
+	 * {@code searchType} 만 오고 {@code keyword} 가 없으면 {@link PostSearchCondition} 이 400
+	 * {@code C001} 로 만든다 — 그쪽은 <b>요청 수준</b> 오류라 {@code fieldErrors} 가 빈 배열이고
+	 * (§4.1) 하한 위반과 갈린다.
 	 */
 	@GetMapping
 	public ApiResponse<PageResponse<PostResponse>> getList(
@@ -93,10 +97,11 @@ public class PostController {
 			@RequestParam(required = false) @Min(PostSearchCondition.MIN_SIZE) Integer size,
 			@RequestParam(required = false) PostSortType sort,
 			@RequestParam(required = false) SearchType searchType,
-			@RequestParam(required = false) String keyword) {
+			@RequestParam(required = false) String keyword,
+			@RequestParam(required = false) PostCategory category) {
 
 		return ApiResponse.success(this.postService.getList(
-				PostSearchCondition.of(page, size, sort, searchType, keyword)));
+				PostSearchCondition.of(page, size, sort, searchType, keyword, category)));
 	}
 
 	/**
@@ -104,8 +109,9 @@ public class PostController {
 	 * §7.1 의 페이징 형식이고 항목은 §4.3 의 <b>목록 모양</b>이다 — 목록과 같다.
 	 *
 	 * <p><b>{@code page}·{@code size}·{@code sort} 만 받는다</b> (§4.1).
-	 * {@code searchType}·{@code keyword} 는 없다 — P-08 이 "{@code writer_id} 기준 페이징" 만
-	 * 요구한다 (sp-docs/requirements/board.md §1). <b>{@code writerId} 도 받지 않는다</b> —
+	 * {@code searchType}·{@code keyword}·{@code category} 는 없다 — P-08 이
+	 * "{@code writer_id} 기준 페이징" 만 요구한다 (sp-docs/requirements/board.md §1 §8).
+	 * <b>{@code writerId} 도 받지 않는다</b> —
 	 * 조회 키는 {@code @CurrentMember} 가 검증된 JWT 의 {@code sub} 에서 꺼낸 것뿐이다
 	 * (§4.1, sp-docs/requirements/board.md §3 규칙 3).
 	 *
@@ -134,7 +140,7 @@ public class PostController {
 
 		return ApiResponse.success(this.postService.getMyPosts(
 				loginMember.accountId(),
-				PostSearchCondition.of(page, size, sort, null, null)));
+				PostSearchCondition.of(page, size, sort, null, null, null)));
 	}
 
 	/**
@@ -160,7 +166,8 @@ public class PostController {
 	 *
 	 * <p>{@code loginMember} 는 {@code @CurrentMember} 가 검증된 JWT 에서 꺼낸 것이다. 수정
 	 * 대상의 작성자와 비교할 값이므로 요청 본문·경로에서 받지 않는다
-	 * (sp-docs/requirements/board.md §3 규칙 1).
+	 * (sp-docs/requirements/board.md §3 규칙 1). 그 {@code role} 은 공지를 다루는 수정의 권한
+	 * (403 {@code P003})에도 쓰이고, 그 판정도 서비스에 있다 (sp-docs/requirements/board.md §8).
 	 */
 	@PutMapping("/{id}")
 	public ApiResponse<PostDetailResponse> update(

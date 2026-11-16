@@ -1,10 +1,11 @@
 package com.example.board.post.dto;
 
 import com.example.board.post.entity.Post;
+import com.example.board.post.entity.PostCategory;
 import java.time.LocalDateTime;
 
 /**
- * 게시글 <b>목록 항목</b>. 정본: sp-docs/api-contract.md §4.3 §9.3 — 일곱 키다.
+ * 게시글 <b>목록 항목</b>. 정본: sp-docs/api-contract.md §4.3 의 목록 줄과 §9.3 의 예시.
  *
  * <p>선언 순서가 곧 JSON 키 순서다. §9.3 의 예시와 같은 순서로 둔다.
  *
@@ -18,15 +19,19 @@ import java.time.LocalDateTime;
  *
  * <p>목록(B-06)과 내가 쓴 글(B-09)이 같은 모양을 쓴다 (§4.3).
  *
+ * @param category {@link PostCategory} 의 이름으로 나간다 (§4.3)
+ * @param likeCount {@code post.like_count} 그대로다 (§4.3)
  * @param createdAt 오프셋을 표기하지 않는다 (sp-docs/tech-stack.md §6)
  */
 public record PostResponse(
 		Long id,
 		String title,
+		PostCategory category,
 		Long writerId,
 		String writerNickname,
 		long viewCount,
 		int commentCount,
+		int likeCount,
 		LocalDateTime createdAt
 ) {
 
@@ -34,10 +39,12 @@ public record PostResponse(
 		return new PostResponse(
 				post.getId(),
 				post.getTitle(),
+				post.getCategory(),
 				post.getWriterId(),
 				post.getWriterNickname(),
 				post.getViewCount(),
 				post.getCommentCount(),
+				post.getLikeCount(),
 				post.getCreatedAt()
 		);
 	}
