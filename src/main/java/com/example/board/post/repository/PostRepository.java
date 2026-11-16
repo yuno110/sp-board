@@ -137,10 +137,12 @@ public interface PostRepository extends JpaRepository<Post, Long> {
 	 *
 	 * <p><b>{@code clearAutomatically} 를 켠다.</b> 부르는 쪽이 이 문장 다음에 {@code post} 를
 	 * 다시 읽는다 — 응답의 {@code likeCount} 는 쓴 뒤(되돌렸으면 되돌린 뒤) 읽은 값이다 (§6.1).
-	 * 이 문장은 엔티티를 지나지 않으므로 영속성 컨텍스트에 남은 사본은 증가 전 값을 들고 있고,
-	 * 비우지 않으면 다시 읽기가 그 사본을 돌려줄 수 있다 — {@link #increaseViewCount} 를 끈
-	 * 상태로 측정한 결함과 같은 모양이다 (sp-docs/plan/phase1.md §6 B-11). 응답 값으로 이 설정을
-	 * 관측하는 것은 그 응답을 만드는 항목이다 (sp-docs/plan/phase2-board.md B-14).
+	 * 이 문장은 엔티티를 지나지 않으므로, 부르는 쪽이 이 문장 앞에 글을 읽어 두었다면 그 사본은 증가
+	 * 전 값을 들고 있고 비우지 않으면 다시 읽기가 그 사본을 돌려줄 수 있다 — {@link #increaseViewCount}
+	 * 를 끈 상태로 측정한 결함과 같은 모양이다 (sp-docs/plan/phase1.md §6 B-11). <b>2026-11-16 의
+	 * 좋아요(B-20)는 이 문장 앞에 글을 읽지 않아 남는 사본이 없다</b> — 비우기만 끈 변이에서 좋아요
+	 * 테스트가 녹색이었다(B-20 실측). 지금 응답을 지키는 것은 그 순서이고, 이 설정은 순서가 깨질 때의
+	 * 방어다.
 	 *
 	 * <p><b>{@code flushAutomatically} 도 켠다.</b> 비우기는 내보내지 않은 변경을 버린다. 먼저
 	 * 내보내야 부르는 쪽이 이 문장 앞에 남긴 쓰기가 비우기에 조용히 사라지지 않는다.
