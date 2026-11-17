@@ -1541,7 +1541,7 @@ class PostServiceTest {
 			Thread 작성 = new Thread(() -> {
 				try {
 					this.commentService.create(postId, 끼워넣기_대역,
-							new CommentCreateRequest("끼워넣은 댓글"));
+							new CommentCreateRequest("끼워넣은 댓글", null));
 				}
 				catch (Throwable ex) {
 					실패.set(ex);
@@ -1731,7 +1731,7 @@ class PostServiceTest {
 			Post post = 게시글을_만든다();
 			끼워넣기 기록 = 다음_post_UPDATE_직전에_끼운다(post.getId(), "comment_count", 1,
 					() -> this.commentService.create(post.getId(), 댓글_작성자,
-							new CommentCreateRequest("끼워넣은 댓글")));
+							new CommentCreateRequest("끼워넣은 댓글", null)));
 
 			this.postService.update(
 					post.getId(), user(작성자), new PostUpdateRequest("바뀐 제목", "바뀐 본문", null));

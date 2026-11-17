@@ -26,6 +26,7 @@ import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.LocalDateTime;
+import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.Executors;
@@ -34,6 +35,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.CsvSource;
@@ -57,8 +59,8 @@ import org.springframework.test.web.servlet.ResultMatcher;
  * 집계·목록 순서는 {@link com.example.board.comment.service.CommentServiceTest} 가 본다.
  *
  * <p>정본은 sp-docs/api-contract.md §4 (경로·성공 코드) §4.2 §4.4 (404 와 403 의 선후) §4.5
- * (응답의 한 모양) §5 §5.1 (실패 판정) §8.3 (에러 코드), 권한은 sp-docs/security.md §5.2,
- * 입력 검증은 sp-docs/requirements/board.md §4 다.
+ * (댓글의 모양과 목록의 최상위 항목) §5 §5.1 (실패 판정) §8.3 (에러 코드), 권한은
+ * sp-docs/security.md §5.2, 입력 검증은 sp-docs/requirements/board.md §4 다.
  *
  * <p><b>실제 {@link MemberClient} 를 쓰고 member 의 응답만 스텁 서버로 흉내 낸다.</b> 검증표의
  * 네 줄(프로필 미등록 · 탈퇴 · 타임아웃 · 404)이 서로 다른 것은 <b>member 가 돌려준 응답</b>
@@ -73,6 +75,8 @@ import org.springframework.test.web.servlet.ResultMatcher;
  * 보므로 (sp-docs/tech-stack.md §5.3) 이미 쓰이는 대역과 겹치지 않게 둔다. 이 클래스는 롤백에
  * 기대지 않고 커밋하므로 {@code @AfterEach} 가 자기 대역만 지운다 —
  * {@code comment.post_id} 에 FK 가 있으므로 ({@code fk_comment_post_id}) 댓글을 먼저 지운다.
+ * B-22 의 중첩 클래스({@link 답글})는 1341~1369 를 쓰고 그 대역을 자기 {@code @AfterEach} 에서
+ * 지운다.
  */
 @SpringBootTest
 @AutoConfigureMockMvc
@@ -93,13 +97,24 @@ class CommentControllerTest {
 	private static final String BULK_PATH = "/internal/v1/members/bulk";
 
 	/**
-	 * sp-docs/api-contract.md §4.5 가 정한 댓글 응답의 키 집합. <b>리터럴로 적는다</b> — DTO 의
-	 * 필드에서 뽑아 오면 필드가 늘거나 줄 때 기대값이 함께 움직여 단언이 아무것도 보지 못한다.
+	 * sp-docs/api-contract.md §4.5 가 정한 댓글 하나의 키 집합 — 작성·수정 응답과 목록의 답글
+	 * 원소. <b>리터럴로 적는다</b> — DTO 의 필드에서 뽑아 오면 필드가 늘거나 줄 때 기대값이 함께
+	 * 움직여 단언이 아무것도 보지 못한다.
 	 *
-	 * <p>{@code deleted}·{@code postId}·{@code updatedAt} 이 없다 (§4.5).
+	 * <p>{@code postId}·{@code updatedAt} 이 없다 (§4.5). 1차의 이 집합에는 {@code parentId}·
+	 * {@code deleted} 도 없었다 — 2026-11-11 {@code D-18} 이 §4.5 에 둘을 더했다.
 	 */
 	private static final Set<String> COMMENT_KEYS = Set.of(
-			"id", "writerId", "writerNickname", "content", "createdAt");
+			"id", "parentId", "writerId", "writerNickname", "content", "deleted", "createdAt");
+
+	/**
+	 * 목록 최상위 항목의 키 집합 — 댓글의 키에 {@code replies} 를 더한 것이다 (§4.5).
+	 * {@link #COMMENT_KEYS} 에서 만들지 않고 <b>리터럴로 따로 적는다</b> — sp-docs/plan/phase2-board.md
+	 * B-22 의 검증표가 「리터럴 집합으로 대조한다」 고 적었다.
+	 */
+	private static final Set<String> TOP_LEVEL_KEYS = Set.of(
+			"id", "parentId", "writerId", "writerNickname", "content", "deleted", "createdAt",
+			"replies");
 
 	/**
 	 * {@code created_at} 을 직접 박을 때 쓰는 값. 과거로 두어 {@code updated_at} 과 갈라
@@ -151,9 +166,16 @@ class CommentControllerTest {
 
 	// --- 작성 (C-01, sp-docs/api-contract.md §4) ---
 
-	/** 검증표 "댓글 작성 → 201" 과 "댓글 응답 키 집합 → 다섯 키 정확히" (§4.5). */
+	/**
+	 * 검증표 "댓글 작성 → 201" 과 "댓글 응답 키 집합 → 다섯 키 정확히" (§4.5).
+	 *
+	 * <p>sp-docs/plan/phase2-board.md B-22 의 검증표 「최상위 작성」 → 201, {@code parentId: null},
+	 * {@code deleted: false}, 키 집합이 §4.5 의 댓글 모양 — 도 이 테스트다. 1차 표의 「다섯 키」 는
+	 * 그 시점의 계약이다 — 2026-11-11 {@code D-18} 이 §4.5 에 {@code parentId}·{@code deleted} 를
+	 * 더했다. 본문에 {@code parentId} 가 없으면 최상위다.
+	 */
 	@Test
-	@DisplayName("정상 작성은 201 이고 §4.5 의 다섯 키를 돌려준다")
+	@DisplayName("정상 작성은 201 이고 parentId 가 null, deleted 가 false 인 §4.5 의 댓글 키를 돌려준다")
 	void 정상_작성은_201() throws Exception {
 		Post post = savedPost(ACCOUNT_ID);
 
@@ -164,9 +186,11 @@ class CommentControllerTest {
 				.andExpect(status().isCreated())
 				.andExpect(jsonPath("$.success").value(true))
 				.andExpect(jsonPath("$.error").value(nullValue()))
+				.andExpect(jsonPath("$.data.parentId").value(nullValue()))
 				.andExpect(jsonPath("$.data.content").value("정상 댓글"))
 				.andExpect(jsonPath("$.data.writerId").value(ACCOUNT_ID))
 				.andExpect(jsonPath("$.data.writerNickname").value(MEMBER_NICKNAME))
+				.andExpect(jsonPath("$.data.deleted").value(false))
 				.andExpect(jsonPath("$.data.createdAt").exists())
 				.andReturn();
 
@@ -174,14 +198,19 @@ class CommentControllerTest {
 	}
 
 	/**
-	 * 검증표 "댓글 응답 키 집합 → <b>다섯 키 정확히</b>. 리터럴 집합으로 대조한다" (§4.5).
+	 * 검증표 "댓글 응답 키 집합 → <b>다섯 키 정확히</b>. 리터럴 집합으로 대조한다" (§4.5). 「다섯 키」
+	 * 는 1차 표의 문구이고, 대조하는 집합은 지금의 §4.5 를 적은 {@link #COMMENT_KEYS} 다.
 	 *
-	 * <p><b>세 엔드포인트를 한 테스트에서 본다.</b> §4.5 가 못박은 것은 "세 엔드포인트가 같은
-	 * 모양" 이므로, 한 쪽만 보면 나머지가 갈라져도 녹색이다.
+	 * <p><b>세 엔드포인트를 한 테스트에서 본다.</b> 1차의 §4.5 가 못박은 것은 "세 엔드포인트가 같은
+	 * 모양" 이었고, 한 쪽만 보면 나머지가 갈라져도 녹색이다. <b>지금의 §4.5 는 목록 항목을 다르게
+	 * 정한다</b> — 작성·수정 응답이 댓글 모양이고, 목록의 각 항목(최상위)은 거기에 {@code replies} 를
+	 * 더한 것이다 (2026-11-11 {@code D-18}). 그래서 목록 항목은 {@link #TOP_LEVEL_KEYS} 와 대조한다 —
+	 * sp-docs/plan/phase2-board.md B-22 의 검증표 「목록 최상위 항목의 키 집합」 → §4.5 의 댓글 모양 +
+	 * {@code replies}, 리터럴 집합으로 대조 — 가 이 대조다. 답글 원소의 키는 {@link 답글} 이 본다.
 	 */
 	@Test
-	@DisplayName("작성 201 · 목록 항목 · 수정 200 이 모두 같은 다섯 키다")
-	void 세_엔드포인트의_응답이_같은_다섯_키다() throws Exception {
+	@DisplayName("작성 201 · 수정 200 은 §4.5 의 댓글 키이고 목록 항목은 거기에 replies 를 더한 키다")
+	void 작성_수정_응답과_목록_항목의_키_집합() throws Exception {
 		Post post = savedPost(832L);
 
 		MvcResult created = this.mockMvc.perform(post(commentsPath(post.getId()))
@@ -206,14 +235,14 @@ class CommentControllerTest {
 				.andReturn();
 
 		assertThat(dataKeys(created)).as("작성 201").isEqualTo(COMMENT_KEYS);
-		assertThat(firstItemKeys(list)).as("목록 항목").isEqualTo(COMMENT_KEYS);
+		assertThat(firstItemKeys(list)).as("목록 최상위 항목").isEqualTo(TOP_LEVEL_KEYS);
 		assertThat(dataKeys(updated)).as("수정 200").isEqualTo(COMMENT_KEYS);
 	}
 
 	/**
-	 * 다섯 키 중 {@code createdAt} 의 <b>값</b>을 못박는다. 키 집합만 보면
-	 * <b>{@code createdAt} 자리에 {@code updated_at} 을 싣는 어긋남이 조용하다</b> — 키는 그대로
-	 * 다섯이고 타입도 같다. 실측: {@code CommentResponse.from} 의 {@code getCreatedAt()} 을
+	 * 댓글 키 중 {@code createdAt} 의 <b>값</b>을 못박는다. 키 집합만 보면
+	 * <b>{@code createdAt} 자리에 {@code updated_at} 을 싣는 어긋남이 조용하다</b> — 키 집합은
+	 * 그대로이고 타입도 같다. 실측: {@code CommentResponse.from} 의 {@code getCreatedAt()} 을
 	 * {@code getUpdatedAt()} 으로 바꾸면 이 테스트가 깨진다.
 	 *
 	 * <p><b>시각을 직접 박아 두 값을 갈라 둔다.</b> 작성 직후에는 {@code created_at} 과
@@ -453,6 +482,9 @@ class CommentControllerTest {
 	 * (sp-docs/api-contract.md §4.1 §2.3, sp-docs/conventions.md §6.1). 500 {@code C005} 가
 	 * 아니다 — 흔한 클라이언트 실수가 {@code log.error} 경보를 만들면 원인이 서버에 있는 500 과
 	 * 구별되지 않는다.
+	 *
+	 * <p>sp-docs/plan/phase2-board.md B-22 의 검증표 「목록 {@code size=0} / {@code page=-1}」 → 400
+	 * {@code C001}, {@code fieldErrors} 1건 (1차 그대로) — 도 이 테스트다.
 	 */
 	@ParameterizedTest
 	@CsvSource({"size,0", "page,-1"})
@@ -677,6 +709,363 @@ class CommentControllerTest {
 				.andExpect(jsonPath("$.error.code").value("CM001"));
 	}
 
+	/**
+	 * sp-docs/plan/phase2-board.md <b>B-22</b>(답글, C-05) 의 검증표 중 HTTP 쪽 — 상태·에러 코드·응답
+	 * 모양 — 이다. 검증표 밖으로 sp-docs/requirements/board.md §12 의 수정·삭제 권한 — 남의 답글
+	 * 수정·삭제가 403 {@code CM002} 인지 — 도 본다. 쓰기 순서·목록의 페이징과 건수·창에 끼운 삭제는
+	 * {@link com.example.board.comment.service.CommentServiceTest} 의 B-22 중첩 클래스가 본다.
+	 * 최상위 작성과 목록 최상위 항목의 키 집합은 1차 테스트를 고쳐서 본다
+	 * ({@link #정상_작성은_201()}, {@link #작성_수정_응답과_목록_항목의_키_집합()}).
+	 *
+	 * <p>판정 순서는 sp-docs/requirements/board.md §12 다 — 프로필({@code S002}) → 없는·삭제된 글
+	 * 404 {@code P001} → 부모의 존재·같은 글·활성 404 {@code CM001} → 부모가 최상위인가 400
+	 * {@code CM003}. <b>순서를 보는 픽스처는 두 판정을 함께 어긴다</b> — 한 판정만 어기면 순서를
+	 * 바꿔도 같은 코드가 나온다. 예: 다른 글의 답글({@code CM001} 과 {@code CM003}), 연쇄 삭제된
+	 * 부모가 있는 삭제된 글({@code P001} 과 {@code CM001}).
+	 *
+	 * <p>픽스처 글의 {@code writerId} 는 1341~1369 를 쓴다. 2026-11-17 에 테스트 소스 전체에서 그
+	 * 대역을 쓰는 곳이 없는 것을 확인하고 골랐다. 바깥 클래스의 {@code @AfterEach} 가 지우는 대역이
+	 * 아니므로 여기서 지운다 — 답글이 부모를 참조하므로({@code fk_comment_parent_id}) 그 참조를 먼저
+	 * 끊는다. <b>답글부터 지우는 순서로 두지 않는다</b> — 그 순서는 깊이가 1 이라는 것에 기대야 FK 를
+	 * 지난다. 깊이 판정을 뺀 변이에서 그 순서의 정리가 FK 위반으로 멈춰, 남은 행이 이 클래스의 다른
+	 * 테스트와 {@code PostQueryRepositoryTest} 까지 빨갛게 만들었다 (2026-11-17 B-22 실측).
+	 */
+	@Nested
+	@DisplayName("답글 — 작성의 판정, 목록의 모양, 수정·삭제 권한")
+	class 답글 {
+
+		@AfterEach
+		void 답글_픽스처_정리() {
+			jdbcTemplate.update("UPDATE comment SET parent_id = NULL WHERE post_id IN "
+					+ "(SELECT id FROM post WHERE writer_id BETWEEN 1341 AND 1369)");
+			jdbcTemplate.update("DELETE FROM comment WHERE post_id IN "
+					+ "(SELECT id FROM post WHERE writer_id BETWEEN 1341 AND 1369)");
+			jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 1341 AND 1369");
+		}
+
+		/**
+		 * 검증표 <b>「답글 작성」 → 201, {@code parentId} 가 부모, {@code comment_count} +1</b>. 답글도
+		 * §4.5 의 댓글 모양이다 — 키 집합을 함께 본다.
+		 */
+		@Test
+		@DisplayName("답글 작성은 201 이고 parentId 가 부모이며 comment_count 가 1 오른다")
+		void 답글_작성은_201_이고_parentId_가_부모다() throws Exception {
+			Post post = savedPost(1341L);
+			Comment 부모 = 작성한_댓글(post, "부모 댓글");
+			assertThat(집계(post.getId())).as("부모의 작성이 집계에 들어야 답글의 +1 을 볼 수 있다").isEqualTo(1);
+
+			MvcResult result = mockMvc.perform(post(commentsPath(post.getId()))
+							.header(HttpHeaders.AUTHORIZATION, bearer(ACCOUNT_ID))
+							.contentType(MediaType.APPLICATION_JSON)
+							.content(replyBody("답글", 부모.getId())))
+					.andExpect(status().isCreated())
+					.andExpect(jsonPath("$.data.parentId").value(부모.getId()))
+					.andExpect(jsonPath("$.data.deleted").value(false))
+					.andExpect(jsonPath("$.data.content").value("답글"))
+					.andReturn();
+
+			assertThat(dataKeys(result)).as("답글도 §4.5 의 댓글 모양이다").isEqualTo(COMMENT_KEYS);
+			assertThat(저장된_부모(dataId(result))).as("저장된 parent_id 가 그 부모다").isEqualTo(부모.getId());
+			assertThat(집계(post.getId()))
+					.as("답글 작성도 comment_count +1 이다 (sp-docs/domain-model.md §5)")
+					.isEqualTo(2);
+		}
+
+		/**
+		 * 완료 기준 「{@code parentId} 가 없거나 {@code null} 이면 최상위 댓글이다」 의 {@code null} 쪽이다
+		 * — 키가 없는 본문은 {@link #정상_작성은_201()} 이 본다. 저장된 {@code parent_id} 도
+		 * {@code null} 이다.
+		 */
+		@Test
+		@DisplayName("본문의 parentId 가 null 이면 최상위 댓글로 201 이다")
+		void parentId_가_null_이면_최상위다() throws Exception {
+			Post post = savedPost(1352L);
+
+			MvcResult result = mockMvc.perform(post(commentsPath(post.getId()))
+							.header(HttpHeaders.AUTHORIZATION, bearer(ACCOUNT_ID))
+							.contentType(MediaType.APPLICATION_JSON)
+							.content("{\"content\":\"최상위\",\"parentId\":null}"))
+					.andExpect(status().isCreated())
+					.andExpect(jsonPath("$.data.parentId").value(nullValue()))
+					.andReturn();
+
+			assertThat(저장된_부모(dataId(result))).isNull();
+			assertThat(집계(post.getId())).isEqualTo(1);
+		}
+
+		/**
+		 * 검증표 <b>「답글에 답글」 → 400 {@code CM003}</b> — 깊이는 1단계다
+		 * (sp-docs/requirements/board.md §12). 판정이 첫 쓰기보다 앞이므로 행도 집계도 그대로다.
+		 */
+		@Test
+		@DisplayName("답글에 답글을 달면 400 CM003 이고 행도 집계도 그대로다")
+		void 답글에_답글은_400_CM003() throws Exception {
+			Post post = savedPost(1342L);
+			Comment 부모 = 작성한_댓글(post, "부모 댓글");
+			Comment 답 = 작성한_답글(post, 부모, "답글");
+
+			mockMvc.perform(post(commentsPath(post.getId()))
+							.header(HttpHeaders.AUTHORIZATION, bearer(ACCOUNT_ID))
+							.contentType(MediaType.APPLICATION_JSON)
+							.content(replyBody("답글의 답글", 답.getId())))
+					.andExpect(status().isBadRequest())
+					.andExpect(jsonPath("$.error.code").value("CM003"));
+
+			assertThat(활성_댓글_수(post.getId())).isEqualTo(2);
+			assertThat(집계(post.getId())).isEqualTo(2);
+		}
+
+		/**
+		 * 검증표 <b>「없는 부모 / 다른 글의 댓글 / 삭제된 부모」 → 404 {@code CM001}</b>
+		 * (sp-docs/requirements/board.md §12 의 「부모가 될 수 없는 것」). 행도 집계도 그대로다.
+		 *
+		 * <p>다른 글의 댓글과 삭제된 부모는 <b>최상위</b>다 — 최상위인지만 보는 구현이면 둘 다 201 이
+		 * 된다. 다른 글의 <b>답글</b>은 {@link #다른_글의_답글을_부모로_주면_404_CM001()} 이 본다.
+		 */
+		@ParameterizedTest
+		@ValueSource(strings = {"MISSING", "OTHER_POST", "DELETED"})
+		@DisplayName("없는 부모 · 다른 글의 댓글 · 삭제된 부모에 답글을 달면 404 CM001 이고 행도 집계도 그대로다")
+		void 부모가_될_수_없는_댓글은_404_CM001(String 부모의_상태) throws Exception {
+			Post post = savedPost(1343L);
+			작성한_댓글(post, "같은 글의 최상위");
+			long 부모_id = switch (부모의_상태) {
+				case "MISSING" -> 987_654_325L;
+				case "OTHER_POST" -> savedComment(savedPost(1344L), ACCOUNT_ID, "다른 글의 최상위").getId();
+				case "DELETED" -> 삭제된_댓글(post, ACCOUNT_ID, "지운 최상위").getId();
+				default -> throw new IllegalArgumentException(부모의_상태);
+			};
+
+			mockMvc.perform(post(commentsPath(post.getId()))
+							.header(HttpHeaders.AUTHORIZATION, bearer(ACCOUNT_ID))
+							.contentType(MediaType.APPLICATION_JSON)
+							.content(replyBody("달 수 없는 답글", 부모_id)))
+					.andExpect(status().isNotFound())
+					.andExpect(jsonPath("$.error.code").value("CM001"));
+
+			assertThat(활성_댓글_수(post.getId())).isEqualTo(1);
+			assertThat(집계(post.getId())).isEqualTo(1);
+		}
+
+		/**
+		 * 검증표 <b>「다른 글의 답글을 부모로」 → 404 {@code CM001} ({@code CM003} 아님 — 순서)</b>.
+		 * 그 부모는 같은 글 조건(404)과 최상위 조건(400)을 둘 다 어긴다 — 같은 글인지를
+		 * 먼저 보므로 {@code CM001} 이다 (sp-docs/requirements/board.md §12 의 판정 순서).
+		 */
+		@Test
+		@DisplayName("다른 글의 답글을 부모로 주면 CM003 이 아니라 404 CM001 이다")
+		void 다른_글의_답글을_부모로_주면_404_CM001() throws Exception {
+			Post post = savedPost(1345L);
+			Post 다른_글 = savedPost(1346L);
+			Comment 다른_글의_답글 = 답글로_둔다(다른_글,
+					savedComment(다른_글, ACCOUNT_ID, "다른 글의 최상위"), "다른 글의 답글");
+
+			mockMvc.perform(post(commentsPath(post.getId()))
+							.header(HttpHeaders.AUTHORIZATION, bearer(ACCOUNT_ID))
+							.contentType(MediaType.APPLICATION_JSON)
+							.content(replyBody("달 수 없는 답글", 다른_글의_답글.getId())))
+					.andExpect(status().isNotFound())
+					.andExpect(jsonPath("$.error.code").value("CM001"));
+
+			assertThat(활성_댓글_수(post.getId())).isZero();
+			assertThat(집계(post.getId())).isZero();
+		}
+
+		/**
+		 * 검증표 <b>「삭제된 글에 답글」 → 404 {@code P001}</b>. 픽스처는 글 삭제의 연쇄가 끝난
+		 * 상태라 부모도 지워져 있다 (sp-docs/requirements/board.md §5 규칙 3) — 부모를 글보다 먼저 보는
+		 * 구현이면 {@code CM001} 이 된다. 판정 순서는 글이 먼저다 (§12).
+		 */
+		@Test
+		@DisplayName("삭제된 글에 답글을 달면 CM001 이 아니라 404 P001 이다")
+		void 삭제된_글에_답글은_404_P001() throws Exception {
+			Post post = savedPost(1347L);
+			Comment 부모 = 삭제된_댓글(post, ACCOUNT_ID, "연쇄 삭제된 부모");
+			post.softDelete();
+			postRepository.saveAndFlush(post);
+
+			mockMvc.perform(post(commentsPath(post.getId()))
+							.header(HttpHeaders.AUTHORIZATION, bearer(ACCOUNT_ID))
+							.contentType(MediaType.APPLICATION_JSON)
+							.content(replyBody("삭제된 글의 답글", 부모.getId())))
+					.andExpect(status().isNotFound())
+					.andExpect(jsonPath("$.error.code").value("P001"));
+
+			assertThat(답글_수(부모.getId())).isZero();
+			assertThat(집계(post.getId())).isZero();
+		}
+
+		/**
+		 * 검증표 <b>「프로필 없는 계정의 답글」 → 403 {@code S002}, 행 0, 집계 불변</b>. 프로필 판정은
+		 * 1차처럼 트랜잭션 밖에서 가장 먼저다 (sp-docs/requirements/board.md §12 의 판정 순서, §3.0).
+		 * 부모는 유효하다 — 이 요청이 실패한다면 프로필 때문이다.
+		 */
+		@Test
+		@DisplayName("프로필 없는 계정이 답글을 달면 403 S002 이고 행도 집계도 그대로다")
+		void 프로필_없는_계정의_답글은_403_S002() throws Exception {
+			Post post = savedPost(1348L);
+			Comment 부모 = 작성한_댓글(post, "부모 댓글");
+			RESPONDER.set(exchange -> writeResponse(exchange, 200, envelope("")));
+
+			mockMvc.perform(post(commentsPath(post.getId()))
+							.header(HttpHeaders.AUTHORIZATION, bearer(ACCOUNT_ID))
+							.contentType(MediaType.APPLICATION_JSON)
+							.content(replyBody("프로필 없는 답글", 부모.getId())))
+					.andExpect(status().isForbidden())
+					.andExpect(jsonPath("$.error.code").value("S002"));
+
+			assertThat(답글_수(부모.getId())).as("행 0").isZero();
+			assertThat(집계(post.getId())).as("집계 불변 — 부모의 1 그대로").isEqualTo(1);
+		}
+
+		/**
+		 * 검증표 <b>「목록 답글 원소의 키 집합」 → §4.5 의 댓글 모양 — {@code replies} 가 없다</b>.
+		 * 리터럴 집합 {@link #COMMENT_KEYS} 와 대조한다.
+		 */
+		@Test
+		@DisplayName("목록의 답글 원소는 §4.5 의 댓글 키이고 replies 가 없다")
+		void 목록의_답글_원소는_댓글_모양이다() throws Exception {
+			Post post = savedPost(1349L);
+			Comment 부모 = 작성한_댓글(post, "부모 댓글");
+			작성한_답글(post, 부모, "답글");
+
+			MvcResult list = mockMvc.perform(get(commentsPath(post.getId())))
+					.andExpect(status().isOk())
+					.andExpect(jsonPath("$.data.content[0].replies", hasSize(1)))
+					.andReturn();
+
+			Map<String, Object> 답글_원소 = JsonPath.read(bodyOf(list), "$.data.content[0].replies[0]");
+			assertThat(답글_원소.keySet()).isEqualTo(COMMENT_KEYS);
+		}
+
+		/**
+		 * 검증표 <b>「답글 없는 최상위」 → {@code replies: []}</b> — 키가 있고 빈 배열이다.
+		 * {@code null} 도 키 없음도 아니다 (sp-docs/api-contract.md §4.5). 답글이 있는 최상위를 옆에
+		 * 둔다 — 답글을 모든 최상위에 붙이는 구현도 갈린다.
+		 */
+		@Test
+		@DisplayName("답글 없는 최상위의 replies 는 빈 배열이다")
+		void 답글_없는_최상위는_replies_가_빈_배열이다() throws Exception {
+			Post post = savedPost(1350L);
+			Comment 답글_있는_최상위 = 작성한_댓글(post, "답글이 있는 최상위");
+			작성한_답글(post, 답글_있는_최상위, "답글");
+			작성한_댓글(post, "답글이 없는 최상위");
+
+			mockMvc.perform(get(commentsPath(post.getId())))
+					.andExpect(status().isOk())
+					.andExpect(jsonPath("$.data.content", hasSize(2)))
+					.andExpect(jsonPath("$.data.content[0].replies", hasSize(1)))
+					.andExpect(jsonPath("$.data.content[1].replies").isArray())
+					.andExpect(jsonPath("$.data.content[1].replies", hasSize(0)));
+		}
+
+		/**
+		 * 검증표 <b>「답글 있는 부모 삭제」 → 부모 자리 {@code deleted: true}, 세 필드 {@code null}, 답글
+		 * 그대로, {@code comment_count} −1</b> (sp-docs/api-contract.md §4.5 §9.7).
+		 *
+		 * <p>세 필드는 <b>키가 있고 값이 {@code null}</b> 이다 — 키가 빠진 응답과 다르다.
+		 * {@code id}·{@code parentId}·{@code createdAt}·{@code replies} 는 그대로다 (§4.5). 부모의
+		 * {@code created_at} 을 과거로 박아 둔다 — 자리의 {@code createdAt} 이 저장된 값인지 본다.
+		 */
+		@Test
+		@DisplayName("답글 있는 부모를 지우면 deleted:true 에 세 필드가 null 인 자리로 남고 답글은 그대로이며 집계가 1 준다")
+		void 답글_있는_부모를_지우면_자리가_남는다() throws Exception {
+			Post post = savedPost(1351L);
+			Comment 부모 = 작성한_댓글(post, "지울 부모");
+			Comment 첫_답글 = 작성한_답글(post, 부모, "남을 답글 하나");
+			Comment 둘째_답글 = 작성한_답글(post, 부모, "남을 답글 둘");
+			setCreatedAt(부모.getId(), FIXED_TIME);
+			assertThat(집계(post.getId())).as("세 작성이 집계에 들어야 삭제의 −1 을 볼 수 있다").isEqualTo(3);
+
+			mockMvc.perform(delete(commentPath(부모.getId()))
+							.header(HttpHeaders.AUTHORIZATION, bearer(ACCOUNT_ID)))
+					.andExpect(status().isNoContent());
+			MvcResult list = mockMvc.perform(get(commentsPath(post.getId())))
+					.andExpect(status().isOk())
+					.andExpect(jsonPath("$.data.content", hasSize(1)))
+					.andReturn();
+
+			Map<String, Object> 자리 = JsonPath.read(bodyOf(list), "$.data.content[0]");
+			assertThat(자리.keySet()).isEqualTo(TOP_LEVEL_KEYS);
+			assertThat(((Number) 자리.get("id")).longValue()).isEqualTo(부모.getId());
+			assertThat(자리)
+					.as("지운 내용과 작성자를 가린다 — 키는 있고 값이 null 이다 (sp-docs/api-contract.md §4.5)")
+					.containsEntry("deleted", true)
+					.containsEntry("writerId", null)
+					.containsEntry("writerNickname", null)
+					.containsEntry("content", null)
+					.containsEntry("parentId", null);
+			assertThat(응답의_createdAt(list, "$.data.content[0].createdAt"))
+					.as("자리의 createdAt 은 그 댓글의 created_at 그대로다")
+					.isEqualTo(FIXED_TIME);
+			assertThat(JsonPath.<List<Object>>read(bodyOf(list), "$.data.content[0].replies[*].id"))
+					.map(id -> ((Number) id).longValue())
+					.as("답글은 그대로다")
+					.containsExactly(첫_답글.getId(), 둘째_답글.getId());
+			assertThat(JsonPath.<List<Object>>read(bodyOf(list), "$.data.content[0].replies[*].content"))
+					.containsExactly("남을 답글 하나", "남을 답글 둘");
+			assertThat(활성_댓글_수(post.getId())).as("답글 행은 활성 그대로다").isEqualTo(2);
+			assertThat(집계(post.getId()))
+					.as("지운 그 하나만 −1 (sp-docs/domain-model.md §5)")
+					.isEqualTo(2);
+		}
+
+		/**
+		 * sp-docs/requirements/board.md §12 의 표가 답글의 수정·삭제 권한을 「댓글과 같다(C-03·C-04)」
+		 * 로 정했다 — 수정은 작성자 본인뿐이다 (sp-docs/security.md §5.2). B-22 의 검증표에는 없는
+		 * 줄이다. 작성자 판정({@code CommentService.validateWriter})에 답글이면 건너뛰는 분기를 넣은
+		 * 변이가 이 테스트 전에는 전체 스위트를 통과했고, 이 테스트에서 빨개진다 (2026-11-17 B-22
+		 * 실측).
+		 */
+		@Test
+		@DisplayName("남의 답글을 수정하면 403 CM002 이고 내용이 그대로다")
+		void 남의_답글_수정은_403_CM002() throws Exception {
+			Post post = savedPost(1353L);
+			Comment 부모 = 작성한_댓글(post, "부모 댓글");
+			Comment 답 = 작성한_답글(post, 부모, "남의 답글");
+			assertThat(저장된_부모(답.getId())).as("답글이어야 답글의 권한 판정을 본다").isEqualTo(부모.getId());
+
+			mockMvc.perform(put(commentPath(답.getId()))
+							.header(HttpHeaders.AUTHORIZATION, bearer(1354L))
+							.contentType(MediaType.APPLICATION_JSON)
+							.content(body("남의 답글 고치기")))
+					.andExpect(status().isForbidden())
+					.andExpect(jsonPath("$.error.code").value("CM002"));
+
+			assertThat(commentRepository.findById(답.getId()).orElseThrow().getContent())
+					.isEqualTo("남의 답글");
+		}
+
+		/**
+		 * sp-docs/requirements/board.md §12 의 표가 답글의 수정·삭제 권한을 「댓글과 같다(C-03·C-04)」
+		 * 로 정했다 — 삭제는 작성자 본인 또는 ADMIN 이다 (sp-docs/security.md §5.2). 호출자는 일반
+		 * {@code USER} 다. B-22 의 검증표에는 없는 줄이다. 삭제의 권한 판정
+		 * ({@code CommentService.validateWriterOrAdmin})이나 작성자 판정
+		 * ({@code CommentService.validateWriter})에 답글이면 건너뛰는 분기를 넣은 변이가 이 테스트
+		 * 전에는 전체 스위트를 통과했고, 이 테스트에서 빨개진다 (2026-11-17 B-22 실측). 판정이 첫
+		 * 쓰기보다 앞이므로 행도 집계도 그대로다.
+		 */
+		@Test
+		@DisplayName("일반 USER 가 남의 답글을 지우면 403 CM002 이고 행도 집계도 그대로다")
+		void 남의_답글_삭제는_403_CM002() throws Exception {
+			Post post = savedPost(1355L);
+			Comment 부모 = 작성한_댓글(post, "부모 댓글");
+			Comment 답 = 작성한_답글(post, 부모, "남의 답글");
+			assertThat(저장된_부모(답.getId())).as("답글이어야 답글의 권한 판정을 본다").isEqualTo(부모.getId());
+			assertThat(집계(post.getId())).as("두 작성이 집계에 들어야 집계 불변을 볼 수 있다").isEqualTo(2);
+
+			mockMvc.perform(delete(commentPath(답.getId()))
+							.header(HttpHeaders.AUTHORIZATION, bearer(1356L)))
+					.andExpect(status().isForbidden())
+					.andExpect(jsonPath("$.error.code").value("CM002"));
+
+			assertThat(commentRepository.findById(답.getId()).orElseThrow().isDeleted())
+					.as("행이 그대로 활성이다")
+					.isFalse();
+			assertThat(집계(post.getId())).as("집계 불변").isEqualTo(2);
+		}
+
+	}
+
 	// --- 헬퍼 ---
 
 	/**
@@ -724,6 +1113,11 @@ class CommentControllerTest {
 
 	private static String body(String content) {
 		return "{\"content\":%s}".formatted(quote(content));
+	}
+
+	/** 답글 작성 본문. {@code parentId} 가 있으면 답글이다 (sp-docs/api-contract.md §4.5). */
+	private static String replyBody(String content, long parentId) {
+		return "{\"content\":%s,\"parentId\":%d}".formatted(quote(content), parentId);
 	}
 
 	/** JSON 문자열 리터럴로 감싼다. 내용에 공백·따옴표가 들어가는 케이스가 있다. */
@@ -778,6 +1172,41 @@ class CommentControllerTest {
 		Comment comment = savedComment(post, writerId, content);
 		comment.softDelete();
 		return this.commentRepository.saveAndFlush(comment);
+	}
+
+	/** 작성 엔드포인트를 지나 만든 답글. 집계가 1 오른 상태다. */
+	private Comment 작성한_답글(Post post, Comment parent, String content) throws Exception {
+		MvcResult result = this.mockMvc.perform(post(commentsPath(post.getId()))
+						.header(HttpHeaders.AUTHORIZATION, bearer(ACCOUNT_ID))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(replyBody(content, parent.getId())))
+				.andExpect(status().isCreated())
+				.andReturn();
+		return this.commentRepository.findById(dataId(result)).orElseThrow();
+	}
+
+	/** 집계를 건드리지 않는 답글 픽스처. 작성 경로의 판정을 지나지 않는다. */
+	private Comment 답글로_둔다(Post post, Comment parent, String content) {
+		return this.commentRepository.saveAndFlush(Comment.builder()
+				.post(post)
+				.parent(parent)
+				.writerId(ACCOUNT_ID)
+				.writerNickname("댓글작성자")
+				.content(content)
+				.build());
+	}
+
+	/** JPA 를 거치지 않고 저장된 {@code parent_id} 를 읽는다. */
+	private Long 저장된_부모(long commentId) {
+		return this.jdbcTemplate.queryForObject(
+				"SELECT parent_id FROM comment WHERE id = ?", Long.class, commentId);
+	}
+
+	/** 그 부모를 가리키는 행의 수 — 삭제 여부와 무관하다. 행이 생기지 않았는지를 본다. */
+	private long 답글_수(Long parentId) {
+		Long count = this.jdbcTemplate.queryForObject(
+				"SELECT COUNT(*) FROM comment WHERE parent_id = ?", Long.class, parentId);
+		return count == null ? 0 : count;
 	}
 
 	private long 활성_댓글_수(Long postId) {

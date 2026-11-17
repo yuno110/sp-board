@@ -28,7 +28,8 @@ import org.springframework.test.context.ActiveProfiles;
  * <p>두 애노테이션의 이유는 {@link com.example.board.post.repository.PostRepositoryTest} 와
  * 같다 (sp-docs/conventions.md §9.3).
  *
- * <p>픽스처의 {@code writerId} 는 301 대역을 쓴다(B-03 이 301~317, B-14 가 318~329) — 같은 JVM
+ * <p>픽스처의 {@code writerId} 는 301 대역을 쓴다(B-03 이 301~317, B-14 가 318~329, B-22 가
+ * 330~339) — 같은 JVM
  * 의 테스트 클래스가 하나의 DB 를 보므로 클래스마다 대역을 겹치지 않게 둔다
  * (sp-docs/tech-stack.md §5.3).
  */
@@ -268,6 +269,37 @@ class CommentRepositoryTest {
 				.isFalse();
 	}
 
+	/**
+	 * sp-docs/plan/phase2-board.md B-22 의 검증표 <b>「글 삭제」 → 답글도 논리 삭제된다 (1차 연쇄
+	 * 그대로)</b> (sp-docs/requirements/board.md §5 규칙 3 — 「하위 댓글(답글 포함)」).
+	 *
+	 * <p>다른 글에도 최상위와 답글을 둔다 — {@code where} 의 글 조건이 빠지면 그쪽 답글까지 지운다.
+	 * 최상위만 지우는 구현({@code parent is null} 이 붙은 조건)은 지울 글의 답글 단언에서 갈린다.
+	 */
+	@Test
+	@DisplayName("softDeleteByPostId() 는 그 게시글의 답글도 지우고 다른 게시글의 답글은 건드리지 않는다")
+	void 게시글별_연쇄_논리삭제는_답글도_지운다() {
+		Post target = savedPost(330L, "삭제될글작성자");
+		Post other = savedPost(331L, "남는글작성자");
+		Comment top = commentRepository.saveAndFlush(comment(target, 332L, "최상위", "대상 최상위"));
+		Comment reply = commentRepository.saveAndFlush(reply(target, top, 333L, "대상 답글"));
+		Comment otherTop = commentRepository.saveAndFlush(comment(other, 334L, "다른최상위", "남는 최상위"));
+		Comment otherReply = commentRepository.saveAndFlush(reply(other, otherTop, 335L, "남는 답글"));
+		em.clear();
+
+		int affected = commentRepository.softDeleteByPostId(target.getId());
+
+		assertThat(affected).as("최상위와 답글").isEqualTo(2);
+		assertThat(commentRepository.findById(top.getId()).orElseThrow().isDeleted()).isTrue();
+		assertThat(commentRepository.findById(reply.getId()).orElseThrow().isDeleted())
+				.as("답글도 그 글의 하위 댓글이다 (sp-docs/requirements/board.md §5 규칙 3)")
+				.isTrue();
+		assertThat(commentRepository.findById(otherTop.getId()).orElseThrow().isDeleted()).isFalse();
+		assertThat(commentRepository.findById(otherReply.getId()).orElseThrow().isDeleted())
+				.as("다른 게시글의 답글은 건드리지 않는다")
+				.isFalse();
+	}
+
 	@Test
 	@DisplayName("softDeleteByPostId() 는 댓글이 없으면 0 을 돌려준다")
 	void 댓글이_없는_게시글의_연쇄_논리삭제() {
@@ -376,6 +408,16 @@ class CommentRepositoryTest {
 				.post(post)
 				.writerId(writerId)
 				.writerNickname(writerNickname)
+				.content(content)
+				.build();
+	}
+
+	private static Comment reply(Post post, Comment parent, Long writerId, String content) {
+		return Comment.builder()
+				.post(post)
+				.parent(parent)
+				.writerId(writerId)
+				.writerNickname("답글작성자")
 				.content(content)
 				.build();
 	}

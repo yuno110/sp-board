@@ -14,6 +14,7 @@ import com.example.board.comment.dto.CommentCreateRequest;
 import com.example.board.comment.dto.CommentPageCondition;
 import com.example.board.comment.dto.CommentResponse;
 import com.example.board.comment.dto.CommentUpdateRequest;
+import com.example.board.comment.dto.TopLevelCommentResponse;
 import com.example.board.comment.entity.Comment;
 import com.example.board.comment.repository.CommentRepository;
 import com.example.board.global.common.PageResponse;
@@ -26,8 +27,10 @@ import com.example.board.support.PhysicalCommitRecorder;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CyclicBarrier;
@@ -37,6 +40,7 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.IntConsumer;
@@ -81,7 +85,8 @@ import org.springframework.transaction.support.TransactionSynchronizationManager
  *
  * <p>픽스처의 {@code writerId} 는 801~829 를 쓰고, B-10 의 중첩 클래스
  * ({@link 집계_갱신의_모양과_동시성})가 901~929, B-17 의 중첩 클래스
- * ({@link 삭제의_순서와_조건부_전환})가 971~979 를 쓴다. 같은 JVM 의 모든 테스트가 하나의
+ * ({@link 삭제의_순서와_조건부_전환})가 971~979, B-22 의 중첩 클래스({@link 답글})가 1311~1339 를
+ * 쓴다. 같은 JVM 의 모든 테스트가 하나의
  * H2 DB 를 보므로 (sp-docs/tech-stack.md §5.3) 이미 쓰이는 대역과 겹치지 않게 둔다. 이
  * 클래스는 트랜잭션 롤백에 기대지 않고 — 작성 경로가 스스로 커밋한다 —
  * {@code @AfterEach} 가 자기 대역만 지운다. <b>테이블 전체를 지우지 않는다</b> — 다른
@@ -141,7 +146,7 @@ class CommentServiceTest {
 		Post post = savedPost(801L);
 
 		CommentResponse created = this.commentService.create(
-				post.getId(), 801L, new CommentCreateRequest("첫 댓글"));
+				post.getId(), 801L, new CommentCreateRequest("첫 댓글", null));
 
 		Comment saved = this.commentRepository.findById(created.id()).orElseThrow();
 		assertThat(saved.getContent()).isEqualTo("첫 댓글");
@@ -166,7 +171,7 @@ class CommentServiceTest {
 		Post post = savedPost(801L);
 
 		CommentResponse created = this.commentService.create(
-				post.getId(), 802L, new CommentCreateRequest("작성자 확인"));
+				post.getId(), 802L, new CommentCreateRequest("작성자 확인", null));
 
 		assertThat(this.commentRepository.findById(created.id()).orElseThrow().getWriterId())
 				.isEqualTo(802L);
@@ -186,7 +191,7 @@ class CommentServiceTest {
 		Post post = savedPost(801L);
 
 		CommentResponse created = this.commentService.create(
-				post.getId(), 803L, new CommentCreateRequest("닉네임 확인"));
+				post.getId(), 803L, new CommentCreateRequest("닉네임 확인", null));
 
 		assertThat(this.commentRepository.findById(created.id()).orElseThrow().getWriterNickname())
 				.isEqualTo(MEMBER_NICKNAME);
@@ -219,7 +224,7 @@ class CommentServiceTest {
 			return MEMBER_NICKNAME;
 		}).given(this.memberClient).findActiveNickname(804L);
 
-		this.commentService.create(post.getId(), 804L, new CommentCreateRequest("순서"));
+		this.commentService.create(post.getId(), 804L, new CommentCreateRequest("순서", null));
 
 		assertThat(호출_시점의_트랜잭션.get())
 				.as("MemberClient 가 호출되지 않았다면 이 단언은 아무것도 보지 못한다")
@@ -240,7 +245,7 @@ class CommentServiceTest {
 		given(this.memberClient.findActiveNickname(805L)).willReturn(MEMBER_NICKNAME);
 
 		assertThatThrownBy(() -> this.commentService.create(
-				987654323L, 805L, new CommentCreateRequest("없는 글에 쓰는 댓글")))
+				987654323L, 805L, new CommentCreateRequest("없는 글에 쓰는 댓글", null)))
 				.isInstanceOf(BusinessException.class)
 				.extracting(e -> ((BusinessException) e).getErrorCode())
 				.isEqualTo(ErrorCode.POST_NOT_FOUND);
@@ -432,7 +437,7 @@ class CommentServiceTest {
 		Post post = savedPost(817L);
 		savedComment(post, 817L, "댓글");
 
-		PageResponse<CommentResponse> page = this.commentService.getList(
+		PageResponse<TopLevelCommentResponse> page = this.commentService.getList(
 				post.getId(), CommentPageCondition.of(null, null));
 
 		assertThat(page.content())
@@ -472,13 +477,13 @@ class CommentServiceTest {
 		List<Long> 기대_순서 = new ArrayList<>(저장_순서);
 		Collections.reverse(기대_순서);
 
-		PageResponse<CommentResponse> page = this.commentService.getList(
+		PageResponse<TopLevelCommentResponse> page = this.commentService.getList(
 				post.getId(), CommentPageCondition.of(null, null));
 
 		assertThat(page.size())
 				.as("기본 크기는 20 이다 (sp-docs/requirements/board.md §2 의 C-02)")
 				.isEqualTo(20);
-		assertThat(page.content()).extracting(CommentResponse::id)
+		assertThat(page.content()).extracting(TopLevelCommentResponse::id)
 				.as("등록순은 created_at ASC, id ASC 다 (sp-docs/api-contract.md §7.1)")
 				.containsExactlyElementsOf(기대_순서.subList(0, 20));
 		assertThat(page.totalElements()).isEqualTo(21);
@@ -488,6 +493,10 @@ class CommentServiceTest {
 	/**
 	 * 검증표 "삭제된 댓글 포함 상태 → 목록에서 제외. <b>건수 쿼리도 제외한다</b>"
 	 * (sp-docs/requirements/board.md §5 규칙 1).
+	 *
+	 * <p><b>B-22 뒤로 제외되는 것은 활성 답글이 없는 삭제된 댓글이다</b> — 같은 규칙의 예외로 활성
+	 * 답글이 있는 삭제된 최상위는 자리로 남는다 (§5 규칙 1, §12). 이 픽스처의 삭제된 댓글에는 답글이
+	 * 없다. 자리로 남는 쪽은 {@link 답글} 이 본다.
 	 *
 	 * <p><b>건수 쿼리의 조건을 관측하려면 두 가지가 모두 필요하다</b>
 	 * (sp-docs/process/review-policy.md §4.1).
@@ -506,7 +515,7 @@ class CommentServiceTest {
 	 * <p>다른 게시글의 활성 댓글도 하나 둔다 — 목록이 게시글별인 것을 함께 본다.
 	 */
 	@Test
-	@DisplayName("삭제된 댓글은 목록과 건수에서 모두 제외된다")
+	@DisplayName("활성 답글이 없는 삭제된 댓글은 목록과 건수에서 모두 제외된다")
 	void 삭제된_댓글은_목록에서_제외된다() {
 		Post post = savedPost(819L);
 		Long first = savedComment(post, 819L, "남는 댓글 하나").getId();
@@ -517,12 +526,12 @@ class CommentServiceTest {
 		this.commentRepository.saveAndFlush(removed);
 		savedComment(savedPost(820L), 820L, "다른 글의 댓글");
 
-		PageResponse<CommentResponse> 전체 = this.commentService.getList(
+		PageResponse<TopLevelCommentResponse> 전체 = this.commentService.getList(
 				post.getId(), CommentPageCondition.of(null, null));
-		PageResponse<CommentResponse> 꽉_찬_페이지 = this.commentService.getList(
+		PageResponse<TopLevelCommentResponse> 꽉_찬_페이지 = this.commentService.getList(
 				post.getId(), CommentPageCondition.of(0, 2));
 
-		assertThat(전체.content()).extracting(CommentResponse::id)
+		assertThat(전체.content()).extracting(TopLevelCommentResponse::id)
 				.as("삭제된 댓글과 다른 글의 댓글이 목록에서 빠진다")
 				.containsExactly(first, second, third);
 		assertThat(꽉_찬_페이지.content()).hasSize(2);
@@ -562,7 +571,7 @@ class CommentServiceTest {
 		for (int page = 0; page < 3; page++) {
 			이어_붙인_목록.addAll(this.commentService
 					.getList(post.getId(), CommentPageCondition.of(page, 2))
-					.content().stream().map(CommentResponse::id).toList());
+					.content().stream().map(TopLevelCommentResponse::id).toList());
 		}
 
 		assertThat(이어_붙인_목록)
@@ -689,7 +698,7 @@ class CommentServiceTest {
 
 			// 준비가 끝난 뒤에 센다. 세는 구간을 create 한 번으로 좁혀 둔다
 			List<String> 커밋된_물리_트랜잭션 = this.커밋_기록기.물리_커밋(() -> this.commentService.create(
-					post.getId(), 822L, new CommentCreateRequest("경계 관측")));
+					post.getId(), 822L, new CommentCreateRequest("경계 관측", null)));
 
 			assertThat(커밋된_물리_트랜잭션)
 					.as("댓글 INSERT 와 comment_count 갱신이 한 로컬 트랜잭션이다 "
@@ -742,7 +751,7 @@ class CommentServiceTest {
 			}).given(this.spyCommentRepository).saveAndFlush(any(Comment.class));
 
 			assertThatThrownBy(() -> this.commentService.create(
-					post.getId(), 823L, new CommentCreateRequest("롤백될 댓글")))
+					post.getId(), 823L, new CommentCreateRequest("롤백될 댓글", null)))
 					.isInstanceOf(DataIntegrityViolationException.class);
 
 			// 두 단언이 각각 반증 가능해야 한다 (sp-docs/process/review-policy.md §4.1).
@@ -889,8 +898,10 @@ class CommentServiceTest {
 		 * 여기서 사유가 드러난다
 		 * <li>활성 댓글이 <b>{@code 동시_요청} 건</b>이라는 것 — 커밋이 하나뿐이었으면 아래
 		 * 단언은 소실을 볼 수 없다
-		 * <li>집계가 그 활성 댓글 수와 <b>같다</b>는 것 — 완료 기준이고
-		 * sp-docs/api-contract.md §4.5 가 목록의 {@code totalElements} 와 같다고 정한 값이다
+		 * <li>집계가 그 활성 댓글 수와 <b>같다</b>는 것 — 완료 기준이고 sp-docs/api-contract.md §4.5
+		 * 가 지키라고 적은 등식 「{@code comment_count} = 답글을 포함한 활성 댓글 수」 다. 1차의 그
+		 * 절은 그 값이 목록의 {@code totalElements} 와 같다고 적었다 — 답글이 생긴 뒤의
+		 * {@code totalElements} 는 최상위 항목의 수라 둘이 다르다
 		 * </ul>
 		 *
 		 * <p><b>엔티티 증가로 되돌리면 빨개진다</b>(실측). 세 트랜잭션이 모두 0 을 읽어
@@ -903,7 +914,7 @@ class CommentServiceTest {
 			모든_스레드를_post_UPDATE_직전에_모은다();
 
 			List<Throwable> 실패 = 동시에_실행한다(i -> this.commentService.create(
-					post.getId(), 동시_작성_대역, new CommentCreateRequest("동시 작성 " + i)));
+					post.getId(), 동시_작성_대역, new CommentCreateRequest("동시 작성 " + i, null)));
 
 			assertThat(실패).as("동시 작성이 실패하면 아래 단언은 소실을 보는 것이 아니다").isEmpty();
 			int 활성_댓글 = 활성_댓글_수(post.getId());
@@ -969,7 +980,7 @@ class CommentServiceTest {
 			this.발행된_문장.비운다();
 
 			this.commentService.create(
-					post.getId(), 작성_문장_대역, new CommentCreateRequest("문장 모양"));
+					post.getId(), 작성_문장_대역, new CommentCreateRequest("문장 모양", null));
 
 			List<String> post_UPDATE = this.발행된_문장.발행된_post_UPDATE();
 			assertThat(post_UPDATE)
@@ -1063,7 +1074,7 @@ class CommentServiceTest {
 
 		private Comment 서비스로_작성한_댓글(Post post, long writerId, String content) {
 			CommentResponse created = this.commentService.create(
-					post.getId(), writerId, new CommentCreateRequest(content));
+					post.getId(), writerId, new CommentCreateRequest(content, null));
 			return this.commentRepository.findById(created.id()).orElseThrow();
 		}
 
@@ -1439,7 +1450,7 @@ class CommentServiceTest {
 
 		private Comment 서비스로_작성한_댓글(Post post, long writerId, String content) {
 			CommentResponse created = this.commentService.create(
-					post.getId(), writerId, new CommentCreateRequest(content));
+					post.getId(), writerId, new CommentCreateRequest(content, null));
 			return this.commentRepository.findById(created.id()).orElseThrow();
 		}
 
@@ -1457,6 +1468,685 @@ class CommentServiceTest {
 			return count == null ? 0 : count;
 		}
 
+	}
+
+	/**
+	 * sp-docs/plan/phase2-board.md <b>B-22</b>(답글, C-05) 의 검증표 중 쓰기 순서·목록·집계 쪽이다.
+	 * HTTP 상태·에러 코드·응답 키 집합과 삭제된 최상위 자리의 JSON 모양은 {@code CommentControllerTest}
+	 * 의 B-22 중첩 클래스가, 글 삭제의 연쇄는 {@code CommentRepositoryTest} 가 본다.
+	 *
+	 * <h2>창에 끼워 넣는 측정 — H2 에서 본 것과 넘긴 것</h2>
+	 *
+	 * <p>같은 부모에 대한 동시 답글과, 답글의 부모 확인 뒤에 커밋되는 부모 삭제를 H2 에서 끼워 넣어
+	 * 잰다. 실 MySQL 의 측정은 sp-docs/plan/phase2-frontend-integration.md 의 I-07 이다 —
+	 * sp-docs/plan/phase2-board.md §4.1 의 「동시 답글, 같은 부모에 대한 답글 작성과 부모 삭제 —
+	 * 교착과 집계」 줄이 넘겼다. <b>교착은 여기서 재지 않는다.</b> sp-docs/domain-model.md §6 의
+	 * 블록인용은 「답글 작성({@code post} → 부모 행의 FK 공유 락)」 과 반대 순서가 교착할 것으로
+	 * 보았다(추정). H2 가 FK 검사에 같은 락을 거는지 확인하지 않았으므로, 여기서 교착이 나지 않는
+	 * 것은 MySQL 에 대해 말해 주는 것이 없다.
+	 *
+	 * <p>픽스처 글의 {@code writerId} 는 1311~1339 를 쓴다. 2026-11-17 에 테스트 소스 전체에서 그
+	 * 대역을 쓰는 곳이 없는 것을 확인하고 골랐다. 바깥 클래스의 {@code @AfterEach} 가 지우는 대역이
+	 * 아니므로 여기서 지운다. 답글이 부모를 참조하므로({@code fk_comment_parent_id}) 그 참조를 먼저
+	 * 끊고, 댓글이 글을 참조하므로 댓글을 먼저 지운다. <b>답글부터 지우는 순서로 두지 않는다</b> — 그
+	 * 순서는 깊이가 1 이라는 것에 기대야 FK 를 지난다. 깊이 판정을 뺀 변이에서 그 순서의 정리가 FK
+	 * 위반으로 멈춰, 남은 행이 다른 테스트 클래스까지 빨갛게 만들었다 (2026-11-17 B-22 실측,
+	 * {@code CommentControllerTest} 의 B-22 중첩 클래스의 정리).
+	 */
+	@Nested
+	@DisplayName("답글 — 쓰기 순서, 최상위 페이징과 답글, 삭제된 최상위의 자리, 창에 끼운 삭제")
+	@ContextConfiguration(classes = CommentServiceTest.StatementRecorderConfig.class)
+	class 답글 {
+
+		/** 댓글·답글을 쓰는 계정. 글의 {@code writerId} 가 대역이고 이 값은 정리 조건이 아니다. */
+		private static final long 댓글_작성자 = 1339L;
+
+		private static final long 발행_순서_대역 = 1311L;
+
+		private static final long 페이징_대역 = 1312L;
+
+		private static final long 자리_건수_대역 = 1313L;
+
+		private static final long 자리_소멸_대역 = 1314L;
+
+		private static final long 답글_없는_삭제_대역 = 1315L;
+
+		private static final long 지운_답글_대역 = 1316L;
+
+		private static final long 동률_대역 = 1317L;
+
+		private static final long 쿼리_수_대역 = 1318L;
+
+		private static final long 동시_답글_대역 = 1319L;
+
+		private static final long 창_대역 = 1320L;
+
+		private static final long 다른_글_대역 = 1321L;
+
+		/** 동시 요청 수. 둘 이상이어야 읽기들이 모두 쓰기보다 먼저인 끼워넣기가 생긴다. */
+		private static final int 동시_요청 = 3;
+
+		/** 집결지·끼워 넣은 삭제를 기다리는 한도. 넘으면 강제가 일어나지 않은 것이므로 터진다. */
+		private static final int 대기_한도_초 = 10;
+
+		@Autowired
+		private CommentService commentService;
+
+		@Autowired
+		private CommentRepository commentRepository;
+
+		@Autowired
+		private PostRepository postRepository;
+
+		/**
+		 * 바깥 클래스의 {@code @MockitoBean} 이 이 컨텍스트에도 상속된다. 바깥 인스턴스의 필드가 아니라
+		 * 이것에 스텁을 거는 이유는 {@link 작성_트랜잭션_경계} 의 같은 필드에 있다.
+		 */
+		@Autowired
+		private MemberClient memberClient;
+
+		@Autowired
+		private JdbcTemplate jdbcTemplate;
+
+		@Autowired
+		private StatementRecorder 발행된_문장;
+
+		@BeforeEach
+		void member_응답을_둔다() {
+			given(this.memberClient.findActiveNickname(anyLong())).willReturn(MEMBER_NICKNAME);
+		}
+
+		@AfterEach
+		void 픽스처_정리() {
+			this.발행된_문장.비운다();
+			this.jdbcTemplate.update("UPDATE comment SET parent_id = NULL WHERE post_id IN "
+					+ "(SELECT id FROM post WHERE writer_id BETWEEN 1311 AND 1339)");
+			this.jdbcTemplate.update("DELETE FROM comment WHERE post_id IN "
+					+ "(SELECT id FROM post WHERE writer_id BETWEEN 1311 AND 1339)");
+			this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 1311 AND 1339");
+		}
+
+		// --- 작성 ---
+
+		/**
+		 * 검증표 <b>「발행 순서」 → {@code update post} 가 {@code insert into comment} 보다 먼저다</b>.
+		 * 완료 기준 「답글 작성도 {@code comment_count} +1 이고 {@code post} 의 좁은 UPDATE 를 INSERT
+		 * 보다 먼저 한다 …」 의 순서 쪽이다 — +1 은 {@code CommentControllerTest} 의 답글 작성이 본다.
+		 *
+		 * <p>쓰기 문장의 목록을 통째로 대조하므로 다른 쓰기가 끼면 빨개진다 — 부모를 엔티티로 고치는
+		 * 구현이면 더티 체킹의 {@code update comment} 가 붙는다. 수집기가 꽂히지 않았으면 빈 목록에서
+		 * 빨개진다.
+		 */
+		@Test
+		@DisplayName("답글 작성은 post UPDATE 를 댓글 INSERT 보다 먼저 발행하고 다른 쓰기를 내지 않는다")
+		void 답글_작성은_post_UPDATE_가_먼저다() {
+			Post post = 게시글을_만든다(발행_순서_대역);
+			Comment 부모 = 서비스로_작성한_댓글(post, "부모");
+			this.발행된_문장.비운다();
+
+			this.commentService.create(post.getId(), 댓글_작성자,
+					new CommentCreateRequest("순서를 볼 답글", 부모.getId()));
+
+			assertThat(this.발행된_문장.발행된_쓰기())
+					.as("post 의 좁은 UPDATE 가 INSERT 보다 먼저다 (sp-docs/plan/phase2-board.md B-22). "
+							+ "수집기가 꽂히지 않았으면 빈 목록이다")
+					.extracting(StatementRecorder::쓰기의_머리)
+					.containsExactly("update post", "insert into comment");
+		}
+
+		// --- 목록 ---
+
+		/**
+		 * 검증표 <b>「최상위 25개와 각 답글」 → 첫 페이지 최상위 20, {@code totalElements} 25, 답글
+		 * 전부</b>. 페이징의 단위가 최상위 항목이고 답글은 {@code size} 에 세지 않는다
+		 * (sp-docs/api-contract.md §4.5). 첫 페이지가 꽉 차므로 {@code totalElements} 단언이 건수
+		 * 쿼리를 본다 (sp-docs/process/review-policy.md §4.1 의 {@code PageImpl} 블록인용).
+		 *
+		 * <p><b>답글 수를 최상위마다 다르게 두고, 답글의 시각을 등록의 역순으로 박는다.</b> 답글이
+		 * 엉뚱한 최상위에 붙거나 일부만 실리면 최상위별 목록이 어긋나고, 답글을 {@code id} 로만
+		 * 정렬하면 등록순({@code created_at ASC, id ASC})과 갈린다. 둘째 페이지의 최상위에도 답글이
+		 * 있다.
+		 */
+		@Test
+		@DisplayName("최상위 25개면 첫 페이지에 최상위 20개와 그 답글 전부가 등록순으로 실리고 totalElements 는 25 다")
+		void 최상위를_페이징하고_답글을_전부_싣는다() {
+			Post post = 게시글을_만든다(페이징_대역);
+			Map<Long, List<Long>> 최상위별_기대_답글 = new LinkedHashMap<>();
+			for (int i = 0; i < 25; i++) {
+				Comment 최상위 = 댓글을_둔다(post, "최상위 " + i);
+				LocalDateTime 최상위_시각 = FIXED_TIME.plusMinutes(i);
+				setCreatedAt(최상위.getId(), 최상위_시각);
+				int 답글_수 = 1 + i % 3;
+				List<Long> 기대_답글 = new ArrayList<>();
+				for (int k = 0; k < 답글_수; k++) {
+					Comment 답 = 답글을_둔다(post, 최상위, "답글 " + i + "-" + k);
+					// 나중에 둔 답글일수록 이른 시각이다. 그래서 기대 순서는 둔 순서의 역순이다
+					setCreatedAt(답.getId(), 최상위_시각.plusSeconds(답글_수 - k));
+					기대_답글.add(0, 답.getId());
+				}
+				최상위별_기대_답글.put(최상위.getId(), 기대_답글);
+			}
+
+			PageResponse<TopLevelCommentResponse> page = this.commentService.getList(
+					post.getId(), CommentPageCondition.of(null, null));
+
+			assertThat(page.content()).extracting(TopLevelCommentResponse::id)
+					.as("페이징 단위는 최상위 항목이고 기본 크기는 20 이다 (sp-docs/api-contract.md §4.5)")
+					.containsExactlyElementsOf(
+							new ArrayList<>(최상위별_기대_답글.keySet()).subList(0, 20));
+			assertThat(page.totalElements())
+					.as("totalElements 는 최상위 항목의 수다 (sp-docs/api-contract.md §4.5)")
+					.isEqualTo(25);
+			assertThat(page.totalPages()).isEqualTo(2);
+			assertThat(page.content())
+					.as("각 최상위 아래에 활성 답글이 전부 등록순으로 실린다 "
+							+ "(sp-docs/requirements/board.md §12)")
+					.allSatisfy(item -> assertThat(item.replies())
+							.extracting(CommentResponse::id)
+							.containsExactlyElementsOf(최상위별_기대_답글.get(item.id())));
+		}
+
+		/**
+		 * 검증표 <b>「활성 최상위 2·활성 답글이 있는 삭제된 최상위 1·답글 없는 삭제된 최상위 1,
+		 * {@code size=2} 의 첫 페이지」 → {@code totalElements} 3</b> — 페이지가 꽉 차 건수 쿼리를
+		 * 본다 (sp-docs/process/review-policy.md §4.1 의 {@code PageImpl} 블록인용).
+		 *
+		 * <p><b>3 이 다른 셈과 겹치지 않게 둔다.</b> 이 글에서 활성 최상위만 세면 2, 최상위를 모두
+		 * 세면 4, 답글을 포함한 활성 댓글을 세면({@code comment_count} 의 셈) 5 다 — 삭제된 최상위에
+		 * 답글을 둘, 활성 최상위 하나에 답글을 하나 둔 까닭이다. 다른 글에도 최상위와 답글을 둔다 —
+		 * 건수의 글 조건이 빠지면 그것까지 센다.
+		 */
+		@Test
+		@DisplayName("활성 답글이 있는 삭제된 최상위는 자리로 남아 건수에 들고 답글 없는 삭제된 최상위는 빠진다")
+		void 활성_답글이_있는_삭제된_최상위만_자리로_센다() {
+			자리_픽스처 픽스처 = 자리_픽스처를_둔다(자리_건수_대역);
+
+			PageResponse<TopLevelCommentResponse> 첫_페이지 = this.commentService.getList(
+					픽스처.post().getId(), CommentPageCondition.of(0, 2));
+
+			assertThat(첫_페이지.content()).extracting(TopLevelCommentResponse::id)
+					.as("자리는 그 댓글의 등록순 자리에 온다")
+					.containsExactly(픽스처.첫_활성().getId(), 픽스처.답글_있는_삭제().getId());
+			assertThat(첫_페이지.totalElements())
+					.as("최상위 항목 — 활성 최상위와 활성 답글이 있는 삭제된 최상위 (sp-docs/api-contract.md §4.5)")
+					.isEqualTo(3);
+			assertThat(첫_페이지.totalPages()).isEqualTo(2);
+		}
+
+		/**
+		 * 검증표 <b>「위에서 그 삭제된 최상위의 답글까지 삭제, 같은 {@code size}」 → 자리가 사라지고
+		 * {@code totalElements} 2</b>.
+		 *
+		 * <p>그 최상위에 답글이 둘이다. 하나를 지운 뒤에는 활성 답글이 남아 있으므로 자리가 그대로이고,
+		 * 둘 다 지운 뒤에 사라진다 (sp-docs/requirements/board.md §12 — 「활성 답글이 없어지면 그 자리도
+		 * 사라진다」). 마지막 페이지도 꽉 차므로 건수 쿼리를 본다.
+		 */
+		@Test
+		@DisplayName("자리의 활성 답글이 하나라도 남으면 자리가 남고 모두 지우면 자리가 사라져 totalElements 가 2 다")
+		void 자리의_답글을_모두_지우면_자리가_사라진다() {
+			자리_픽스처 픽스처 = 자리_픽스처를_둔다(자리_소멸_대역);
+			Long postId = 픽스처.post().getId();
+
+			지운다(픽스처.첫_답글());
+			PageResponse<TopLevelCommentResponse> 하나_남음 = this.commentService.getList(
+					postId, CommentPageCondition.of(0, 2));
+			지운다(픽스처.둘째_답글());
+			PageResponse<TopLevelCommentResponse> 모두_지움 = this.commentService.getList(
+					postId, CommentPageCondition.of(0, 2));
+
+			assertThat(하나_남음.content()).extracting(TopLevelCommentResponse::id)
+					.as("활성 답글이 하나라도 남아 있으면 자리가 남는다")
+					.containsExactly(픽스처.첫_활성().getId(), 픽스처.답글_있는_삭제().getId());
+			assertThat(하나_남음.totalElements()).isEqualTo(3);
+			assertThat(모두_지움.content()).extracting(TopLevelCommentResponse::id)
+					.as("활성 답글이 없어지면 자리도 사라진다 (sp-docs/requirements/board.md §12)")
+					.containsExactly(픽스처.첫_활성().getId(), 픽스처.둘째_활성().getId());
+			assertThat(모두_지움.totalElements()).isEqualTo(2);
+		}
+
+		/**
+		 * 검증표 <b>「답글 없는 최상위 삭제」 → 목록에서 사라진다</b>.
+		 *
+		 * <p>같은 글의 다른 최상위에 활성 답글을 둔다. 자리를 남기는 조건이 그 최상위 <b>자신의</b>
+		 * 답글이 아니라 글의 답글을 보면 지운 최상위가 자리로 남는다.
+		 */
+		@Test
+		@DisplayName("답글이 없는 최상위를 지우면 목록에서 사라진다 — 같은 글의 다른 최상위에 답글이 있어도")
+		void 답글_없는_최상위를_지우면_목록에서_사라진다() {
+			Post post = 게시글을_만든다(답글_없는_삭제_대역);
+			Comment 답글_있는_최상위 = 서비스로_작성한_댓글(post, "답글이 있는 최상위");
+			서비스로_작성한_답글(post, 답글_있는_최상위, "다른 최상위의 답글");
+			Comment 지울_최상위 = 서비스로_작성한_댓글(post, "답글이 없는 최상위");
+
+			지운다(지울_최상위);
+
+			assertThat(목록(post)).extracting(TopLevelCommentResponse::id)
+					.as("활성 답글이 없는 삭제된 최상위는 자리로도 남지 않는다 "
+							+ "(sp-docs/requirements/board.md §12)")
+					.containsExactly(답글_있는_최상위.getId());
+		}
+
+		/**
+		 * 검증표 <b>「지운 답글」 → 싣지 않는다</b>. 지운 그 하나만 {@code comment_count} −1 인 것을
+		 * 함께 본다 — 답글도 댓글이다 (sp-docs/domain-model.md §5).
+		 */
+		@Test
+		@DisplayName("지운 답글은 목록에 실리지 않고 comment_count 는 그 하나만 준다")
+		void 지운_답글은_싣지_않는다() {
+			Post post = 게시글을_만든다(지운_답글_대역);
+			Comment 최상위 = 서비스로_작성한_댓글(post, "최상위");
+			Comment 첫째 = 서비스로_작성한_답글(post, 최상위, "첫째 답글");
+			Comment 둘째 = 서비스로_작성한_답글(post, 최상위, "둘째 답글");
+			Comment 셋째 = 서비스로_작성한_답글(post, 최상위, "셋째 답글");
+			assertThat(커밋된_집계(post.getId()))
+					.as("답글 작성도 +1 이어야 삭제의 −1 이 무엇과 비교하는지 정해진다")
+					.isEqualTo(4);
+
+			지운다(둘째);
+
+			assertThat(목록(post)).singleElement()
+					.satisfies(item -> assertThat(item.replies())
+							.extracting(CommentResponse::id)
+							.as("지운 답글은 목록에 싣지 않는다 (sp-docs/api-contract.md §4.5)")
+							.containsExactly(첫째.getId(), 셋째.getId()));
+			assertThat(커밋된_집계(post.getId()))
+					.as("지운 그 하나만 −1 (sp-docs/domain-model.md §5)")
+					.isEqualTo(3);
+		}
+
+		/**
+		 * 검증표 <b>「같은 {@code created_at} 의 최상위·답글」 → {@code id} 로 순서가 정해진다</b>
+		 * (sp-docs/api-contract.md §4.5 — 「최상위와 답글 모두 {@code created_at ASC, id ASC} 다」).
+		 *
+		 * <p>최상위와 답글의 시각을 모두 같게 박는다. 1차 키가 전부 동률이므로 남는 순서는 마지막
+		 * 정렬 키뿐이다. 두 최상위에 답글을 번갈아 두어 부모별로 나눈 뒤의 순서도 본다.
+		 *
+		 * <p><b>이 테스트는 두 조회의 {@code id DESC} 를 잡지만 {@code id} 를 뺀 구현은 잡지 못한다</b>
+		 * (2026-11-17 B-22 실측 — 사본에서 두 조회의 마지막 정렬 키를 하나씩 바꿔 전체 스위트를
+		 * 돌렸다). H2 는 동률이 한 페이지에 다 들어가는 조회에서 {@code id} 오름차순으로 돌려줬고,
+		 * 페이지가 동률 사이를 자르는 조회에서는 그러지 않았다 — 이유는 재지 않았다. 그래서 최상위
+		 * 조회에서 뺀 변이는 페이지가 동률을 가르는 테스트들
+		 * ({@link #활성_답글이_있는_삭제된_최상위만_자리로_센다()},
+		 * {@link #자리의_답글을_모두_지우면_자리가_사라진다()},
+		 * {@link CommentServiceTest#created_at_동률의_페이지_경계()}) 이 잡았다. <b>답글 조회에서 뺀 변이는
+		 * 전체 스위트가 녹색이었다</b> — 답글 조회는 페이징하지 않는다.
+		 */
+		@Test
+		@DisplayName("created_at 이 같으면 최상위도 답글도 id 오름차순이다")
+		void 같은_created_at_이면_최상위도_답글도_id_순이다() {
+			Post post = 게시글을_만든다(동률_대역);
+			List<Long> 최상위 = new ArrayList<>();
+			for (int i = 0; i < 3; i++) {
+				최상위.add(댓글을_둔다(post, "동률 최상위 " + i).getId());
+			}
+			Comment 첫_최상위 = this.commentRepository.findById(최상위.get(0)).orElseThrow();
+			Comment 둘째_최상위 = this.commentRepository.findById(최상위.get(1)).orElseThrow();
+			List<Long> 첫_최상위의_답글 = new ArrayList<>();
+			List<Long> 둘째_최상위의_답글 = new ArrayList<>();
+			for (int k = 0; k < 3; k++) {
+				첫_최상위의_답글.add(답글을_둔다(post, 첫_최상위, "동률 답글 " + k).getId());
+				둘째_최상위의_답글.add(답글을_둔다(post, 둘째_최상위, "동률 답글 " + k).getId());
+			}
+			this.jdbcTemplate.update("UPDATE comment SET created_at = ? WHERE post_id = ?",
+					FIXED_TIME, post.getId());
+
+			List<TopLevelCommentResponse> 목록 = 목록(post);
+
+			assertThat(목록).extracting(TopLevelCommentResponse::id)
+					.as("최상위의 1차 키가 동률이면 id ASC 다")
+					.containsExactlyElementsOf(최상위);
+			assertThat(목록.get(0).replies()).extracting(CommentResponse::id)
+					.as("답글의 1차 키가 동률이면 id ASC 다")
+					.containsExactlyElementsOf(첫_최상위의_답글);
+			assertThat(목록.get(1).replies()).extracting(CommentResponse::id)
+					.containsExactlyElementsOf(둘째_최상위의_답글);
+			assertThat(목록.get(2).replies()).isEmpty();
+		}
+
+		/**
+		 * 검증표 <b>「목록 쿼리 수」 → 최상위·답글 수를 바꾼 두 측정이 같다</b>. 완료 기준 「목록의
+		 * 쿼리 수가 최상위 항목 수·답글 수와 무관하다 — 행 수만 바꾼 두 측정이 같은지 본다 …」 이다.
+		 * 단언은 행 수가 실제로 달라졌는지, 수집기가 살아 있는지, 두 집계가 같은지를 본다 — 앞의 둘이
+		 * 없으면 마지막 단언이 아무것도 보지 못한다.
+		 *
+		 * <p><b>두 측정 모두 첫 페이지가 꽉 차지 않게 둔다.</b> 꽉 차면 건수 쿼리가 더 나가므로 한쪽만
+		 * 꽉 차면 행 수와 무관한 이유로 두 집계가 갈린다. 크기를 같게 둔 채 둘 다 꽉 채우면 페이지의
+		 * 최상위 수가 같아져 최상위마다 내는 쿼리를 볼 수 없다. <b>삭제된 최상위의 자리 수도 두 측정이
+		 * 다르다</b> — 자리마다 쿼리를 내는 구현도 갈린다.
+		 */
+		@Test
+		@DisplayName("목록의 statement 수가 최상위 항목 수·답글 수와 무관하게 같다")
+		void 목록의_쿼리_수가_최상위와_답글_수와_무관하다() {
+			Post 적은_쪽 = 게시글을_만든다(쿼리_수_대역);
+			Post 많은_쪽 = 게시글을_만든다(쿼리_수_대역);
+			자리와_최상위들을_둔다(적은_쪽, 2, 1, 1);
+			자리와_최상위들을_둔다(많은_쪽, 5, 2, 3);
+
+			목록_측정 적게 = 목록을_잰다(적은_쪽);
+			목록_측정 많이 = 목록을_잰다(많은_쪽);
+
+			assertThat(적게.최상위()).as("행 수가 달라지지 않으면 집계가 같은 것이 아무것도 뜻하지 않는다")
+					.isEqualTo(2);
+			assertThat(적게.자리()).isEqualTo(1);
+			assertThat(적게.답글()).isEqualTo(2);
+			assertThat(많이.최상위()).isEqualTo(5);
+			assertThat(많이.자리()).isEqualTo(2);
+			assertThat(많이.답글()).isEqualTo(15);
+			assertThat(적게.문장())
+					.as("수집기가 꽂히지 않았으면 두 집계가 모두 0 이고 같다는 단언이 무의미해진다")
+					.isPositive();
+			assertThat(많이.문장())
+					.as("최상위·답글이 늘었는데 statement 가 늘면 항목마다 쿼리를 낸 것이다 "
+							+ "(sp-docs/plan/phase2-board.md B-22)")
+					.isEqualTo(적게.문장());
+		}
+
+		// --- 창에 끼워 넣는 측정 ---
+
+		/**
+		 * 같은 부모에 동시 답글 {@code 동시_요청} 건 — 모든 읽기(글·부모)가 어느 쓰기보다 먼저 일어나게
+		 * {@code update post} 직전에 모은다. 모두 성공하고 {@code comment_count} 가 답글을 포함한 활성
+		 * 댓글 수와 같다 (sp-docs/domain-model.md §5·§6). 실 MySQL 의 측정은
+		 * sp-docs/plan/phase2-frontend-integration.md 의 I-07 이다.
+		 */
+		@Test
+		@DisplayName("같은 부모에 동시 답글을 달면 모두 성공하고 comment_count 가 활성 댓글 수와 같다")
+		void 같은_부모에_동시_답글() throws InterruptedException {
+			Post post = 게시글을_만든다(동시_답글_대역);
+			Comment 부모 = 서비스로_작성한_댓글(post, "동시 답글의 부모");
+			모든_스레드를_post_UPDATE_직전에_모은다();
+
+			List<Throwable> 실패 = 동시에_실행한다(i -> this.commentService.create(post.getId(),
+					댓글_작성자, new CommentCreateRequest("동시 답글 " + i, 부모.getId())));
+
+			assertThat(실패).as("동시 답글이 실패하면 집계 단언은 동시 작성을 보는 것이 아니다").isEmpty();
+			assertThat(답글_수(부모.getId())).isEqualTo(동시_요청);
+			int 활성_댓글 = 활성_댓글_수(post.getId());
+			assertThat(활성_댓글).isEqualTo(동시_요청 + 1);
+			assertThat(커밋된_집계(post.getId()))
+					.as("comment_count 는 답글을 포함한 활성 댓글 수다 (sp-docs/domain-model.md §5)")
+					.isEqualTo(활성_댓글);
+		}
+
+		/**
+		 * 완료 기준 <b>「부모 확인과 커밋 사이의 창은 닫지 않는다」</b>. 답글이 부모를 활성으로 확인한
+		 * 뒤, 첫 쓰기 직전에 다른 트랜잭션이 그 부모를 지우고 커밋한다. 답글은 생기고, 부모는 지워졌지만
+		 * 활성 답글이 있어 목록에 자리로 남는다 — sp-docs/requirements/board.md §12 가 「삭제된 댓글에
+		 * 답글 불가」 를 보장이 아니라 통상 동작으로 둔 결과다. 집계는 답글을 포함한 활성 댓글 수와 같다.
+		 *
+		 * <p>끼우는 삭제는 실제 삭제 경로({@code CommentService.delete})다. 그 삭제도 {@code update
+		 * post} 를 내므로 훅이 그 스레드에서도 불린다 — 답글을 쓰는 스레드에서만 끼운다.
+		 *
+		 * <p><b>부모 확인을 집계 증가 뒤로 옮기면 이 테스트가 빨개진다</b> — 사본에서 그렇게 옮기자
+		 * 답글이 404 {@code CM001} 로 끝났다 (2026-11-17 B-22 실측). 그래서 이 테스트는 확인이 첫
+		 * 쓰기보다 앞이라는 것도 지킨다 — 그 순서의 이유는 {@code CommentService.create} 가 적는다.
+		 */
+		@Test
+		@DisplayName("부모 확인 뒤 커밋 전에 부모가 지워지면 답글이 생기고 부모는 자리로 남으며 집계가 맞다")
+		void 부모_확인_뒤에_지워진_부모_아래에_답글이_생긴다() {
+			Post post = 게시글을_만든다(창_대역);
+			Comment 부모 = 서비스로_작성한_댓글(post, "곧 지워질 부모");
+			Thread 답글_스레드 = Thread.currentThread();
+			AtomicBoolean 끼운_삭제가_끝났다 = new AtomicBoolean();
+			this.발행된_문장.훅을_건다(sql -> sql.startsWith("update post"), () -> {
+				if (Thread.currentThread() == 답글_스레드) {
+					다른_스레드에서_지운다(부모);
+					끼운_삭제가_끝났다.set(true);
+				}
+			});
+
+			CommentResponse 답 = this.commentService.create(post.getId(), 댓글_작성자,
+					new CommentCreateRequest("창 안의 답글", 부모.getId()));
+
+			assertThat(끼운_삭제가_끝났다)
+					.as("부모 삭제가 답글의 부모 확인 뒤, 첫 쓰기 전에 커밋돼야 이 측정이 창을 본다")
+					.isTrue();
+			assertThat(삭제됐다(부모.getId())).as("끼운 삭제가 커밋됐다").isTrue();
+			assertThat(답.parentId()).isEqualTo(부모.getId());
+			int 활성_댓글 = 활성_댓글_수(post.getId());
+			assertThat(활성_댓글).as("활성 댓글은 그 답글 하나다").isEqualTo(1);
+			assertThat(커밋된_집계(post.getId()))
+					.as("부모의 −1 과 답글의 +1 이 둘 다 남는다 (sp-docs/domain-model.md §5)")
+					.isEqualTo(활성_댓글);
+			assertThat(목록(post)).singleElement()
+					.satisfies(item -> {
+						assertThat(item.id()).isEqualTo(부모.getId());
+						assertThat(item.deleted()).as("지운 부모는 자리로 남는다").isTrue();
+						assertThat(item.replies()).extracting(CommentResponse::id)
+								.containsExactly(답.id());
+					});
+		}
+
+		/**
+		 * {@code 동시_요청} 개 스레드를 {@code update post} 가 발행되기 직전에 모은다. 한도 안에 모이지
+		 * 않으면 {@link IllegalStateException} 으로 터진다 — 강제가 일어나지 않은 측정이 통과하지 않게
+		 * 한다.
+		 */
+		private void 모든_스레드를_post_UPDATE_직전에_모은다() {
+			CyclicBarrier 집결지 = new CyclicBarrier(동시_요청);
+			this.발행된_문장.훅을_건다(sql -> sql.startsWith("update post"), () -> {
+				try {
+					집결지.await(대기_한도_초, TimeUnit.SECONDS);
+				}
+				catch (InterruptedException | BrokenBarrierException | TimeoutException ex) {
+					throw new IllegalStateException(
+							"post UPDATE 직전에 모든 스레드가 모이지 않았다 — 읽기가 모두 쓰기보다 먼저라는 "
+									+ "끼워넣기가 강제되지 않았다", ex);
+				}
+			});
+		}
+
+		/** 스레드 번호를 받는 작업을 {@code 동시_요청} 개 스레드로 동시에 돌리고 실패를 모은다. */
+		private List<Throwable> 동시에_실행한다(IntConsumer 작업) throws InterruptedException {
+			ExecutorService 풀 = Executors.newFixedThreadPool(동시_요청);
+			try {
+				List<Future<?>> 결과 = new ArrayList<>();
+				for (int i = 0; i < 동시_요청; i++) {
+					int index = i;
+					결과.add(풀.submit(() -> 작업.accept(index)));
+				}
+
+				List<Throwable> 실패 = new ArrayList<>();
+				for (Future<?> future : 결과) {
+					try {
+						future.get(대기_한도_초 * 3L, TimeUnit.SECONDS);
+					}
+					catch (ExecutionException ex) {
+						실패.add(ex.getCause());
+					}
+					catch (TimeoutException ex) {
+						실패.add(ex);
+					}
+				}
+				return 실패;
+			}
+			finally {
+				풀.shutdownNow();
+			}
+		}
+
+		/**
+		 * 다른 스레드에서 서비스의 삭제로 댓글을 지우고 커밋까지 기다린다. <b>다른 스레드여야 한다</b> —
+		 * 부르는 스레드에는 답글의 트랜잭션이 묶여 있어 같은 스레드의 호출은 그 트랜잭션에 참여한다.
+		 * 끝나지 않거나 실패하면 {@link IllegalStateException} 으로 터진다.
+		 */
+		private void 다른_스레드에서_지운다(Comment comment) {
+			ExecutorService 다른_스레드 = Executors.newSingleThreadExecutor();
+			try {
+				다른_스레드.submit(() -> this.commentService.delete(comment.getId(), user(댓글_작성자)))
+						.get(대기_한도_초, TimeUnit.SECONDS);
+			}
+			catch (InterruptedException | ExecutionException | TimeoutException ex) {
+				throw new IllegalStateException(
+						"끼운 부모 삭제가 커밋되지 않았다 — 이 측정은 창을 볼 수 없다", ex);
+			}
+			finally {
+				다른_스레드.shutdownNow();
+			}
+		}
+
+		// --- 픽스처 ---
+
+		/**
+		 * 검증표 「활성 최상위 2·활성 답글이 있는 삭제된 최상위 1·답글 없는 삭제된 최상위 1, …」 의
+		 * 픽스처다. 삭제된 최상위에 활성 답글을 둘, 활성 최상위 하나에 답글을 하나 둔다 — 그 까닭은
+		 * {@link #활성_답글이_있는_삭제된_최상위만_자리로_센다()} 와
+		 * {@link #자리의_답글을_모두_지우면_자리가_사라진다()} 에 있다. 다른 글에 활성 최상위와 답글을
+		 * 하나씩 둔다. 모두 서비스로 쓰고 지우므로 집계가 활성 댓글 수와 같다.
+		 *
+		 * <p>둔 순서가 등록순이다 — 첫 활성, 답글 있는 삭제, 답글 없는 삭제, 둘째 활성. 자리를 활성 최상위
+ * 사이에 둔다 — 자리를 맨 앞이나 맨 뒤에 두는 정렬이 첫 페이지에서 갈린다(2026-11-17 B-22 리뷰
+ * 1라운드: 자리를 맨 앞에 둔 픽스처에서는 {@code deleted desc} 를 앞세운 변이가 살았다).
+		 */
+		private 자리_픽스처 자리_픽스처를_둔다(long 대역) {
+			Post post = 게시글을_만든다(대역);
+			Comment 첫_활성 = 서비스로_작성한_댓글(post, "첫 활성 최상위");
+			서비스로_작성한_답글(post, 첫_활성, "활성 최상위의 답글");
+			Comment 답글_있는_삭제 = 서비스로_작성한_댓글(post, "답글이 있어 자리로 남을 최상위");
+			Comment 첫_답글 = 서비스로_작성한_답글(post, 답글_있는_삭제, "자리의 첫 답글");
+			Comment 둘째_답글 = 서비스로_작성한_답글(post, 답글_있는_삭제, "자리의 둘째 답글");
+			Comment 답글_없는_삭제 = 서비스로_작성한_댓글(post, "답글 없이 지울 최상위");
+			Comment 둘째_활성 = 서비스로_작성한_댓글(post, "둘째 활성 최상위");
+			지운다(답글_있는_삭제);
+			지운다(답글_없는_삭제);
+
+			Post 다른_글 = 게시글을_만든다(다른_글_대역);
+			서비스로_작성한_답글(다른_글, 서비스로_작성한_댓글(다른_글, "다른 글의 최상위"), "다른 글의 답글");
+
+			return new 자리_픽스처(post, 답글_있는_삭제, 첫_답글, 둘째_답글, 첫_활성, 둘째_활성);
+		}
+
+		/**
+		 * 최상위 {@code 최상위_수} 개를 두고 그 가운데 앞의 {@code 자리_수} 개를 지운다. 최상위마다
+		 * 활성 답글을 {@code 답글_수} 개 두므로 지운 최상위는 자리로 남는다. 집계를 거치지 않는다.
+		 */
+		private void 자리와_최상위들을_둔다(Post post, int 최상위_수, int 자리_수, int 답글_수) {
+			for (int i = 0; i < 최상위_수; i++) {
+				Comment 최상위 = 댓글을_둔다(post, "쿼리 수 최상위 " + i);
+				for (int k = 0; k < 답글_수; k++) {
+					답글을_둔다(post, 최상위, "쿼리 수 답글 " + i + "-" + k);
+				}
+				if (i < 자리_수) {
+					this.jdbcTemplate.update(
+							"UPDATE comment SET deleted = TRUE WHERE id = ?", 최상위.getId());
+				}
+			}
+		}
+
+		/**
+		 * 기본 크기로 목록을 한 번 조회하고 그 조회가 낸 statement 수를 센다. 세는 구간은 조회
+		 * 한 번이다 — 픽스처의 INSERT 가 섞이지 않는다.
+		 */
+		private 목록_측정 목록을_잰다(Post post) {
+			this.발행된_문장.비운다();
+			PageResponse<TopLevelCommentResponse> page = this.commentService.getList(
+					post.getId(), CommentPageCondition.of(null, null));
+			int 문장 = this.발행된_문장.발행된_문장_수();
+			int 자리 = (int) page.content().stream().filter(TopLevelCommentResponse::deleted).count();
+			int 답글 = page.content().stream().mapToInt(item -> item.replies().size()).sum();
+			return new 목록_측정(page.content().size(), 자리, 답글, 문장);
+		}
+
+		private List<TopLevelCommentResponse> 목록(Post post) {
+			return this.commentService.getList(post.getId(), CommentPageCondition.of(null, null))
+					.content();
+		}
+
+		private Post 게시글을_만든다(long writerId) {
+			return this.postRepository.saveAndFlush(Post.builder()
+					.writerId(writerId)
+					.writerNickname("글작성자")
+					.title("답글 대상")
+					.content("본문")
+					.build());
+		}
+
+		/** 최상위 댓글을 서비스로 쓴다 — 집계가 오른다. */
+		private Comment 서비스로_작성한_댓글(Post post, String content) {
+			CommentResponse created = this.commentService.create(
+					post.getId(), 댓글_작성자, new CommentCreateRequest(content, null));
+			return this.commentRepository.findById(created.id()).orElseThrow();
+		}
+
+		/** 답글을 서비스로 쓴다 — 집계가 오른다. */
+		private Comment 서비스로_작성한_답글(Post post, Comment parent, String content) {
+			CommentResponse created = this.commentService.create(
+					post.getId(), 댓글_작성자, new CommentCreateRequest(content, parent.getId()));
+			return this.commentRepository.findById(created.id()).orElseThrow();
+		}
+
+		/** 집계를 거치지 않는 최상위 댓글. 집계를 보지 않는 테스트가 쓴다. */
+		private Comment 댓글을_둔다(Post post, String content) {
+			return this.commentRepository.saveAndFlush(Comment.builder()
+					.post(post)
+					.writerId(댓글_작성자)
+					.writerNickname("댓글작성자")
+					.content(content)
+					.build());
+		}
+
+		/** 집계를 거치지 않는 답글. */
+		private Comment 답글을_둔다(Post post, Comment parent, String content) {
+			return this.commentRepository.saveAndFlush(Comment.builder()
+					.post(post)
+					.parent(parent)
+					.writerId(댓글_작성자)
+					.writerNickname("댓글작성자")
+					.content(content)
+					.build());
+		}
+
+		/** 서비스의 삭제로 지운다 — 집계가 준다. */
+		private void 지운다(Comment comment) {
+			this.commentService.delete(comment.getId(), user(댓글_작성자));
+		}
+
+		private void setCreatedAt(Long commentId, LocalDateTime createdAt) {
+			this.jdbcTemplate.update(
+					"UPDATE comment SET created_at = ? WHERE id = ?", createdAt, commentId);
+		}
+
+		/** JPA 를 거치지 않고 커밋된 값을 읽는다. 다른 스레드가 커밋한 것을 봐야 한다. */
+		private int 커밋된_집계(Long postId) {
+			Integer count = this.jdbcTemplate.queryForObject(
+					"SELECT comment_count FROM post WHERE id = ?", Integer.class, postId);
+			return count == null ? 0 : count;
+		}
+
+		private int 활성_댓글_수(Long postId) {
+			Integer count = this.jdbcTemplate.queryForObject(
+					"SELECT COUNT(*) FROM comment WHERE post_id = ? AND deleted = FALSE",
+					Integer.class, postId);
+			return count == null ? 0 : count;
+		}
+
+		private int 답글_수(Long parentId) {
+			Integer count = this.jdbcTemplate.queryForObject(
+					"SELECT COUNT(*) FROM comment WHERE parent_id = ? AND deleted = FALSE",
+					Integer.class, parentId);
+			return count == null ? 0 : count;
+		}
+
+		private boolean 삭제됐다(Long commentId) {
+			Boolean deleted = this.jdbcTemplate.queryForObject(
+					"SELECT deleted FROM comment WHERE id = ?", Boolean.class, commentId);
+			return Boolean.TRUE.equals(deleted);
+		}
+
+	}
+
+	/** {@link 답글} 의 자리 픽스처. 둔 것은 {@code 자리_픽스처를_둔다} 의 주석에 있다. */
+	private record 자리_픽스처(
+			Post post,
+			Comment 답글_있는_삭제,
+			Comment 첫_답글,
+			Comment 둘째_답글,
+			Comment 첫_활성,
+			Comment 둘째_활성) {
+	}
+
+	/** 목록 조회 한 번의 최상위 항목 수·그중 자리의 수·답글 수와 그 조회가 낸 statement 수. */
+	private record 목록_측정(int 최상위, int 자리, int 답글, int 문장) {
 	}
 
 	/**
@@ -1535,9 +2225,34 @@ class CommentServiceTest {
 					.toList();
 		}
 
+		/** 쓰기 문장(UPDATE·INSERT·DELETE)만. 수집된 순서 그대로이고 정규화된 문장이다. */
+		List<String> 발행된_쓰기() {
+			return this.발행된_문장.stream()
+					.map(StatementRecorder::정규화)
+					.filter(sql -> sql.startsWith("update ") || sql.startsWith("insert ")
+							|| sql.startsWith("delete "))
+					.toList();
+		}
+
+		/** 수집된 모든 문장의 수. */
+		int 발행된_문장_수() {
+			return this.발행된_문장.size();
+		}
+
 		/** 정규화된 {@code update <테이블> …} 문장의 테이블 이름. */
 		static String 대상_테이블(String 정규화된_UPDATE) {
 			return 정규화된_UPDATE.split(" ")[1];
+		}
+
+		/**
+		 * 정규화된 쓰기 문장의 머리 — {@code update <테이블>}, {@code insert into <테이블>},
+		 * {@code delete from <테이블>}.
+		 */
+		static String 쓰기의_머리(String 정규화된_쓰기) {
+			String[] 낱말 = 정규화된_쓰기.split(" ");
+			return "update".equals(낱말[0])
+					? 낱말[0] + " " + 낱말[1]
+					: 낱말[0] + " " + 낱말[1] + " " + 낱말[2];
 		}
 
 		private static String 정규화(String sql) {
@@ -1593,7 +2308,7 @@ class CommentServiceTest {
 	private Comment 서비스로_작성한_댓글(Post post, long writerId, String content) {
 		given(this.memberClient.findActiveNickname(writerId)).willReturn("댓글작성자");
 		CommentResponse created = this.commentService.create(
-				post.getId(), writerId, new CommentCreateRequest(content));
+				post.getId(), writerId, new CommentCreateRequest(content, null));
 		return this.commentRepository.findById(created.id()).orElseThrow();
 	}
 

@@ -4,8 +4,15 @@ import jakarta.validation.constraints.NotBlank;
 import jakarta.validation.constraints.Size;
 
 /**
- * 댓글 작성 요청 본문 (C-01). 정본: sp-docs/requirements/board.md §4 — content(댓글)는
- * 1~500자다. 위반은 400 {@code C001} 이다 (sp-docs/api-contract.md §8.1).
+ * 댓글 작성 요청 본문 (C-01, C-05). 정본: sp-docs/requirements/board.md §4 — content(댓글)는
+ * 1~500자이고, parentId 는 생략하거나 같은 글의 활성 최상위 댓글 id 다. content 위반은 400
+ * {@code C001} 이다 (sp-docs/api-contract.md §8.1).
+ *
+ * <p><b>{@code parentId} 가 없거나 {@code null} 이면 최상위 댓글이다</b> (sp-docs/api-contract.md
+ * §4.5). 값이 있으면 그 댓글의 답글이다. <b>그 값의 판정 — 부모가 있는가·같은 글인가·활성인가
+ * (404 {@code CM001}), 부모가 최상위인가(400 {@code CM003}) — 을 이 레코드가 하지 않는다.</b> 글과
+ * 부모 행을 읽어야 판정할 수 있으므로 {@code CommentService} 가 한다
+ * (sp-docs/requirements/board.md §12 의 판정 순서).
  *
  * <p><b>{@code postId} 필드를 두지 않는다.</b> 대상 게시글은 경로
  * ({@code /api/v1/posts/{postId}/comments})가 담는다 (sp-docs/api-contract.md §4). 본문에도
@@ -25,12 +32,15 @@ import jakarta.validation.constraints.Size;
  * {@code DataIntegrityViolationException} 으로 터진다.
  *
  * @param content 댓글 내용
+ * @param parentId 답글이면 부모 댓글의 id. 최상위 댓글이면 생략하거나 {@code null}
  */
 public record CommentCreateRequest(
 
 		@NotBlank(message = CONTENT_MESSAGE)
 		@Size(max = CONTENT_MAX_LENGTH, message = CONTENT_MESSAGE)
-		String content) {
+		String content,
+
+		Long parentId) {
 
 	/** sp-docs/requirements/board.md §4. 컬럼 폭도 500 이다 (sp-docs/domain-model.md §4.2). */
 	public static final int CONTENT_MAX_LENGTH = 500;

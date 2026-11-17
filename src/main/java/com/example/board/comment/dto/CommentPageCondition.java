@@ -9,6 +9,10 @@ package com.example.board.comment.dto;
  * {@code size} 1~50, 초과 시 50으로 절삭). {@code page} 기본값 0 은 게시글 목록과 같다
  * (sp-docs/api-contract.md §4.1).
  *
+ * <p><b>{@code size} 는 최상위 항목의 수다.</b> sp-docs/api-contract.md §4.5 가 「페이징의
+ * 단위는 최상위 항목이다」 로 정했다 — 답글은 그 항목에 딸려 오고 {@code size} 에 세지 않는다
+ * (C-05, sp-docs/requirements/board.md §12).
+ *
  * <p><b>정렬 파라미터가 없다.</b> 댓글 목록은 등록순 하나뿐이므로
  * (sp-docs/requirements/board.md §2 의 C-02) 고를 것이 없고, 순서는
  * {@code CommentRepository} 의 쿼리가 {@code created_at ASC, id ASC} 로 고정한다

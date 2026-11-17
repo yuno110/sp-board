@@ -5,6 +5,7 @@ import com.example.board.comment.dto.CommentCreateRequest;
 import com.example.board.comment.dto.CommentPageCondition;
 import com.example.board.comment.dto.CommentResponse;
 import com.example.board.comment.dto.CommentUpdateRequest;
+import com.example.board.comment.dto.TopLevelCommentResponse;
 import com.example.board.comment.entity.Comment;
 import com.example.board.comment.repository.CommentRepository;
 import com.example.board.global.common.PageResponse;
@@ -15,6 +16,10 @@ import com.example.board.global.security.LoginMember;
 import com.example.board.post.entity.Post;
 import com.example.board.post.repository.PostRepository;
 import com.example.board.post.support.PostReader;
+import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
+import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -22,8 +27,8 @@ import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 
 /**
- * 댓글 쓰기·조회 (C-01 ~ C-04). 정본: sp-docs/requirements/board.md §2 §3 §3.0 §5,
- * sp-docs/api-contract.md §4 §4.2 §4.4 §4.5 §5.1 §7.1, sp-docs/domain-model.md §4.2 §5,
+ * 댓글·답글 쓰기·조회 (C-01 ~ C-05). 정본: sp-docs/requirements/board.md §2 §3 §3.0 §5 §12,
+ * sp-docs/api-contract.md §4 §4.2 §4.4 §4.5 §5.1 §7.1, sp-docs/domain-model.md §4.2 §5 §6,
  * sp-docs/security.md §5.
  *
  * <p>트랜잭션 경계는 서비스에 둔다 (sp-docs/conventions.md §5).
@@ -98,7 +103,8 @@ public class CommentService {
 	}
 
 	/**
-	 * 댓글 작성 (C-01).
+	 * 댓글·답글 작성 (C-01, C-05). {@code parentId} 가 없거나 {@code null} 이면 최상위 댓글이고,
+	 * 있으면 그 댓글의 답글이다 (sp-docs/api-contract.md §4.5).
 	 *
 	 * <p><b>순서가 전부다 — 조회 → 성공 확인 → BEGIN → INSERT → COMMIT</b>
 	 * (sp-docs/requirements/board.md §3 규칙 8 과 같은 절의 호출 순서도). 게시글과 같은
@@ -130,12 +136,39 @@ public class CommentService {
 	 *
 	 * <p><b>집계 증가를 INSERT 보다 앞에 둔다.</b> 둘 다 같은 트랜잭션이므로 순서가 결과를
 	 * 바꾸지 않지만, 뒤에 두면 INSERT 에 실패를 주입하는 테스트에서 집계 변경이 아예 일어나지
-	 * 않아 "집계도 롤백된다" 가 반증 불가능해진다 (§4.1).
+	 * 않아 "집계도 롤백된다" 가 반증 불가능해진다 (§4.1). <b>답글도 같은 순서다</b>
+	 * (sp-docs/plan/phase2-board.md B-22) — {@link #delete} 가 {@code post} 감소를 먼저 하는 것과
+	 * 같은 쪽이다 (sp-docs/domain-model.md §6 의 블록인용). 답글도 댓글이므로 집계는 +1 이다
+	 * (sp-docs/domain-model.md §5).
+	 *
+	 * <p><b>판정 순서는 sp-docs/requirements/board.md §12 다</b> — 프로필({@code S001}·{@code S002},
+	 * 트랜잭션 밖) → 없는·삭제된 글 404 {@code P001} → 부모의 존재·같은 글·활성 404 {@code CM001}
+	 * → 부모가 최상위인가 400 {@code CM003}. 다른 글의 답글을 부모로 주면 {@code CM001} 이다 — 같은
+	 * 글인지를 최상위인지보다 먼저 본다 ({@link #getReplyableParent}). 판정이 모두 첫 쓰기보다
+	 * 앞이므로 실패하면 쓴 것이 없다.
 	 *
 	 * <p><b>게시글 조회는 트랜잭션 안이다.</b> 조회는 "없거나 삭제된 게시글은 404 {@code P001}"
-	 * 판정을 받는 자리이고 (sp-docs/requirements/board.md §5 규칙 1), 그 판정과 집계 갱신·댓글
-	 * INSERT 가 한 트랜잭션이어야 그 사이에 게시글이 삭제되는 틈이 없다. 규칙 8이 밖으로
-	 * 내보내라고 한 것은 <b>원격 호출</b>이다.
+	 * 판정을 받는 자리이고 (sp-docs/requirements/board.md §5 규칙 1), 규칙 8이 밖으로 내보내라고
+	 * 한 것은 <b>원격 호출</b>이다. <b>그 조회와 부모 확인은 잠그지 않는 읽기다</b> — 같은 트랜잭션에
+	 * 있어도 확인 뒤 첫 쓰기 전에 커밋된 삭제를 막지 않는다. 글 삭제도 그렇다: 증가 문장의
+	 * {@code where} 에 {@code deleted} 조건이 없어 그 삭제를 알아채는 자리가 없고, 삭제된 글 아래에
+	 * 활성 댓글이 남는다 (2026-11-17 B-22 실측 — 사본에서 최상위 댓글 작성의 {@code update post}
+	 * 직전에 {@code PostService.delete} 를 다른 스레드로 커밋시킨 프로브, H2).
+	 *
+	 * <p><b>부모 확인과 커밋 사이의 창을 닫지 않는다</b> (sp-docs/requirements/board.md §12,
+	 * sp-docs/plan/phase2-board.md B-22). 확인 뒤 커밋 전에 부모가 지워지면 삭제된 부모 아래에
+	 * 답글이 생기고, 그 답글이 활성이므로 부모가 목록에 자리로 남는다 — §12 가 「삭제된 댓글에 답글
+	 * 불가」 를 보장이 아니라 통상 동작으로 두었다. 닫으려면 정본 개정이 먼저다. H2 에서 이 창에 부모
+	 * 삭제를 끼워 넣은 결과는 {@code CommentServiceTest} 의 B-22 중첩 클래스가 잰다.
+	 *
+	 * <p><b>부모 확인이 집계 증가보다 앞인 것도 그래서다</b> — 잠그지 않는 읽기 그대로 증가 뒤로
+	 * 옮기면 H2 의 테스트가 운영과 다른 동작을 재게 될 것으로 본다. 사본에서 그렇게 옮기자
+	 * {@code CommentServiceTest} 의 {@code 부모_확인_뒤에_지워진_부모_아래에_답글이_생긴다} 에서
+	 * 답글이 404 {@code CM001} 로 끝났다 — 커밋된 읽기를 보는 H2 에서는 옮긴 읽기가 증가 전에 커밋된
+	 * 삭제를 본다 (2026-11-17 B-22 실측). 첫 읽기의 스냅숏을 보는 MySQL 의 반복 읽기에서는 같은
+	 * 읽기가 그 삭제를 보지 못해 창이 열린 채로 남을 것으로 본다(추정 — 실 MySQL 에서 재지 않았다).
+	 * 닫는 모양은 §12 가 적었다 — 「부모 확인을 그 락 뒤의 잠금 읽기로 옮기는 것만으로 닫힌다」. 그
+	 * 모양이 기대는 줄 세우기가 H2 에서 성립하지 않은 경우는 {@link #delete} 가 적는다.
 	 *
 	 * @param accountId 검증된 JWT 의 {@code sub}
 	 */
@@ -143,12 +176,17 @@ public class CommentService {
 		// 1) 트랜잭션 밖. 실패하면 아래로 내려가지 않으므로 BEGIN 자체가 일어나지 않는다
 		String writerNickname = this.memberClient.findActiveNickname(accountId);
 
-		// 2) BEGIN -> SELECT post -> UPDATE comment_count -> INSERT comment -> COMMIT
+		// 2) BEGIN -> SELECT post -> (답글이면) SELECT parent -> UPDATE comment_count
+		//    -> INSERT comment -> COMMIT
 		Comment saved = this.insertTransaction.execute(status -> {
 			Post post = this.postReader.getActiveById(postId);
+			Comment parent = request.parentId() == null
+					? null
+					: getReplyableParent(request.parentId(), post.getId());
 			this.postRepository.increaseCommentCount(post.getId());
 			return this.commentRepository.saveAndFlush(Comment.builder()
 					.post(post)
+					.parent(parent)
 					.writerId(accountId)
 					.writerNickname(writerNickname)
 					.content(request.content())
@@ -159,14 +197,38 @@ public class CommentService {
 	}
 
 	/**
-	 * 댓글 목록 (C-02). <b>비로그인 허용이다</b> (sp-docs/api-contract.md §4).
+	 * 답글의 부모. 같은 글의 활성 댓글이 아니면 404 {@code CM001}, 답글이면 400 {@code CM003} 이다
+	 * (sp-docs/requirements/board.md §12). <b>그 순서다</b> — 다른 글의 답글이나 삭제된 답글을
+	 * 부모로 주면 {@code CM001} 이다.
+	 *
+	 * <p>깊이가 1단계라는 불변식은 제약이 아니라 이 판정이 지킨다 (sp-docs/domain-model.md §4.2).
+	 */
+	private Comment getReplyableParent(Long parentId, Long postId) {
+		Comment parent = this.commentRepository.findByIdAndPostIdAndDeletedFalse(parentId, postId)
+				.orElseThrow(() -> new BusinessException(ErrorCode.COMMENT_NOT_FOUND));
+		if (parent.getParent() != null) {
+			throw new BusinessException(ErrorCode.NESTED_REPLY_NOT_ALLOWED);
+		}
+		return parent;
+	}
+
+	/**
+	 * 댓글 목록 (C-02, C-05). <b>비로그인 허용이다</b> (sp-docs/api-contract.md §4).
 	 *
 	 * <p><b>{@code MemberClient} 를 호출하지 않는다.</b> 작성자 닉네임은 작성 시점 스냅샷이
 	 * 댓글 행에 있고, 조회 경로의 board → member 호출은 금지되어 있다
 	 * (sp-docs/api-contract.md §4.2, sp-docs/architecture.md §5).
 	 *
-	 * <p>등록순·삭제분 제외는 리포지터리의 쿼리가 맡는다
-	 * ({@code findByPostIdAndDeletedFalseOrderByCreatedAtAscIdAsc}).
+	 * <p><b>최상위 항목을 페이징하고 답글을 각 최상위 아래에 전부 등록순으로 싣는다</b>
+	 * (sp-docs/requirements/board.md §12, sp-docs/api-contract.md §4.5). 페이징의 단위와
+	 * {@code totalElements} 가 최상위 항목이다 — 답글은 {@code size} 에 세지 않는다. 어느 최상위가
+	 * 목록에 오는지와 그 순서·건수는 {@link CommentRepository#findListedTopLevels} 가, 답글의 활성
+	 * 조건과 순서는 {@link CommentRepository#findActiveRepliesOf} 가 맡는다. 삭제된 최상위의 내용을
+	 * 가리는 것은 응답 모양이다 ({@link CommentResponse#from}).
+	 *
+	 * <p><b>답글은 그 페이지의 최상위 id 들로 한 번에 읽는다</b> — 최상위마다 읽지 않는다. 그래서
+	 * 쿼리 수가 최상위 항목 수·답글 수와 무관하다 (sp-docs/plan/phase2-board.md B-22). 빈 페이지면
+	 * 읽을 부모가 없으므로 답글을 읽지 않는다.
 	 *
 	 * <p><b>없는·삭제된 게시글의 댓글 목록은 404 {@code P001} 이다</b> — 빈 페이지 200 이
 	 * 아니다 (sp-docs/api-contract.md §4.5). <b>같은 서비스가 같은 게시글에 두 가지 답을 하지
@@ -179,13 +241,31 @@ public class CommentService {
 	 * 그 조회의 결과에서 오므로 조회를 빼면 쿼리 인수도 함께 없어진다.
 	 */
 	@Transactional(readOnly = true)
-	public PageResponse<CommentResponse> getList(Long postId, CommentPageCondition condition) {
+	public PageResponse<TopLevelCommentResponse> getList(
+			Long postId, CommentPageCondition condition) {
 		Post post = this.postReader.getActiveById(postId);
 
-		return PageResponse.of(this.commentRepository
-				.findByPostIdAndDeletedFalseOrderByCreatedAtAscIdAsc(
-						post.getId(), PageRequest.of(condition.page(), condition.size()))
-				.map(CommentResponse::from));
+		Page<Comment> topLevels = this.commentRepository.findListedTopLevels(
+				post.getId(), PageRequest.of(condition.page(), condition.size()));
+		Map<Long, List<CommentResponse>> repliesByParentId = activeRepliesOf(topLevels.getContent());
+
+		return PageResponse.of(topLevels.map(topLevel -> TopLevelCommentResponse.of(
+				topLevel, repliesByParentId.getOrDefault(topLevel.getId(), List.of()))));
+	}
+
+	/**
+	 * 최상위 댓글들의 활성 답글을 부모 id 별로 나눈다. 각 목록의 순서는 조회의 등록순 그대로다 —
+	 * 순차 스트림의 {@code groupingBy} 는 만난 순서대로 담는다.
+	 */
+	private Map<Long, List<CommentResponse>> activeRepliesOf(List<Comment> topLevels) {
+		if (topLevels.isEmpty()) {
+			return Map.of();
+		}
+		List<Long> parentIds = topLevels.stream().map(Comment::getId).toList();
+		return this.commentRepository.findActiveRepliesOf(parentIds).stream()
+				.collect(Collectors.groupingBy(
+						reply -> reply.getParent().getId(),
+						Collectors.mapping(CommentResponse::from, Collectors.toList())));
 	}
 
 	/**
@@ -197,7 +277,8 @@ public class CommentService {
 	 * 프로필도 생성에만 필요하다 (§5 규칙 8). 그래서 member 장애가 수정을 막지 않는다
 	 * (sp-docs/api-contract.md §4.2).
 	 *
-	 * <p>응답은 작성·목록과 <b>같은 한 모양</b>이다 (sp-docs/api-contract.md §4.5).
+	 * <p>응답은 작성 응답·목록의 답글과 <b>같은 모양</b>이다 (sp-docs/api-contract.md §4.5) — 목록의
+	 * 최상위 항목은 거기에 {@code replies} 를 더한 것이다.
 	 *
 	 * <p>없는 id·삭제된 댓글은 404 {@code CM001} 이다 — <b>조회가 권한 판정보다 먼저다</b>
 	 * (§4.4). 타인의 삭제된 댓글도 {@code CM001} 이고 {@code CM002} 가 아니다. 정보 노출이
@@ -221,6 +302,11 @@ public class CommentService {
 	 * <p><b>{@code comment_count} 가 1 감소한다</b> (sp-docs/domain-model.md §5). 감소와 댓글
 	 * 행의 전환이 한 트랜잭션인 것은 이 메서드의 {@code @Transactional} 이 보장한다.
 	 *
+	 * <p><b>답글이 달린 댓글을 지워도 답글은 그대로다</b> — 전환하는 행은 그 댓글 하나이고 감소도
+	 * 1 이다 (sp-docs/domain-model.md §5 의 표, sp-docs/requirements/board.md §12). 지운 최상위는
+	 * 활성 답글이 남아 있는 동안 목록에 자리로 남는다 ({@link #getList}). 답글 삭제도 이 경로다 —
+	 * 수정·삭제 권한이 댓글과 같다 (§12).
+	 *
 	 * <p><b>순서는 {@code post} 감소 → 댓글의 조건부 전환이다</b> (sp-docs/plan/phase2-board.md
 	 * B-17, sp-docs/domain-model.md §6.2 의 첨부 삭제와 같은 모양).
 	 * <ol>
@@ -237,6 +323,14 @@ public class CommentService {
 	 * ({@code post} → 부모 행의 FK 공유 락)과 순서가 반대라 교착할 것으로 본다 —
 	 * sp-docs/domain-model.md §6 의 블록인용(2026-11-11 {@code D-18})이 추정으로 적었다. 작성
 	 * 경로도 집계 증가를 INSERT 보다 먼저 한다({@link #create}).
+	 *
+	 * <p><b>1) 이 0 행일 때 {@code post} 행의 락은 DB 에 달렸다.</b> H2 는 쥐지 않는다: 집계를 0
+	 * 으로 어긋나게 둔 글에서, 답글이 {@code post} 를 갱신하고 INSERT 를 내기 직전에 그 부모를 이
+	 * 메서드로 지우자 감소가 답글의 커밋을 기다리지 않았고, 삭제가 먼저 커밋돼 답글이 지워진 부모
+	 * 아래에 생겼다 (2026-11-17 B-22 실측 — 사본 프로브). MySQL 의 반복 읽기는 쥘 것으로 본다(추정
+	 * — 실 MySQL 에서 재지 않았다). 그 결과는 sp-docs/requirements/board.md §12 가 열어 둔 창 안에
+	 * 있다. 다만 §12 가 그 창을 닫을 근거로 적은 「두 경로가 {@code post} 의 배타 락에서 한 줄로
+	 * 서므로」 는 H2 에서 이 감소가 0 행이면 성립하지 않았다.
 	 *
 	 * <p><b>전환의 영향 행 수가 최종 판정이다.</b> 아래 404·403 판정은 락 전의 읽기라 같은 댓글의
 	 * 동시 삭제를 거르지 못한다 — 모두 활성으로 읽고 쓰기에 닿을 수 있다. 그 요청들 가운데 전환이

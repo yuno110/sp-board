@@ -4,6 +4,7 @@ import com.example.board.comment.dto.CommentCreateRequest;
 import com.example.board.comment.dto.CommentPageCondition;
 import com.example.board.comment.dto.CommentResponse;
 import com.example.board.comment.dto.CommentUpdateRequest;
+import com.example.board.comment.dto.TopLevelCommentResponse;
 import com.example.board.comment.service.CommentService;
 import com.example.board.global.common.ApiResponse;
 import com.example.board.global.common.PageResponse;
@@ -24,7 +25,8 @@ import org.springframework.web.bind.annotation.ResponseStatus;
 import org.springframework.web.bind.annotation.RestController;
 
 /**
- * 댓글 API. 정본: sp-docs/api-contract.md §4 (경로·성공 코드) §4.5 (응답의 한 모양).
+ * 댓글 API. 정본: sp-docs/api-contract.md §4 (경로·성공 코드) §4.5 (댓글의 모양과 목록의 최상위
+ * 항목).
  *
  * <p><b>클래스 수준 {@code @RequestMapping} 이 없다.</b> 네 엔드포인트가 두 기준 경로로
  * 갈린다 — 작성·목록은 {@code /api/v1/posts/{postId}/comments}, 수정·삭제는
@@ -43,14 +45,16 @@ public class CommentController {
 	private final CommentService commentService;
 
 	/**
-	 * 댓글 작성 (C-01). <b>201</b> 이다 (sp-docs/api-contract.md §4).
+	 * 댓글·답글 작성 (C-01, C-05). <b>201</b> 이다 (sp-docs/api-contract.md §4). 본문의
+	 * {@code parentId} 가 있으면 답글이다 (§4.5).
 	 *
 	 * <p>{@code accountId} 는 {@code @CurrentMember} 가 검증된 JWT 의 {@code sub} 에서 꺼낸
 	 * 것이다. <b>요청 본문에서 받지 않는다</b> (sp-docs/requirements/board.md §3 규칙 1) —
 	 * {@link CommentCreateRequest} 에 그 필드가 없다.
 	 *
 	 * <p>대상 게시글은 경로 변수 하나로 정해진다. 없거나 삭제된 게시글이면 404 {@code P001}
-	 * 이고, 그 판정은 서비스가 한다.
+	 * 이고, 부모의 판정(404 {@code CM001}, 400 {@code CM003})과 함께 서비스가 한다
+	 * (sp-docs/requirements/board.md §12 의 판정 순서).
 	 */
 	@PostMapping("/api/v1/posts/{postId}/comments")
 	@ResponseStatus(HttpStatus.CREATED)
@@ -64,8 +68,9 @@ public class CommentController {
 	}
 
 	/**
-	 * 댓글 목록 (C-02). <b>비로그인 허용이다</b> (sp-docs/api-contract.md §4). 응답은 §7.1 의
-	 * 페이징 형식이고 항목은 §4.5 의 모양이다.
+	 * 댓글 목록 (C-02, C-05). <b>비로그인 허용이다</b> (sp-docs/api-contract.md §4). 응답은 §7.1 의
+	 * 페이징 형식이고 항목은 §4.5 의 최상위 항목 — 댓글의 키에 {@code replies} 를 더한 것이다.
+	 * 페이징의 단위가 최상위 항목이다 (§4.5).
 	 *
 	 * <p>{@code @CurrentMember} 를 받지 않는다 — 무토큰 요청에서 해석할 Claim 이 없다.
 	 *
@@ -82,7 +87,7 @@ public class CommentController {
 	 * Validation 은 {@code null} 을 건너뛴다. 기본값 채우기는 그대로 레코드가 한다.
 	 */
 	@GetMapping("/api/v1/posts/{postId}/comments")
-	public ApiResponse<PageResponse<CommentResponse>> getList(
+	public ApiResponse<PageResponse<TopLevelCommentResponse>> getList(
 			@PathVariable Long postId,
 			@RequestParam(required = false) @Min(CommentPageCondition.MIN_PAGE) Integer page,
 			@RequestParam(required = false) @Min(CommentPageCondition.MIN_SIZE) Integer size) {
@@ -92,7 +97,7 @@ public class CommentController {
 	}
 
 	/**
-	 * 댓글 수정 (C-03). <b>200</b> 이고 응답은 <b>작성·목록과 같은 모양</b>이다
+	 * 댓글 수정 (C-03). <b>200</b> 이고 응답은 <b>작성 응답·목록의 답글과 같은 모양</b>이다
 	 * (sp-docs/api-contract.md §4 §4.5).
 	 *
 	 * <p><b>소유자 검증을 여기서 하지 않는다.</b> {@code CommentService} 가 한다 — 리소스를
