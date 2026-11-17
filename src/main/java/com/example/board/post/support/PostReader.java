@@ -29,4 +29,20 @@ public class PostReader {
 				.orElseThrow(() -> new BusinessException(ErrorCode.POST_NOT_FOUND));
 	}
 
+	/**
+	 * {@link #getActiveById} 와 같은 판정을 하되 엔티티를 읽지 않는다.
+	 *
+	 * <p>상세 조회의 404 판정이 쓴다 ({@code PostService.getDetail}). 그 경로는 판정 뒤의 읽기로
+	 * 응답을 만드는데, 요청 동안 열려 있는 영속성 컨텍스트(Open Session In View)에 앞서 읽은 글이
+	 * 남아 있으면 뒤의 읽기가 그 사본을 돌려준다 — 404 판정 뒤에 커밋된 조회수가 응답에서 빠진다. 이
+	 * 메서드 대신 {@link #getActiveById} 를 부른 변이에서 세지 않은 재조회의 응답이 판정 사이에 커밋된
+	 * 증가를 싣지 않았다 (2026-11-16 B-21 실측). 집계된 조회에서 그 사본이 어떻게 되는지는
+	 * {@code PostRepository.increaseViewCount} 의 주석에 있다.
+	 */
+	public void requireActive(Long id) {
+		if (!postRepository.existsByIdAndDeletedFalse(id)) {
+			throw new BusinessException(ErrorCode.POST_NOT_FOUND);
+		}
+	}
+
 }

@@ -3,7 +3,6 @@ package com.example.board.like.service;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
-import static org.mockito.BDDMockito.willAnswer;
 import static org.mockito.BDDMockito.willReturn;
 import static org.mockito.BDDMockito.willThrow;
 
@@ -18,6 +17,7 @@ import com.example.board.like.entity.PostLike;
 import com.example.board.like.repository.PostLikeRepository;
 import com.example.board.post.entity.Post;
 import com.example.board.post.repository.PostRepository;
+import com.example.board.support.PhysicalCommitRecorder;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.List;
@@ -51,11 +51,10 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.TransactionStatus;
 
 /**
  * sp-docs/plan/phase2-board.md B-20 의 검증 표 중 저장·집계·순서·동시성 쪽이다. HTTP 상태·응답 키·
@@ -83,7 +82,8 @@ import org.springframework.transaction.TransactionStatus;
  */
 @SpringBootTest
 @ActiveProfiles("test")
-@ContextConfiguration(classes = LikeServiceTest.StatementRecorderConfig.class)
+@ContextConfiguration(classes = {LikeServiceTest.StatementRecorderConfig.class,
+		PhysicalCommitRecorder.Config.class})
 class LikeServiceTest {
 
 	/** 동시 요청 수. 둘 이상이어야 같은 글의 요청들이 {@code post} 행 락에서 줄을 선다. */
@@ -102,12 +102,9 @@ class LikeServiceTest {
 	@MockitoSpyBean
 	private PostLikeRepository postLikeRepository;
 
-	/**
-	 * <b>경계를 관측하는 지점이다.</b> 서비스의 템플릿과 리포지터리의 {@code @Transactional} 이 이
-	 * 빈으로 트랜잭션을 열고 닫으므로 그 커밋이 여기를 지난다.
-	 */
-	@MockitoSpyBean
-	private PlatformTransactionManager transactionManager;
+	/** <b>경계를 관측하는 지점이다.</b> 세는 법은 {@link PhysicalCommitRecorder} 다. */
+	@Autowired
+	private PhysicalCommitRecorder 커밋_기록기;
 
 	@Autowired
 	private JdbcTemplate jdbcTemplate;
@@ -395,25 +392,22 @@ class LikeServiceTest {
 	 * (sp-docs/process/review-policy.md §4.1). 행위 단언으로는 한 트랜잭션과 연산마다 커밋되는
 	 * 트랜잭션이 정상 경로에서 구별되지 않는다.
 	 *
-	 * <p><b>{@code isNewTransaction()} 이 참인 커밋만 센다.</b> 리포지터리 호출은 템플릿의 트랜잭션에
-	 * 참여하므로 매니저의 {@code commit} 을 지나도 물리 커밋이 아니다. 단언은 「정확히 한 번」 에만
-	 * 건다.
+	 * <p><b>새로 연 트랜잭션의 커밋만 센다</b> — 세는 법은 {@link PhysicalCommitRecorder} 다. 리포지터리
+	 * 호출은 템플릿의 트랜잭션에 참여하므로 물리 커밋이 아니다. 세는 구간은 누르기·취소 한 번씩이다.
+	 * 단언은 「정확히 한 번」 에만 건다.
 	 */
 	@Test
 	@DisplayName("한 번의 누르기와 한 번의 취소에 물리 트랜잭션이 각각 정확히 하나 커밋된다")
 	void 누르기와_취소의_커밋이_각각_정확히_한_번이다() {
 		Post post = 게시글을_만든다(1120L);
-		List<TransactionStatus> 누르기_커밋 = 물리_커밋을_센다();
 
-		this.likeService.like(post.getId(), 1121L);
+		List<String> 누르기_커밋 = this.커밋_기록기.물리_커밋(() -> this.likeService.like(post.getId(), 1121L));
 
 		assertThat(좋아요_행_수(post, 1121L)).as("누르기가 일어나지 않았다면 커밋 수는 아무것도 말하지 않는다")
 				.isEqualTo(1);
 		assertThat(누르기_커밋).as("post 증가와 post_like INSERT 가 한 로컬 트랜잭션이다").hasSize(1);
 
-		List<TransactionStatus> 취소_커밋 = 물리_커밋을_센다();
-
-		this.likeService.unlike(post.getId(), 1121L);
+		List<String> 취소_커밋 = this.커밋_기록기.물리_커밋(() -> this.likeService.unlike(post.getId(), 1121L));
 
 		assertThat(좋아요_행_수(post, 1121L)).as("취소가 일어나지 않았다면 커밋 수는 아무것도 말하지 않는다")
 				.isZero();
@@ -662,19 +656,6 @@ class LikeServiceTest {
 		}
 	}
 
-	/** 이 뒤로 커밋되는 물리 트랜잭션을 모은다. 참여 트랜잭션의 커밋은 물리 커밋이 아니므로 뺀다. */
-	private List<TransactionStatus> 물리_커밋을_센다() {
-		List<TransactionStatus> 커밋 = new CopyOnWriteArrayList<>();
-		willAnswer(invocation -> {
-			TransactionStatus status = invocation.getArgument(0);
-			if (status.isNewTransaction()) {
-				커밋.add(status);
-			}
-			return invocation.callRealMethod();
-		}).given(this.transactionManager).commit(any(TransactionStatus.class));
-		return 커밋;
-	}
-
 	/** 작업을 돌리는 동안 {@link LikeService} 가 남긴 로그 수준을 모은다. */
 	private static List<Level> 서비스_로그_수준(Runnable 작업) {
 		Logger logger = (Logger) LoggerFactory.getLogger(LikeService.class);
@@ -755,10 +736,19 @@ class LikeServiceTest {
 	 * (sp-docs/process/review-policy.md §4.1 「실패할 수 없는 단언을 쓰지 않는다」). 훅과 수집은
 	 * {@code CommentServiceTest} 의 같은 이름의 수집기와 같고(조회 메서드는 다르다), 그것이 그 패키지
 	 * 안에 있어 여기 둔다.
+	 *
+	 * <p><b>스케줄러 스레드의 문장은 모으지 않고 훅도 돌리지 않는다.</b> 판정 행의 정리 작업
+	 * ({@code PostViewCleanup}, B-21)이 컨텍스트가 뜬 직후 그 스레드에서 {@code delete from post_view}
+	 * 를 낸다. 그 문장이 {@link #비운다()} 뒤에 들어오면 첫 문장과 쓰기 목록의 단언이 깨진다 — 정리를
+	 * 수집 창 안에서 스케줄러 스레드로 돌리고 취소의 첫 문장을 단언한 프로브가 그 문장을 보고 빨갰다
+	 * (2026-11-17 B-21 실측). 테스트가 띄운 스레드의 문장은 그대로 모은다 — 동시 요청의 훅이 그
+	 * 스레드에서 돈다. 스케줄러 스레드는 이름의 접두어로 가르고, 접두어는 컨텍스트의 스케줄러에서 받는다.
 	 */
 	static class StatementRecorder implements StatementInspector {
 
 		private final List<String> 발행된_문장 = new CopyOnWriteArrayList<>();
+
+		private final String 스케줄러_스레드_접두어;
 
 		private volatile Predicate<String> 훅_대상 = sql -> false;
 
@@ -768,8 +758,15 @@ class LikeServiceTest {
 		/** 스레드마다 한 번만 돈다. 한 스레드가 두 번 모이면 집결지가 다시 닫혀 열리지 않는다. */
 		private final ThreadLocal<Boolean> 훅_소진 = ThreadLocal.withInitial(() -> false);
 
+		StatementRecorder(String 스케줄러_스레드_접두어) {
+			this.스케줄러_스레드_접두어 = 스케줄러_스레드_접두어;
+		}
+
 		@Override
 		public String inspect(String sql) {
+			if (Thread.currentThread().getName().startsWith(this.스케줄러_스레드_접두어)) {
+				return sql;
+			}
 			this.발행된_문장.add(sql);
 			if (!this.훅_소진.get() && this.훅_대상.test(정규화(sql))) {
 				this.훅_소진.set(true);
@@ -832,8 +829,8 @@ class LikeServiceTest {
 	static class StatementRecorderConfig {
 
 		@Bean
-		StatementRecorder statementRecorder() {
-			return new StatementRecorder();
+		StatementRecorder statementRecorder(ThreadPoolTaskScheduler taskScheduler) {
+			return new StatementRecorder(taskScheduler.getThreadNamePrefix());
 		}
 
 		@Bean

@@ -22,6 +22,7 @@ import com.example.board.global.error.ErrorCode;
 import com.example.board.global.security.LoginMember;
 import com.example.board.post.entity.Post;
 import com.example.board.post.repository.PostRepository;
+import com.example.board.support.PhysicalCommitRecorder;
 import java.time.LocalDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
@@ -54,12 +55,11 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
-import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
@@ -578,8 +578,8 @@ class CommentServiceTest {
 	 * {@code comment_count} 둘 다 롤백. 두 단언이 각각 반증 가능해야 한다" 와 "한 번의 작성에
 	 * 커밋이 정확히 한 번 — 변이 셋(A·B·C)을 돌린다" — 이 여기 있다.
 	 *
-	 * <p>빈 둘을 스파이로 바꿔야 하므로 중첩 클래스이고, 바깥 클래스의 {@code commentService}
-	 * 에는 스파이가 아닌 원래 빈이 들어 있으므로 여기서 다시 주입받는다.
+	 * <p>빈 하나를 스파이로 바꾸고 커밋 기록기를 더해야 하므로 중첩 클래스이고, 바깥 클래스의
+	 * {@code commentService} 에는 스파이가 아닌 원래 빈이 들어 있으므로 여기서 다시 주입받는다.
 	 *
 	 * <table border="1">
 	 * <caption>{@code create} 변이별 실패 (B-10 이후 전체 스위트로 재측정)</caption>
@@ -634,21 +634,18 @@ class CommentServiceTest {
 	 */
 	@Nested
 	@DisplayName("댓글 INSERT 와 comment_count 갱신이 한 로컬 트랜잭션이다")
+	@ContextConfiguration(classes = PhysicalCommitRecorder.Config.class)
 	class 작성_트랜잭션_경계 {
 
 		/** 댓글 저장 지점에 실패를 주입한다. 나머지 메서드는 실제 빈에 위임된다. */
 		@MockitoSpyBean
 		private CommentRepository spyCommentRepository;
 
-		/**
-		 * <b>경계를 관측하는 지점이다.</b> {@code TransactionTemplate} 과
-		 * {@code TransactionInterceptor} 가 이 빈으로 트랜잭션을 열고 닫으므로 커밋이 전부
-		 * 여기를 지난다.
-		 */
-		@MockitoSpyBean
-		private PlatformTransactionManager spyTransactionManager;
+		/** <b>경계를 관측하는 지점이다.</b> 세는 법은 {@link PhysicalCommitRecorder} 다. */
+		@Autowired
+		private PhysicalCommitRecorder 커밋_기록기;
 
-		/** 위 스파이들을 주입받은 쪽이다. 바깥 클래스의 것과 다른 인스턴스다. */
+		/** {@code spyCommentRepository} 를 주입받은 쪽이다. 바깥 클래스의 것과 다른 인스턴스다. */
 		@Autowired
 		private CommentService commentService;
 
@@ -656,7 +653,7 @@ class CommentServiceTest {
 		private PostRepository postRepository;
 
 		/**
-		 * <b>바깥 클래스의 목 필드를 쓰지 않고 다시 주입받는다.</b> 스파이 둘이 더해져 이
+		 * <b>바깥 클래스의 목 필드를 쓰지 않고 다시 주입받는다.</b> 스파이와 커밋 기록기가 더해져 이
 		 * 중첩 클래스는 다른 애플리케이션 컨텍스트를 쓰고, 바깥 인스턴스의 필드는 바깥
 		 * 클래스의 컨텍스트에서 주입되므로 거기에 스텁을 걸어도 이쪽 서비스가 보는 목이
 		 * 아니다. 바깥의 {@code @MockitoBean} 은 중첩 클래스에 상속되므로 이 컨텍스트의
@@ -677,11 +674,10 @@ class CommentServiceTest {
 		 * 검증표 <b>"한 번의 작성에 커밋이 정확히 한 번"</b>. 경계 자체를 관측하므로 행위
 		 * 단언으로 대체할 수 없다 (sp-docs/process/review-policy.md §4.1).
 		 *
-		 * <p><b>{@code isNewTransaction()} 이 참인 커밋만 센다.</b> 참여 트랜잭션도 매니저의
-		 * {@code commit} 을 지나지만 그것은 물리 트랜잭션의 커밋이 아니므로, 빼고 남는 수가
-		 * 실제로 커밋된 트랜잭션의 수다. 이 경로의 {@code saveAndFlush} 는
+		 * <p><b>새로 연 트랜잭션의 커밋만 센다</b> — 세는 법은 {@link PhysicalCommitRecorder} 다.
+		 * 참여 트랜잭션의 완료는 물리 트랜잭션의 커밋이 아니다. 이 경로의 {@code saveAndFlush} 는
 		 * {@code SimpleJpaRepository} 의 {@code @Transactional} 을 지나 템플릿의 트랜잭션에
-		 * 참여하므로 그 커밋이 필터에 걸러진다.
+		 * 참여하므로 세지 않는다.
 		 *
 		 * <p><b>단언은 "정확히 한 번" 에만 걸고 다른 수치를 예측값으로 쓰지 않는다</b>(§4.1).
 		 */
@@ -692,16 +688,8 @@ class CommentServiceTest {
 			Post post = 게시글을_만든다(822L);
 
 			// 준비가 끝난 뒤에 센다. 세는 구간을 create 한 번으로 좁혀 둔다
-			List<TransactionStatus> 커밋된_물리_트랜잭션 = new ArrayList<>();
-			willAnswer(invocation -> {
-				TransactionStatus status = invocation.getArgument(0);
-				if (status.isNewTransaction()) {
-					커밋된_물리_트랜잭션.add(status);
-				}
-				return invocation.callRealMethod();
-			}).given(this.spyTransactionManager).commit(any(TransactionStatus.class));
-
-			this.commentService.create(post.getId(), 822L, new CommentCreateRequest("경계 관측"));
+			List<String> 커밋된_물리_트랜잭션 = this.커밋_기록기.물리_커밋(() -> this.commentService.create(
+					post.getId(), 822L, new CommentCreateRequest("경계 관측")));
 
 			assertThat(커밋된_물리_트랜잭션)
 					.as("댓글 INSERT 와 comment_count 갱신이 한 로컬 트랜잭션이다 "
@@ -1158,7 +1146,8 @@ class CommentServiceTest {
 	 */
 	@Nested
 	@DisplayName("댓글 삭제는 post 감소가 먼저이고 댓글 행의 전환이 조건부 문장 하나다")
-	@ContextConfiguration(classes = CommentServiceTest.StatementRecorderConfig.class)
+	@ContextConfiguration(classes = {CommentServiceTest.StatementRecorderConfig.class,
+			PhysicalCommitRecorder.Config.class})
 	class 삭제의_순서와_조건부_전환 {
 
 		/** 동시 요청 수. 둘 이상이어야 같은 댓글을 여러 요청이 활성으로 읽을 수 있다. */
@@ -1177,12 +1166,9 @@ class CommentServiceTest {
 		/** 집결지·끼워넣은 쓰기를 기다리는 한도. 넘으면 강제가 일어나지 않은 것이므로 터진다. */
 		private static final int 대기_한도_초 = 10;
 
-		/**
-		 * <b>경계를 관측하는 지점이다.</b> {@link 작성_트랜잭션_경계} 의 같은 필드와 같은 이유다 —
-		 * {@code @Transactional} 의 인터셉터가 이 빈으로 트랜잭션을 열고 닫는다.
-		 */
-		@MockitoSpyBean
-		private PlatformTransactionManager spyTransactionManager;
+		/** <b>경계를 관측하는 지점이다.</b> 세는 법은 {@link PhysicalCommitRecorder} 다. */
+		@Autowired
+		private PhysicalCommitRecorder 커밋_기록기;
 
 		@Autowired
 		private CommentService commentService;
@@ -1352,10 +1338,7 @@ class CommentServiceTest {
 		/**
 		 * 완료 기준 「한 로컬 트랜잭션이 1차 그대로다」 의 경계 관측이다
 		 * (sp-docs/process/review-policy.md §4.1 — 완료 기준에 한 로컬 트랜잭션이 있으면 경계를
-		 * 관측한다). 세는 법은 {@link 작성_트랜잭션_경계#커밋이_정확히_한_번이다()} 와 같다.
-		 *
-		 * <p>삭제됐는지는 {@code JdbcTemplate} 으로 본다. 리포지터리의 상속 조회는 자기 트랜잭션을
-		 * 열고 닫아 이 집계에 섞인다.
+		 * 관측한다). 세는 법은 {@link PhysicalCommitRecorder} 다.
 		 */
 		@Test
 		@DisplayName("한 번의 삭제에 물리 트랜잭션이 정확히 하나 커밋된다")
@@ -1364,16 +1347,8 @@ class CommentServiceTest {
 			Comment comment = 서비스로_작성한_댓글(post, 경계_대역, "경계를 볼 댓글");
 
 			// 준비가 끝난 뒤에 센다. 세는 구간을 delete 한 번으로 좁혀 둔다
-			List<TransactionStatus> 커밋된_물리_트랜잭션 = new ArrayList<>();
-			willAnswer(invocation -> {
-				TransactionStatus status = invocation.getArgument(0);
-				if (status.isNewTransaction()) {
-					커밋된_물리_트랜잭션.add(status);
-				}
-				return invocation.callRealMethod();
-			}).given(this.spyTransactionManager).commit(any(TransactionStatus.class));
-
-			this.commentService.delete(comment.getId(), user(경계_대역));
+			List<String> 커밋된_물리_트랜잭션 = this.커밋_기록기.물리_커밋(
+					() -> this.commentService.delete(comment.getId(), user(경계_대역)));
 
 			assertThat(활성_댓글_수(post.getId()))
 					.as("삭제가 일어나지 않았다면 커밋 수는 아무것도 말하지 않는다")
@@ -1492,10 +1467,19 @@ class CommentServiceTest {
 	 * {@code show-sql}·{@code generate_statistics} 를 읽는 수단은 그 설정이 꺼지면 조용히 빈
 	 * 결과를 돌려준다. 이 수집기는 테스트가 직접 꽂고, 꽂히지 않으면 단언이 빈 목록에서
 	 * 터진다 (sp-docs/process/review-policy.md §4.1 "실패할 수 없는 단언을 쓰지 않는다").
+	 *
+	 * <p><b>스케줄러 스레드의 문장은 모으지 않고 훅도 돌리지 않는다.</b> 판정 행의 정리 작업
+	 * ({@code PostViewCleanup}, B-21)이 컨텍스트가 뜬 직후 그 스레드에서 {@code delete from post_view}
+	 * 를 낸다 — 테스트가 낸 문장이 아니다. 정리를 수집 창 안에서 스케줄러 스레드로 돌린 프로브에서
+	 * {@code LikeServiceTest} 의 수집기가 그 문장을 모았고 첫 문장 단언이 빨갰다 (2026-11-17 B-21
+	 * 실측). 테스트가 띄운 스레드의 문장은 그대로 모은다 — 동시 요청의 훅이 그 스레드에서 돈다. 스케줄러
+	 * 스레드는 이름의 접두어로 가르고, 접두어는 컨텍스트의 스케줄러에서 받는다.
 	 */
 	static class StatementRecorder implements StatementInspector {
 
 		private final List<String> 발행된_문장 = new CopyOnWriteArrayList<>();
+
+		private final String 스케줄러_스레드_접두어;
 
 		private volatile Predicate<String> 훅_대상 = sql -> false;
 
@@ -1505,8 +1489,15 @@ class CommentServiceTest {
 		/** 스레드마다 한 번만 돈다. 한 스레드가 두 번 모이면 집결지가 다시 닫혀 열리지 않는다. */
 		private final ThreadLocal<Boolean> 훅_소진 = ThreadLocal.withInitial(() -> false);
 
+		StatementRecorder(String 스케줄러_스레드_접두어) {
+			this.스케줄러_스레드_접두어 = 스케줄러_스레드_접두어;
+		}
+
 		@Override
 		public String inspect(String sql) {
+			if (Thread.currentThread().getName().startsWith(this.스케줄러_스레드_접두어)) {
+				return sql;
+			}
 			this.발행된_문장.add(sql);
 			if (!this.훅_소진.get() && this.훅_대상.test(정규화(sql))) {
 				this.훅_소진.set(true);
@@ -1563,8 +1554,8 @@ class CommentServiceTest {
 	static class StatementRecorderConfig {
 
 		@Bean
-		StatementRecorder statementRecorder() {
-			return new StatementRecorder();
+		StatementRecorder statementRecorder(ThreadPoolTaskScheduler taskScheduler) {
+			return new StatementRecorder(taskScheduler.getThreadNamePrefix());
 		}
 
 		@Bean

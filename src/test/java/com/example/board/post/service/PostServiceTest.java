@@ -2,7 +2,6 @@ package com.example.board.post.service;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
-import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyLong;
 import static org.mockito.BDDMockito.given;
 import static org.mockito.BDDMockito.willAnswer;
@@ -26,6 +25,7 @@ import com.example.board.post.dto.PostUpdateRequest;
 import com.example.board.post.entity.Post;
 import com.example.board.post.entity.PostCategory;
 import com.example.board.post.repository.PostRepository;
+import com.example.board.support.PhysicalCommitRecorder;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.sql.Connection;
@@ -70,12 +70,12 @@ import org.springframework.boot.test.context.TestConfiguration;
 import org.springframework.context.annotation.Bean;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.scheduling.concurrent.ThreadPoolTaskScheduler;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.ContextConfiguration;
 import org.springframework.test.context.bean.override.mockito.MockitoBean;
 import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.transaction.PlatformTransactionManager;
-import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -94,8 +94,8 @@ import org.springframework.transaction.support.TransactionTemplate;
  * 남는지. 실패를 HTTP 응답으로 끝까지 끌고 가는 쪽은 {@code PostControllerTest} 가 실제
  * {@code MemberClient} 와 스텁 서버로 본다.
  *
- * <p>리포지터리는 스텁으로 바꾸지 않고 H2 를 그대로 쓴다. "글이 저장되지 않는다" 와 "조회수가
- * 1 증가한다" 는 저장된 행을 봐야 확인된다.
+ * <p>리포지터리는 스텁으로 바꾸지 않고 H2 를 그대로 쓴다. "글이 저장되지 않는다" 와 조회수가
+ * 올랐는지는 저장된 행을 봐야 확인된다.
  *
  * <p>픽스처의 {@code writerId} 는 작성·조회(B-05)가 501~519, 수정·삭제(B-07)가 701~729,
  * B-11 의 중첩 클래스({@link 조회수_증가의_모양과_동시성})가 931~939 를 쓴다. 같은 JVM 의 모든
@@ -128,6 +128,12 @@ class PostServiceTest {
 
 	private static final String ROLE_ADMIN = "ADMIN";
 
+	/**
+	 * 상세 조회의 접속 주소. 비로그인 조회자의 판정 키가 이 값의 HMAC 이다
+	 * (sp-docs/requirements/board.md §9.1). 문서용 대역(TEST-NET-1)의 주소다.
+	 */
+	private static final String REMOTE_ADDR = "192.0.2.1";
+
 	@Autowired
 	private PostService postService;
 
@@ -151,6 +157,9 @@ class PostServiceTest {
 		// comment.post_id 에 FK 가 있으므로 (fk_comment_post_id) 댓글을 먼저 지운다
 		this.jdbcTemplate.update("DELETE FROM comment WHERE post_id IN "
 				+ "(SELECT id FROM post WHERE writer_id BETWEEN 701 AND 729)");
+		// post_view.post_id 에는 FK 가 없어 글을 지워도 판정 행이 남는다 — 글보다 먼저 지운다
+		this.jdbcTemplate.update("DELETE FROM post_view WHERE post_id IN "
+				+ "(SELECT id FROM post WHERE writer_id BETWEEN 501 AND 519)");
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 501 AND 519");
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 701 AND 729");
 	}
@@ -304,7 +313,7 @@ class PostServiceTest {
 	void 상세_조회는_member_를_호출하지_않는다() {
 		Post post = savedPost(502L, "저장된닉네임", "상세 대상", "상세 본문");
 
-		PostDetailResponse detail = this.postService.getDetail(post.getId());
+		PostDetailResponse detail = this.postService.getDetail(post.getId(), null, REMOTE_ADDR);
 
 		assertThat(detail.id()).isEqualTo(post.getId());
 		assertThat(detail.title()).isEqualTo("상세 대상");
@@ -314,31 +323,46 @@ class PostServiceTest {
 		verifyNoInteractions(this.memberClient);
 	}
 
+	/**
+	 * <b>같은 조회자는 한 번, 서로 다른 조회자는 각각 센다</b> (sp-docs/requirements/board.md §9.2).
+	 * 1차의 이 테스트는 상세 조회 2회에 2 를 기대했다 — 그 시점의 계약이다 (sp-docs/api-contract.md
+	 * §4.8 의 블록인용).
+	 *
+	 * <p>같은 주소의 비로그인 조회 둘 뒤에 로그인 조회를 둔다. 주소가 같아도 판정 키가 다르다 —
+	 * 로그인 전·후는 두 조회자다 (§9.2).
+	 */
 	@Test
-	@DisplayName("상세 조회 2회면 view_count 가 2다")
-	void 조회수는_조회마다_1_증가한다() {
+	@DisplayName("같은 조회자의 재조회는 세지 않고 다른 조회자의 조회는 센다")
+	void 같은_조회자는_한_번_다른_조회자는_각각_센다() {
 		Post post = savedPost(503L, "조회수작성자", "조회수", "본문");
 
-		this.postService.getDetail(post.getId());
-		this.postService.getDetail(post.getId());
+		this.postService.getDetail(post.getId(), null, REMOTE_ADDR);
+		this.postService.getDetail(post.getId(), null, REMOTE_ADDR);
 
 		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getViewCount())
+				.as("같은 주소의 비로그인 재조회는 24시간 안이라 세지 않는다")
+				.isEqualTo(1L);
+
+		this.postService.getDetail(post.getId(), user(509L), REMOTE_ADDR);
+
+		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getViewCount())
+				.as("로그인한 조회자는 다른 판정 키라 센다")
 				.isEqualTo(2L);
 	}
 
 	/** 응답에도 증가된 값이 실린다 — 저장만 하고 돌려주는 값이 옛 값이면 클라이언트가 못 본다. */
 	@Test
-	@DisplayName("상세 응답의 viewCount 는 증가 후 값이다")
+	@DisplayName("집계된 조회의 응답 viewCount 는 증가 후 값이다")
 	void 응답의_조회수는_증가_후_값이다() {
 		Post post = savedPost(504L, "조회수작성자", "조회수 응답", "본문");
 
-		assertThat(this.postService.getDetail(post.getId()).viewCount()).isEqualTo(1L);
+		assertThat(this.postService.getDetail(post.getId(), null, REMOTE_ADDR).viewCount()).isEqualTo(1L);
 	}
 
 	@Test
 	@DisplayName("없는 id 는 P001 이다")
 	void 없는_id_는_P001() {
-		assertThatThrownBy(() -> this.postService.getDetail(987654321L))
+		assertThatThrownBy(() -> this.postService.getDetail(987654321L, null, REMOTE_ADDR))
 				.isInstanceOf(BusinessException.class)
 				.extracting(e -> ((BusinessException) e).getErrorCode())
 				.isEqualTo(ErrorCode.POST_NOT_FOUND);
@@ -355,7 +379,7 @@ class PostServiceTest {
 		post.softDelete();
 		this.postRepository.saveAndFlush(post);
 
-		assertThatThrownBy(() -> this.postService.getDetail(post.getId()))
+		assertThatThrownBy(() -> this.postService.getDetail(post.getId(), null, REMOTE_ADDR))
 				.isInstanceOf(BusinessException.class)
 				.extracting(e -> ((BusinessException) e).getErrorCode())
 				.isEqualTo(ErrorCode.POST_NOT_FOUND);
@@ -367,7 +391,7 @@ class PostServiceTest {
 	@Test
 	@DisplayName("조회 실패 경로도 MemberClient 를 호출하지 않는다")
 	void 조회_실패_경로도_member_를_호출하지_않는다() {
-		assertThatThrownBy(() -> this.postService.getDetail(987654322L))
+		assertThatThrownBy(() -> this.postService.getDetail(987654322L, null, REMOTE_ADDR))
 				.isInstanceOf(BusinessException.class);
 
 		verify(this.memberClient, never()).findActiveNickname(anyLong());
@@ -921,9 +945,8 @@ class PostServiceTest {
 	 * 예외 발생 → 둘 다 롤백, 두 단언이 각각 반증 가능해야 한다" 와 "한 번의 삭제에 커밋이
 	 * 정확히 한 번 — 변이 셋(A·B·C)을 돌린다" — 이 여기 있다.
 	 *
-	 * <p>구조는 AU-08·AU-09 의 {@code 트랜잭션_경계} 와 같다. 빈 둘을 스파이로 바꿔야 하므로
-	 * 중첩 클래스이고, 바깥 클래스의 {@code postService} 에는 스파이가 아닌 원래 빈이 들어
-	 * 있으므로 여기서 다시 주입받는다.
+	 * <p>빈 하나를 스파이로 바꾸고 커밋 기록기를 더해야 하므로 중첩 클래스이고, 바깥 클래스의
+	 * {@code postService} 에는 스파이가 아닌 원래 빈이 들어 있으므로 여기서 다시 주입받는다.
 	 *
 	 * <table border="1">
 	 * <caption>{@code delete} 변이별 실패 (실측, 전체 198개 기준)</caption>
@@ -974,20 +997,18 @@ class PostServiceTest {
 	 */
 	@Nested
 	@DisplayName("게시글 삭제와 하위 댓글 삭제가 한 로컬 트랜잭션이다")
+	@ContextConfiguration(classes = PhysicalCommitRecorder.Config.class)
 	class 삭제_트랜잭션_경계 {
 
 		/** 댓글 연쇄 삭제 지점에 실패를 주입한다. 나머지 메서드는 실제 빈에 위임된다. */
 		@MockitoSpyBean
 		private CommentRepository spyCommentRepository;
 
-		/**
-		 * <b>경계를 관측하는 지점이다.</b> {@code TransactionInterceptor} 가 이 빈으로
-		 * 트랜잭션을 열고 닫으므로 커밋이 전부 여기를 지난다.
-		 */
-		@MockitoSpyBean
-		private PlatformTransactionManager spyTransactionManager;
+		/** <b>경계를 관측하는 지점이다.</b> 세는 법은 {@link PhysicalCommitRecorder} 다. */
+		@Autowired
+		private PhysicalCommitRecorder 커밋_기록기;
 
-		/** 위 스파이들을 주입받은 쪽이다. 바깥 클래스의 것과 다른 인스턴스다. */
+		/** {@code spyCommentRepository} 를 주입받은 쪽이다. 바깥 클래스의 것과 다른 인스턴스다. */
 		@Autowired
 		private PostService postService;
 
@@ -1006,19 +1027,8 @@ class PostServiceTest {
 		 * 검증표 <b>"한 번의 삭제에 커밋이 정확히 한 번"</b>. 경계 자체를 관측하므로 행위
 		 * 단언으로 대체할 수 없다 (sp-docs/process/review-policy.md §4.1).
 		 *
-		 * <p><b>{@code isNewTransaction()} 이 참인 커밋만 센다.</b> 참여 트랜잭션도 매니저의
-		 * {@code commit} 을 지나지만 그것은 물리 트랜잭션의 커밋이 아니므로, 빼고 남는 수가
-		 * 실제로 커밋된 트랜잭션의 수다.
-		 *
-		 * <p><b>"필터가 없으면 집계가 1을 넘는다" 를 이 자리의 근거로 적지 않는다.</b>
-		 * {@code delete} 는 {@code SimpleJpaRepository} 상속 메서드를 하나도 부르지 않고
-		 * 파생 쿼리와 {@code @Query} 만 지나므로 <b>필터를 지워도 올바른 구현의 집계가 1
-		 * 그대로다</b> (B-07 리뷰 실측). 다른 항목에서 성립하는 이유를 여기 옮겨 적으면
-		 * 측정하지 않은 주장이 된다 (sp-docs/conventions.md §9.5).
-		 *
-		 * <p><b>그래도 필터는 둔다.</b> sp-docs/process/review-policy.md §4.1 이 요구하는
-		 * 형태이고, 조회가 상속 메서드로 바뀌는 순간 필터 없는 테스트는 <b>올바른 구현에서</b>
-		 * 빨개진다.
+		 * <p><b>새로 연 트랜잭션의 커밋만 센다</b> — 세는 법은 {@link PhysicalCommitRecorder} 다.
+		 * 참여 트랜잭션의 완료는 물리 트랜잭션의 커밋이 아니다.
 		 *
 		 * <p><b>단언은 "정확히 한 번" 에만 걸고 다른 수치를 예측값으로 쓰지 않는다</b>(§4.1).
 		 */
@@ -1028,16 +1038,8 @@ class PostServiceTest {
 			Post post = 댓글_둘인_게시글을_만든다(719L);
 
 			// 준비가 끝난 뒤에 센다. 세는 구간을 delete 한 번으로 좁혀 둔다
-			List<TransactionStatus> 커밋된_물리_트랜잭션 = new ArrayList<>();
-			willAnswer(invocation -> {
-				TransactionStatus status = invocation.getArgument(0);
-				if (status.isNewTransaction()) {
-					커밋된_물리_트랜잭션.add(status);
-				}
-				return invocation.callRealMethod();
-			}).given(this.spyTransactionManager).commit(any(TransactionStatus.class));
-
-			this.postService.delete(post.getId(), new LoginMember(719L, ROLE_USER));
+			List<String> 커밋된_물리_트랜잭션 = this.커밋_기록기.물리_커밋(
+					() -> this.postService.delete(post.getId(), new LoginMember(719L, ROLE_USER)));
 
 			assertThat(커밋된_물리_트랜잭션)
 					.as("post.deleted 와 하위 댓글의 deleted 가 한 로컬 트랜잭션이다 "
@@ -1134,9 +1136,10 @@ class PostServiceTest {
 	 * <p>B-11 전의 {@code getDetail} 은 관리 엔티티의 조회수를 메모리에서 올렸고, 더티 체킹이
 	 * 변경되지 않은 컬럼까지 전부 UPDATE 에 실어 <b>그 트랜잭션이 읽은 {@code comment_count} 를
 	 * 그대로 다시 썼다</b> — SELECT 와 flush 사이에 커밋된 댓글 작성의 증가가 조회 하나로
-	 * 소실된다 (sp-docs/api-contract.md §4.5 가 {@code comment_count} 와 댓글 목록의
-	 * {@code totalElements} 가 같다고 정한 값이 어긋난다). 조회수 자체도 같은 성질이어서 동시
-	 * 조회가 같은 값을 읽으면 하나가 소실된다.
+	 * 소실된다 (sp-docs/api-contract.md §4.5 가 지키라고 적은 등식
+	 * 「{@code comment_count} = 답글을 포함한 활성 댓글 수」 가 어긋난다 — 1차의 그 절은 그 값이 댓글
+	 * 목록의 {@code totalElements} 와 같다고 적었다). 조회수 자체도 같은 성질이어서 동시 조회가 같은
+	 * 값을 읽으면 하나가 소실된다.
 	 *
 	 * <p><b>B-18 뒤로 {@code comment_count} 쪽은 {@code Post} 의 {@code @DynamicUpdate} 로도
 	 * 막힌다</b> — 더티 체킹의 UPDATE 가 바뀐 컬럼만 싣는다. 그래서 조회수 증가를 엔티티 변경으로
@@ -1153,11 +1156,16 @@ class PostServiceTest {
 	 *
 	 * <p>{@link StatementRecorder} 가 {@code update post …} 를 보면 그 스레드에서 훅을 돌린다.
 	 * Hibernate 의 {@code StatementInspector} 라 문장이 JDBC 로 넘어가기 <b>전에</b> 불리므로,
-	 * 그 시점에 조회 트랜잭션의 읽기는 끝나 있고 아직 아무 쓰기도 없다.
+	 * 그 시점에 조회수를 올리는 트랜잭션은 아직 {@code post} 에 쓴 것이 없다.
+	 *
+	 * <p><b>B-21(2026-11-16) 뒤로 그 트랜잭션은 조회수 판정이고, {@code post} 앞에 판정
+	 * 행({@code post_view})을 쓴다</b> (sp-docs/requirements/board.md §9.3). 훅의 대상은 테이블 이름
+	 * 뒤의 공백까지 본다 — {@code update post_view} 에서 멈추면 그 지점은 {@code post} 를 바꾸기
+	 * 직전이 아니다.
 	 *
 	 * <ul>
-	 * <li><b>동시 조회</b>는 집결지에 세운다 — 모두 모일 때까지 어느 스레드도 쓰지 않으므로,
-	 * 엔티티 증가 구현이면 그 읽기들이 모두 같은 조회수를 보았다는 뜻이 된다
+	 * <li><b>동시 조회</b>는 집결지에 세운다 — 모두 모일 때까지 어느 스레드도 {@code post} 에 쓰지
+	 * 않으므로, 엔티티 증가 구현이면 그 읽기들이 모두 같은 조회수를 보았다는 뜻이 된다
 	 * <li><b>댓글 끼워넣기</b>는 그 자리에서 댓글 작성을 <b>다른 스레드로 끝까지(커밋까지)</b>
 	 * 돌린다. 같은 스레드로 부르면 조회의 트랜잭션에 참여해 따로 커밋되지 않아 "그 사이에
 	 * 커밋된 증가" 가 만들어지지 않는다
@@ -1170,6 +1178,7 @@ class PostServiceTest {
 	 * <p>이 중첩 클래스의 {@code writerId} 는 931~939 를 쓴다. 바깥 클래스의
 	 * {@code @AfterEach} 는 그 대역을 지우지 않으므로 여기서 지운다.
 	 * {@code comment.post_id} 에 FK 가 있으므로 ({@code fk_comment_post_id}) 댓글을 먼저 지운다.
+	 * {@code post_view.post_id} 에는 FK 가 없어 글을 지워도 판정 행이 남으므로 그것도 먼저 지운다.
 	 */
 	@Nested
 	@DisplayName("조회수 증가가 좁은 UPDATE 이고 조회가 comment_count 를 덮어쓰지 않는다")
@@ -1189,6 +1198,8 @@ class PostServiceTest {
 		private static final long 조회_문장_대역 = 933L;
 
 		private static final long 응답_모양_대역 = 934L;
+
+		private static final long 같은_키_대역 = 935L;
 
 		/** 집결지·끼워넣기에서 기다리는 한도. 넘으면 강제가 일어나지 않은 것이므로 시끄럽게 터진다. */
 		private static final int 집결_한도_초 = 10;
@@ -1229,6 +1240,8 @@ class PostServiceTest {
 			// comment.post_id 에 FK 가 있으므로 (fk_comment_post_id) 댓글을 먼저 지운다
 			this.jdbcTemplate.update("DELETE FROM comment WHERE post_id IN "
 					+ "(SELECT id FROM post WHERE writer_id BETWEEN 931 AND 939)");
+			this.jdbcTemplate.update("DELETE FROM post_view WHERE post_id IN "
+					+ "(SELECT id FROM post WHERE writer_id BETWEEN 931 AND 939)");
 			this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 931 AND 939");
 		}
 
@@ -1236,9 +1249,10 @@ class PostServiceTest {
 		 * 검증표 <b>"댓글 작성과 상세 조회를 끼워넣기 → {@code comment_count} 가 덮어써지지
 		 * 않는다. 조회수 증가를 엔티티 변경으로 되돌리면 깨진다"</b>.
 		 *
-		 * <p>조회 트랜잭션이 게시글을 읽은 <b>뒤</b>, 그 트랜잭션이 {@code post} 를 바꾸기
-		 * <b>전</b>에 댓글 작성을 끼워 커밋시킨다. B-18 전에는 엔티티 증가 구현이면 뒤따르는
-		 * 전체 컬럼 UPDATE 가 읽어 둔 {@code comment_count} 를 다시 써서 그 증가를 지웠다.
+		 * <p>조회수를 올리는 트랜잭션이 {@code post} 를 바꾸기 <b>직전</b>에 댓글 작성을 끼워
+		 * 커밋시킨다 — 엔티티 증가 구현이면 그 트랜잭션이 게시글을 읽은 <b>뒤</b>다. B-18 전에는
+		 * 엔티티 증가 구현이면 뒤따르는 전체 컬럼 UPDATE 가 읽어 둔 {@code comment_count} 를 다시
+		 * 써서 그 증가를 지웠다.
 		 *
 		 * <p><b>검증표의 「되돌리면 깨진다」 는 이 테스트에 대해 B-18 전의 사실이다.</b> B-18 뒤로
 		 * {@code Post} 가 {@code @DynamicUpdate} 라 엔티티 증가의 UPDATE 가 {@code comment_count}
@@ -1247,7 +1261,7 @@ class PostServiceTest {
 		 * 증가를 엔티티 변경으로 되돌리고 {@code @DynamicUpdate} 까지 뺀 변이에서는 이 테스트가
 		 * 빨개졌다 (B-18 실측).
 		 *
-		 * <p><b>전제를 못박는 단언은 훅 안에서 읽은 값이다.</b> 조회의 쓰기가 나가기 전에
+		 * <p><b>전제를 못박는 단언은 훅 안에서 읽은 값이다.</b> 조회의 {@code post} 쓰기가 나가기 전에
 		 * {@link DataSource} 에서 직접 얻은 커넥션으로 {@code comment_count} 를 읽어 그 값이
 		 * 이미 1 인 것을 본다 — 그래야 그 증가가 <b>다른 트랜잭션이 따로 커밋한 것</b>임이
 		 * 관측된다. {@code JdbcTemplate} 으로는 안 된다: {@code DataSourceUtils} 를 지나 그
@@ -1275,14 +1289,14 @@ class PostServiceTest {
 			AtomicInteger 쓰기_전_집계 = new AtomicInteger(-1);
 			// 끼운 댓글 작성도 update post 를 발행하므로 훅을 한 번만 돌린다. 스레드마다 한 번인
 			// StatementRecorder 의 소진 표시로는 막히지 않는다 — 그쪽은 다른 스레드다
-			this.발행된_문장.훅을_건다(sql -> sql.startsWith("update post"), () -> {
+			this.발행된_문장.훅을_건다(sql -> sql.startsWith("update post "), () -> {
 				if (끼워넣었다.compareAndSet(false, true)) {
 					끼워넣기_실패.set(다른_스레드에서_댓글을_작성한다(post.getId()));
 					쓰기_전_집계.set(조회_트랜잭션_밖에서_읽은_집계(post.getId()));
 				}
 			});
 
-			this.postService.getDetail(post.getId());
+			this.postService.getDetail(post.getId(), null, REMOTE_ADDR);
 
 			assertThat(끼워넣었다)
 					.as("조회가 post 를 바꾸는 문장을 발행하지 않았으면 끼워넣기가 일어나지 않는다")
@@ -1313,14 +1327,19 @@ class PostServiceTest {
 		 *
 		 * <p>엔티티 증가 구현이면 세 트랜잭션이 모두 0 을 읽어 메모리에서 1 로 올리므로 커밋된
 		 * 조회수가 1 에서 멈춘다.
+		 *
+		 * <p><b>조회자를 스레드마다 다르게 둔다.</b> B-21(2026-11-16) 뒤로 같은 조회자는 24시간에 한
+		 * 번만 센다 — sp-docs/plan/phase2-board.md B-21 의 검증표가 이 줄을 「서로 다른 조회자의 동시
+		 * 조회 N건」 으로 고쳤다. 주소가 서로 다른 비로그인 조회자다.
 		 */
 		@Test
-		@DisplayName("같은 글을 동시 조회 3건이면 view_count 가 3 이다")
+		@DisplayName("서로 다른 조회자의 같은 글 동시 조회 3건이면 view_count 가 3 이다")
 		void 동시_조회에서_증가가_소실되지_않는다() throws InterruptedException {
 			Post post = 게시글을_만든다(동시_조회_대역);
 			모든_스레드를_post_UPDATE_직전에_모은다();
 
-			List<Throwable> 실패 = 동시에_실행한다(i -> this.postService.getDetail(post.getId()));
+			List<Throwable> 실패 = 동시에_실행한다(
+					i -> this.postService.getDetail(post.getId(), null, "192.0.2." + (11 + i)));
 
 			assertThat(실패).as("동시 조회가 실패하면 아래 단언은 소실을 보는 것이 아니다").isEmpty();
 			assertThat(커밋된_조회수(post.getId()))
@@ -1352,7 +1371,7 @@ class PostServiceTest {
 			Post post = 게시글을_만든다(조회_문장_대역);
 			this.발행된_문장.비운다();
 
-			this.postService.getDetail(post.getId());
+			this.postService.getDetail(post.getId(), null, REMOTE_ADDR);
 
 			List<String> post_UPDATE = this.발행된_문장.발행된_post_UPDATE();
 			assertThat(post_UPDATE)
@@ -1371,9 +1390,12 @@ class PostServiceTest {
 		 * P-05 의 동작과 §4.3 의 모양이 그대로인 것을 본다 (B-05 의 완료 기준).
 		 *
 		 * <p><b>"여덟 키" 는 1차 계약의 수다</b> (sp-docs/plan/phase1.md §6 머리의 블록인용).
-		 * B-19 가 2026-11-11 {@code D-18} 의 {@code category}·{@code likeCount} 를 더했고, §4.3
-		 * 의 상세 줄에 남은 {@code liked}·{@code attachments} 는 계획이 B-21·B-24 에 배정했다
-		 * (sp-docs/plan/phase2-board.md 의 B-19 완료 기준).
+		 * B-19 가 2026-11-11 {@code D-18} 의 {@code category}·{@code likeCount} 를, B-21 이
+		 * {@code liked} 를 더했다. §4.3 의 상세 줄에 남은 {@code attachments} 는 계획이 B-24 에
+		 * 배정했다 (sp-docs/plan/phase2-board.md 의 B-24).
+		 *
+		 * <p>조회수 쪽은 처음 보는 조회자의 조회다 — B-21 뒤로 같은 조회자의 재조회는 세지 않는다
+		 * (sp-docs/requirements/board.md §9.2).
 		 *
 		 * <p><b>커밋된 값과 응답의 값을 함께 본다.</b> 좁은 UPDATE 는 영속성 컨텍스트의
 		 * 엔티티를 지나지 않으므로 둘이 어긋날 수 있다 — DB 는 올랐는데 응답이 증가 전 값을
@@ -1388,11 +1410,11 @@ class PostServiceTest {
 		void 상세_조회_1회의_조회수와_응답_모양() throws Exception {
 			Post post = 게시글을_만든다(응답_모양_대역);
 
-			PostDetailResponse detail = this.postService.getDetail(post.getId());
+			PostDetailResponse detail = this.postService.getDetail(post.getId(), null, REMOTE_ADDR);
 
 			assertThat(커밋된_조회수(post.getId()))
-					.as("상세 조회 시 view_count 가 1 증가한다 (P-05, "
-							+ "sp-docs/requirements/board.md §1)")
+					.as("처음 보는 조회자의 상세 조회는 view_count 를 1 올린다 (P-05, "
+							+ "sp-docs/requirements/board.md §9.2)")
 					.isEqualTo(1L);
 			assertThat(detail.viewCount())
 					.as("응답에도 증가된 값이 실린다 — 저장만 하고 옛 값을 돌려주면 "
@@ -1402,30 +1424,78 @@ class PostServiceTest {
 					this.objectMapper.writeValueAsString(detail),
 					new TypeReference<Map<String, Object>>() { });
 			assertThat(serialized.keySet())
-					.as("상세는 목록 항목의 키에 content 를 더한 것이다 — liked·attachments 는 "
-							+ "B-19 가 싣지 않았다 (sp-docs/api-contract.md §4.3)")
+					.as("상세는 목록 항목의 키에 content·liked 를 더한 것이다 — sp-docs/api-contract.md "
+							+ "§4.3 의 상세 줄에서 attachments 를 뺀 모양이고, attachments 는 계획이 B-24 에 "
+							+ "배정했다 (sp-docs/plan/phase2-board.md 의 B-24)")
 					.isEqualTo(Set.of(
 							"id", "title", "category", "content", "writerId", "writerNickname",
-							"viewCount", "commentCount", "likeCount", "createdAt"));
+							"viewCount", "commentCount", "likeCount", "liked", "createdAt"));
+		}
+
+		/**
+		 * sp-docs/plan/phase2-board.md B-21 의 검증표 <b>"같은 키의 동시 첫 조회 N건 →
+		 * {@code view_count} +1, 응답 전부 200"</b> 의 저장 쪽이다. 200 은 여기서 예외 없이 끝난
+		 * 것으로 본다 — HTTP 의 UNIQUE 충돌 경로는 {@code PostControllerTest} 가 본다.
+		 *
+		 * <p><b>모든 스레드를 판정 INSERT 직전에 모은다.</b> 그 시점에 모두가 조건부 UPDATE 의 0 행과
+		 * 존재 확인의 「없음」 을 지났으므로 모두 INSERT 를 낸다 — 하나만 들어가고 나머지는 UNIQUE
+		 * 충돌이다 (sp-docs/requirements/board.md §9.3). 모으지 않으면 먼저 커밋한 스레드의 행을 뒤의
+		 * 스레드가 존재 확인에서 보고 충돌 없이 끝날 수 있어, 충돌 경로를 지났는지가 운에 달린다.
+		 * 한도 안에 모이지 않으면 그 스레드가 실패로 남아 첫 단언에서 터진다.
+		 *
+		 * <p>H2 에서 같은 키의 두 번째 INSERT 는 앞 트랜잭션이 끝날 때까지 기다렸다가 UNIQUE 위반이
+		 * 된다 (B-21 실측). 기다림은 H2 의 잠금 한도 안이어야 한다 — 앞 트랜잭션은 그 뒤에 좁은
+		 * UPDATE 하나를 내고 커밋한다.
+		 */
+		@Test
+		@DisplayName("같은 키의 동시 첫 조회 3건은 view_count 를 1 올리고 모두 예외 없이 끝난다")
+		void 같은_키의_동시_첫_조회는_한_번만_센다() throws InterruptedException {
+			Post post = 게시글을_만든다(같은_키_대역);
+			모든_스레드를_판정_INSERT_직전에_모은다();
+
+			List<Throwable> 실패 = 동시에_실행한다(
+					i -> this.postService.getDetail(post.getId(), null, REMOTE_ADDR));
+
+			assertThat(실패)
+					.as("판정 INSERT 의 UNIQUE 충돌이 상세 조회를 실패시키지 않는다 "
+							+ "(sp-docs/requirements/board.md §9.3)")
+					.isEmpty();
+			assertThat(커밋된_조회수(post.getId()))
+					.as("같은 키의 동시 조회는 한 번만 센다 (sp-docs/requirements/board.md §9.2)")
+					.isEqualTo(1L);
+			assertThat(판정_행_수(post.getId())).as("판정 행은 UNIQUE 가 하나로 묶는다").isEqualTo(1);
 		}
 
 		/**
 		 * <b>끼워넣기를 강제한다.</b> {@code update post …} 가 발행되기 직전에 스레드를 세워,
-		 * {@code 동시_요청} 개가 모두 모인 뒤에야 첫 쓰기가 실행되게 한다.
+		 * {@code 동시_요청} 개가 모두 모인 뒤에야 {@code post} 의 첫 쓰기가 실행되게 한다.
+		 */
+		private void 모든_스레드를_post_UPDATE_직전에_모은다() {
+			모든_스레드를_문장_직전에_모은다(sql -> sql.startsWith("update post "), "post UPDATE");
+		}
+
+		/** 판정 행의 INSERT 가 발행되기 직전에 스레드를 세운다 (B-21). */
+		private void 모든_스레드를_판정_INSERT_직전에_모은다() {
+			모든_스레드를_문장_직전에_모은다(sql -> sql.startsWith("insert into post_view"), "판정 INSERT");
+		}
+
+		/**
+		 * {@code 대상} 문장이 발행되기 직전에 스레드를 세워 {@code 동시_요청} 개가 모두 모인 뒤에야
+		 * 그 문장이 실행되게 한다.
 		 *
 		 * <p>한도 안에 모이지 않으면 {@link IllegalStateException} 으로 터진다 — 강제가
 		 * 일어나지 않은 측정이 통과하지 않게 한다.
 		 */
-		private void 모든_스레드를_post_UPDATE_직전에_모은다() {
+		private void 모든_스레드를_문장_직전에_모은다(Predicate<String> 대상, String 지점) {
 			CyclicBarrier 집결지 = new CyclicBarrier(동시_요청);
-			this.발행된_문장.훅을_건다(sql -> sql.startsWith("update post"), () -> {
+			this.발행된_문장.훅을_건다(대상, () -> {
 				try {
 					집결지.await(집결_한도_초, TimeUnit.SECONDS);
 				}
 				catch (InterruptedException | BrokenBarrierException | TimeoutException ex) {
 					throw new IllegalStateException(
-							"post UPDATE 직전에 모든 스레드가 모이지 않았다 — 끼워넣기가 강제되지 "
-									+ "않았으므로 이 측정은 소실을 볼 수 없다", ex);
+							지점 + " 직전에 모든 스레드가 모이지 않았다 — 끼워넣기가 강제되지 "
+									+ "않았으므로 이 측정은 경합을 볼 수 없다", ex);
 				}
 			});
 		}
@@ -1543,6 +1613,12 @@ class PostServiceTest {
 			Integer count = this.jdbcTemplate.queryForObject(
 					"SELECT COUNT(*) FROM comment WHERE post_id = ? AND deleted = FALSE",
 					Integer.class, postId);
+			return count == null ? 0 : count;
+		}
+
+		private int 판정_행_수(Long postId) {
+			Integer count = this.jdbcTemplate.queryForObject(
+					"SELECT COUNT(*) FROM post_view WHERE post_id = ?", Integer.class, postId);
 			return count == null ? 0 : count;
 		}
 
@@ -2030,10 +2106,19 @@ class PostServiceTest {
 	 *
 	 * <p>{@code CommentServiceTest} 에 같은 모양의 수집기가 있다. 그쪽은 package-private 이고
 	 * 다른 패키지라 여기서 쓸 수 없다 — 끌어올리려면 B-10 의 테스트 파일을 함께 고쳐야 한다.
+	 *
+	 * <p><b>스케줄러 스레드의 문장은 모으지 않고 훅도 돌리지 않는다.</b> 판정 행의 정리 작업
+	 * ({@code PostViewCleanup}, B-21)이 컨텍스트가 뜬 직후 그 스레드에서 {@code delete from post_view}
+	 * 를 낸다 — 테스트가 낸 문장이 아니다. 정리를 수집 창 안에서 스케줄러 스레드로 돌린 프로브에서
+	 * {@code LikeServiceTest} 의 수집기가 그 문장을 모았고 첫 문장 단언이 빨갰다 (2026-11-17 B-21
+	 * 실측). 테스트가 띄운 스레드의 문장은 그대로 모은다 — 동시 조회의 훅이 그 스레드에서 돈다. 스케줄러
+	 * 스레드는 이름의 접두어로 가르고, 접두어는 컨텍스트의 스케줄러에서 받는다.
 	 */
 	static class StatementRecorder implements StatementInspector {
 
 		private final List<String> 발행된_문장 = new CopyOnWriteArrayList<>();
+
+		private final String 스케줄러_스레드_접두어;
 
 		private volatile Predicate<String> 훅_대상 = sql -> false;
 
@@ -2043,8 +2128,15 @@ class PostServiceTest {
 		/** 스레드마다 한 번만 돈다. 한 스레드가 두 번 모이면 집결지가 다시 닫혀 열리지 않는다. */
 		private final ThreadLocal<Boolean> 훅_소진 = ThreadLocal.withInitial(() -> false);
 
+		StatementRecorder(String 스케줄러_스레드_접두어) {
+			this.스케줄러_스레드_접두어 = 스케줄러_스레드_접두어;
+		}
+
 		@Override
 		public String inspect(String sql) {
+			if (Thread.currentThread().getName().startsWith(this.스케줄러_스레드_접두어)) {
+				return sql;
+			}
 			this.발행된_문장.add(sql);
 			if (!this.훅_소진.get() && this.훅_대상.test(정규화(sql))) {
 				this.훅_소진.set(true);
@@ -2066,11 +2158,14 @@ class PostServiceTest {
 			this.훅_소진.remove();
 		}
 
-		/** {@code post} 를 바꾸는 UPDATE 만. 소문자·공백이 정규화된 문장이다. */
+		/**
+		 * {@code post} 를 바꾸는 UPDATE 만. 소문자·공백이 정규화된 문장이다. 테이블 이름 뒤의 공백까지
+		 * 본다 — {@code update post_view} 는 {@code post} 를 바꾸는 문장이 아니다 (B-21).
+		 */
 		List<String> 발행된_post_UPDATE() {
 			return this.발행된_문장.stream()
 					.map(StatementRecorder::정규화)
-					.filter(sql -> sql.startsWith("update post"))
+					.filter(sql -> sql.startsWith("update post "))
 					.toList();
 		}
 
@@ -2088,8 +2183,8 @@ class PostServiceTest {
 	static class StatementRecorderConfig {
 
 		@Bean
-		StatementRecorder statementRecorder() {
-			return new StatementRecorder();
+		StatementRecorder statementRecorder(ThreadPoolTaskScheduler taskScheduler) {
+			return new StatementRecorder(taskScheduler.getThreadNamePrefix());
 		}
 
 		@Bean

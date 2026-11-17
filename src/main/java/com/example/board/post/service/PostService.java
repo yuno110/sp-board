@@ -7,6 +7,7 @@ import com.example.board.global.error.BusinessException;
 import com.example.board.global.error.ErrorCode;
 import com.example.board.global.security.ContractRole;
 import com.example.board.global.security.LoginMember;
+import com.example.board.like.repository.PostLikeRepository;
 import com.example.board.post.dto.PostCreateRequest;
 import com.example.board.post.dto.PostDetailResponse;
 import com.example.board.post.dto.PostResponse;
@@ -17,6 +18,9 @@ import com.example.board.post.entity.PostCategory;
 import com.example.board.post.repository.PostQueryRepository;
 import com.example.board.post.repository.PostRepository;
 import com.example.board.post.support.PostReader;
+import com.example.board.post.support.ViewCountJudge;
+import com.example.board.post.support.ViewerKeyFactory;
+import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.annotation.Transactional;
@@ -57,12 +61,29 @@ public class PostService {
 	 */
 	private final TransactionTemplate insertTransaction;
 
+	/** 상세 조회의 조회수 판정 (P-05). 자기 트랜잭션을 연다 — {@link #getDetail} 의 주석. */
+	private final ViewCountJudge viewCountJudge;
+
+	private final ViewerKeyFactory viewerKeyFactory;
+
+	/** 상세·수정 응답의 {@code liked} (sp-docs/api-contract.md §4.3, sp-docs/conventions.md §1.3). */
+	private final PostLikeRepository postLikeRepository;
+
+	/**
+	 * 상세 조회의 읽기 트랜잭션. <b>{@code @Transactional} 로 메서드 전체를 감쌀 수 없어서</b>
+	 * 템플릿을 쓴다 — 감싸면 판정이 그 트랜잭션에 참여한다 ({@link #getDetail}).
+	 */
+	private final TransactionTemplate readTransaction;
+
 	public PostService(
 			PostRepository postRepository,
 			PostQueryRepository postQueryRepository,
 			PostReader postReader,
 			MemberClient memberClient,
 			CommentRepository commentRepository,
+			ViewCountJudge viewCountJudge,
+			ViewerKeyFactory viewerKeyFactory,
+			PostLikeRepository postLikeRepository,
 			PlatformTransactionManager transactionManager) {
 
 		this.postRepository = postRepository;
@@ -70,7 +91,12 @@ public class PostService {
 		this.postReader = postReader;
 		this.memberClient = memberClient;
 		this.commentRepository = commentRepository;
+		this.viewCountJudge = viewCountJudge;
+		this.viewerKeyFactory = viewerKeyFactory;
+		this.postLikeRepository = postLikeRepository;
 		this.insertTransaction = new TransactionTemplate(transactionManager);
+		this.readTransaction = new TransactionTemplate(transactionManager);
+		this.readTransaction.setReadOnly(true);
 	}
 
 	/**
@@ -122,45 +148,66 @@ public class PostService {
 						.category(request.category())
 						.build()));
 
-		return PostDetailResponse.from(saved);
+		// 방금 만든 글이라 누른 사람이 없다 (sp-docs/api-contract.md §4.4)
+		return PostDetailResponse.from(saved, false);
 	}
 
 	/**
-	 * 게시글 상세 조회 (P-04) 와 조회수 증가 (P-05). <b>비로그인 허용이다</b>
-	 * (sp-docs/api-contract.md §4).
+	 * 게시글 상세 조회 (P-04) 와 조회수 판정 (P-05). <b>인증은 선택이다</b>
+	 * (sp-docs/api-contract.md §4.8).
 	 *
 	 * <p><b>{@code MemberClient} 를 호출하지 않는다.</b> 작성자 닉네임은 작성 시점 스냅샷이
 	 * 게시글에 있고, 조회 경로의 board → member 호출은 금지되어 있다
 	 * (sp-docs/api-contract.md §4.2, sp-docs/architecture.md §5).
 	 *
-	 * <p><b>{@code readOnly = true} 를 쓸 수 없다.</b> 조회수 증가가 쓰기다 (P-05).
+	 * <p><b>트랜잭션을 나눠 차례로 끝낸다</b> — 404 판정의 읽기, 조회수 판정, 응답의 읽기다.
+	 * <ol>
+	 * <li><b>404 판정이 먼저다</b> — 없는·삭제된 글은 {@code P001} 이고 판정 행이 생기지 않는다
+	 * (sp-docs/domain-model.md §4.5). {@link PostReader#requireActive} 는 엔티티를 읽지 않는다 —
+	 * 그 이유는 그 메서드에 있다.
+	 * <li><b>조회수 판정은 이 메서드의 트랜잭션이 아니다</b> (sp-docs/requirements/board.md §9.3).
+	 * 판정 INSERT 의 UNIQUE 충돌이 그 트랜잭션을 되돌림 전용으로 만들므로, 응답을 만드는 트랜잭션과
+	 * 같으면 상세 조회가 500 이 된다. {@link ViewCountJudge} 가 자기 트랜잭션을 열고 커밋까지 끝낸다.
+	 * <li><b>응답은 판정 커밋 뒤에 시작된 읽기에서 만든다</b> (sp-docs/requirements/board.md
+	 * §9.3, sp-docs/api-contract.md §4.8). MySQL 의 반복 읽기에서는 트랜잭션의 첫 읽기가 스냅샷을
+	 * 정하므로, 판정 전에 연 트랜잭션에서 읽으면 판정이 커밋한 +1 을 보지 못한다
+	 * (sp-docs/requirements/board.md §9.3).
+	 * </ol>
 	 *
-	 * <p>삭제된 게시글·없는 id 는 {@link PostReader} 가 404 {@code P001} 로 만든다 —
-	 * {@code deleted} 조건을 여기서 다시 쓰지 않는다 (sp-docs/requirements/board.md §5 규칙 1).
+	 * <p><b>그래서 이 메서드에 {@code @Transactional} 을 붙이지 않는다.</b> 붙이면 판정과 읽기의
+	 * 템플릿이 그 트랜잭션에 참여한다 — 판정이 응답의 트랜잭션과 갈라지지 않고, 응답의 읽기가 판정
+	 * 전에 시작된 트랜잭션 안이 된다. 읽기는 {@code readOnly} 다 (sp-docs/conventions.md §5).
 	 *
-	 * <p><b>조회수 증가는 {@link PostRepository#increaseViewCount} 의 좁은 UPDATE 다</b>
-	 * (sp-docs/plan/phase1.md §6 B-11). 읽어 둔 엔티티의 조회수를 메모리에서 올리면 동시 조회가
-	 * 같은 값을 읽어 하나가 소실된다. B-11 이 잰 그 UPDATE 는 변경되지 않은 컬럼까지 실어 <b>이
-	 * 트랜잭션이 읽은 {@code comment_count} 도 다시 썼다</b> — 그쪽은 B-18 뒤로 {@code Post} 의
-	 * {@code @DynamicUpdate} 가 막는다.
+	 * <p><b>404 판정과 응답의 읽기 사이에 창이 있다.</b> 그 사이에 글 삭제가 커밋되면 판정 행과 +1
+	 * 이 삭제된 글에 남을 수 있고 응답은 404 {@code P001} 이다 (코드 읽기). 판정은 글의 삭제 여부를
+	 * 다시 보지 않는다. 삭제된 글은 보이지 않으므로 드러나지 않는다.
 	 *
-	 * <p><b>그래서 이 메서드는 엔티티를 바꾸지 않는다.</b> 엔티티를 함께 올리면 더티 체킹의
-	 * UPDATE 가 좁은 UPDATE 와 <b>함께</b> 발행되고, 그 문장이 이 트랜잭션이 읽은 조회수로
-	 * 계산한 값을 쓰므로 조회수가 어긋난다 — 발행된 {@code update post} 가 정확히 하나인지를
-	 * 보는 단언이 그것을 본다.
-	 *
-	 * <p><b>한 번의 상세 조회가 게시글을 두 번 읽는다.</b> 앞의 읽기는 404 판정이고, 뒤의
-	 * 읽기는 응답에 실을 값이다 — 좁은 UPDATE 는 영속성 컨텍스트를 지나지 않으므로 앞에서
-	 * 읽어 둔 사본은 증가 전 조회수를 들고 있고, 그것으로 응답을 만들면 클라이언트가 옛 값을
-	 * 받는다. {@code increaseViewCount} 의 {@code clearAutomatically} 가 컨텍스트를 비워 뒤의
-	 * 읽기가 새 SELECT 가 된다.
+	 * @param loginMember 유효한 토큰의 계정. 토큰이 없으면 {@code null} — 유효하지 않은 토큰은
+	 *        여기 오지 않고 401 이다 (sp-docs/api-contract.md §4.8)
+	 * @param remoteAddr TCP 연결의 상대 주소. 비로그인 조회자의 판정 키에만 쓴다
+	 *        (sp-docs/security.md §9)
 	 */
-	@Transactional
-	public PostDetailResponse getDetail(Long id) {
-		// 404 판정이 먼저다. 돌아온 엔티티를 응답에 쓰지 않는 이유는 위에 있다
-		this.postReader.getActiveById(id);
-		this.postRepository.increaseViewCount(id);
-		return PostDetailResponse.from(this.postReader.getActiveById(id));
+	public PostDetailResponse getDetail(Long id, @Nullable LoginMember loginMember, String remoteAddr) {
+		// 1) 404 — 판정보다 먼저다
+		this.readTransaction.executeWithoutResult(status -> this.postReader.requireActive(id));
+
+		// 2) 판정 — 자기 트랜잭션에서 커밋까지 끝난다
+		this.viewCountJudge.judge(id, this.viewerKeyFactory.keyOf(loginMember, remoteAddr));
+
+		// 3) 판정 커밋 뒤에 시작한 읽기
+		return this.readTransaction.execute(status -> PostDetailResponse.from(
+				this.postReader.getActiveById(id), likedBy(id, loginMember)));
+	}
+
+	/**
+	 * 상세·수정 응답의 {@code liked}. 토큰이 없으면 {@code null} 이고, 있으면 그 계정이 눌렀는지다
+	 * (sp-docs/api-contract.md §4.3 §4.4 §4.8).
+	 */
+	private Boolean likedBy(Long postId, @Nullable LoginMember loginMember) {
+		if (loginMember == null) {
+			return null;
+		}
+		return this.postLikeRepository.existsByPostIdAndAccountId(postId, loginMember.accountId());
 	}
 
 	/**
@@ -245,7 +292,8 @@ public class PostService {
 		post.update(request.title(), request.content());
 		post.changeCategory(request.category());
 
-		return PostDetailResponse.from(post);
+		// 요청한 계정의 실제 상태다 (sp-docs/api-contract.md §4.4)
+		return PostDetailResponse.from(post, likedBy(id, loginMember));
 	}
 
 	/**

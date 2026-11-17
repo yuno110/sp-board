@@ -17,7 +17,7 @@ public interface PostLikeRepository extends JpaRepository<PostLike, Long> {
 	/**
 	 * 이 회원이 이 글을 눌렀는가.
 	 *
-	 * <p>좋아요의 멱등 판정과 상세 응답의 {@code liked} 가 이 확인을 쓴다
+	 * <p>좋아요의 멱등 판정과 상세·수정 응답의 {@code liked} 가 이 확인을 쓴다
 	 * (sp-docs/domain-model.md §6.1, sp-docs/plan/phase2-board.md §2.1). <b>회원당 한 번의 최종
 	 * 판정은 이 확인이 아니라 {@code uk_post_like_post_account} 다</b> — 락 전의 일반 읽기는 앞서
 	 * 커밋된 좋아요를 놓칠 수 있다 (§6.1).

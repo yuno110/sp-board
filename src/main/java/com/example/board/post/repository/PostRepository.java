@@ -39,6 +39,14 @@ public interface PostRepository extends JpaRepository<Post, Long> {
 	Optional<Post> findByIdAndDeletedFalse(Long id);
 
 	/**
+	 * 삭제되지 않은 게시글이 있는가. 엔티티를 읽지 않는 404 판정이다 — 부르는 쪽은
+	 * {@link com.example.board.post.support.PostReader#requireActive} 다.
+	 *
+	 * <p>조건은 {@link #findByIdAndDeletedFalse} 와 같다 (sp-docs/requirements/board.md §5 규칙 1).
+	 */
+	boolean existsByIdAndDeletedFalse(Long id);
+
+	/**
 	 * {@code comment_count} 를 1 올린다. 영향받은 행 수를 돌려준다.
 	 *
 	 * <p><b>좁은 UPDATE 다 — {@code comment_count} 한 컬럼만 싣는다</b>
@@ -101,20 +109,30 @@ public interface PostRepository extends JpaRepository<Post, Long> {
 	 * UPDATE 는 변경되지 않은 컬럼까지 실어 <b>그 트랜잭션이 읽은 {@code comment_count} 도 다시
 	 * 썼다</b> — 그쪽은 B-18 뒤로 {@code Post} 의 {@code @DynamicUpdate} 가 막는다.
 	 *
-	 * <p><b>{@code clearAutomatically} 를 켠다.</b> 부르는 쪽
-	 * ({@code PostService.getDetail})이 이 문장 다음에 같은 게시글을 다시 읽어 응답을 만들고,
-	 * 이 문장은 엔티티를 지나지 않으므로 영속성 컨텍스트에 남아 있는 사본은 증가 전 조회수를
-	 * 들고 있다. 비우지 않으면 그 사본이 그대로 돌아와 <b>응답의 {@code viewCount} 가 증가 전
-	 * 값이 된다</b> — 끈 상태로 돌려 측정한 것이다. 비우면 다음 읽기가 새 SELECT 가 되어 DB 가
-	 * 올린 값을 본다.
+	 * <p><b>{@code clearAutomatically} 를 켠다.</b> 이 문장은 엔티티를 지나지 않으므로, 이 문장 앞에
+	 * 읽은 글의 사본이 영속성 컨텍스트에 남아 있으면 그 사본은 증가 전 조회수를 들고 있고 비우지 않으면
+	 * 뒤의 읽기가 그 사본을 돌려준다. B-11 의 상세 조회는 한 트랜잭션에서 이 문장 앞뒤로 글을 읽어
+	 * 응답을 만들었고, 끈 상태에서 응답의 {@code viewCount} 가 증가 전 값이었다
+	 * (sp-docs/plan/phase1.md §6 B-11 의 블록인용).
 	 *
-	 * <p>{@code flushAutomatically} 는 켜지 않는다. 상세 조회는 이 문장 앞에 쓰기가 없어
-	 * 내보낼 것이 없다 — 켤 이유가 있는 것은 호출 시점에 쓰기 대기 중인 변경을 들고 있는
-	 * 경로다 (B-17 전의 댓글 삭제 경로가 그랬다).
+	 * <p><b>2026-11-16 의 상세 조회(B-21)는 이 설정에 기대지 않는다.</b> 이 문장을 부르는 쪽은 조회수
+	 * 판정({@link com.example.board.post.support.ViewCountJudge})이고, 응답은 판정 커밋 뒤의 다른
+	 * 트랜잭션에서 읽는다. 요청 동안 열려 있는 영속성 컨텍스트(Open Session In View)는 그 트랜잭션들을
+	 * 넘어 남지만 이 문장 앞에 글을 읽는 단계가 없다 — 404 판정은 엔티티를 읽지 않고
+	 * ({@link com.example.board.post.support.PostReader#requireActive}) 판정은 글을 읽지 않는다.
+	 * 비우기만 끈 변이에서 전체 스위트가 녹색이었다 (B-21 실측). 지금 응답을 지키는 것은 이 문장 앞에
+	 * 글을 읽지 않는 순서이고, 이 설정은 그 순서가 깨질 때의 방어다 — <b>이 문장이 나가는 집계된
+	 * 조회에서만</b>이다. 404 판정이 엔티티를 읽게 한 변이에서 집계된 조회의 응답은 맞았고, 세지 않은
+	 * 재조회의 응답은 판정 사이에 커밋된 증가를 싣지 않았다. 거기에 비우기까지 끈 변이에서는 집계된
+	 * 조회의 응답도 증가 전 값이었다 (B-21 실측).
+	 *
+	 * <p>{@code flushAutomatically} 는 켜지 않는다. 판정은 이 문장 앞에 판정 행을 쓰지만 그 쓰기는 이미
+	 * 나갔다 — 조건부 UPDATE 는 벌크 문장이고 INSERT 는 {@code saveAndFlush} 다 (코드 읽기). 켤 이유가
+	 * 있는 것은 호출 시점에 쓰기 대기 중인 변경을 들고 있는 경로다 (B-17 전의 댓글 삭제 경로가 그랬다).
 	 *
 	 * <p>{@code deleted} 조건을 이 문장에 두지 않는다. 삭제된 게시글을 없는 것으로 보는 판정은
-	 * {@link com.example.board.post.support.PostReader} 가 하고, 부르는 쪽이 그 판정을 먼저
-	 * 지난 뒤 이 문장을 발행한다 — 조건을 여기 복제하면 같은 규칙이 두 군데에서 각각 늙는다.
+	 * {@link com.example.board.post.support.PostReader} 가 하고, 상세 조회가 그 판정을 먼저 지난 뒤
+	 * 조회수 판정이 이 문장을 발행한다 — 조건을 여기 복제하면 같은 규칙이 두 군데에서 각각 늙는다.
 	 *
 	 * <p><b>발행된 {@code update post} 가 정확히 하나인지를 보는 단언이 막는 것은 더티
 	 * 엔티티다.</b> 이 문장을 그대로 두고 엔티티의 {@code increaseViewCount()} 를 함께 부르면
@@ -138,11 +156,11 @@ public interface PostRepository extends JpaRepository<Post, Long> {
 	 * <p><b>{@code clearAutomatically} 를 켠다.</b> 부르는 쪽이 이 문장 다음에 {@code post} 를
 	 * 다시 읽는다 — 응답의 {@code likeCount} 는 쓴 뒤(되돌렸으면 되돌린 뒤) 읽은 값이다 (§6.1).
 	 * 이 문장은 엔티티를 지나지 않으므로, 부르는 쪽이 이 문장 앞에 글을 읽어 두었다면 그 사본은 증가
-	 * 전 값을 들고 있고 비우지 않으면 다시 읽기가 그 사본을 돌려줄 수 있다 — {@link #increaseViewCount}
-	 * 를 끈 상태로 측정한 결함과 같은 모양이다 (sp-docs/plan/phase1.md §6 B-11). <b>2026-11-16 의
-	 * 좋아요(B-20)는 이 문장 앞에 글을 읽지 않아 남는 사본이 없다</b> — 비우기만 끈 변이에서 좋아요
-	 * 테스트가 녹색이었다(B-20 실측). 지금 응답을 지키는 것은 그 순서이고, 이 설정은 순서가 깨질 때의
-	 * 방어다.
+	 * 전 값을 들고 있고 비우지 않으면 다시 읽기가 그 사본을 돌려줄 수 있다 — B-11 이
+	 * {@link #increaseViewCount} 를 끈 상태로 측정한 결함과 같은 모양이다 (sp-docs/plan/phase1.md §6
+	 * B-11). <b>2026-11-16 의 좋아요(B-20)는 이 문장 앞에 글을 읽지 않아 남는 사본이 없다</b> — 비우기만
+	 * 끈 변이에서 좋아요 테스트가 녹색이었다(B-20 실측). 지금 응답을 지키는 것은 그 순서이고, 이 설정은
+	 * 순서가 깨질 때의 방어다.
 	 *
 	 * <p><b>{@code flushAutomatically} 도 켠다.</b> 비우기는 내보내지 않은 변경을 버린다. 먼저
 	 * 내보내야 부르는 쪽이 이 문장 앞에 남긴 쓰기가 비우기에 조용히 사라지지 않는다.

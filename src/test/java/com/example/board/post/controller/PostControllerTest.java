@@ -3,6 +3,9 @@ package com.example.board.post.controller;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.hasSize;
 import static org.hamcrest.Matchers.nullValue;
+import static org.mockito.ArgumentMatchers.anyLong;
+import static org.mockito.ArgumentMatchers.anyString;
+import static org.mockito.BDDMockito.willAnswer;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -16,6 +19,8 @@ import com.example.board.global.error.BusinessException;
 import com.example.board.post.entity.Post;
 import com.example.board.post.entity.PostCategory;
 import com.example.board.post.repository.PostRepository;
+import com.example.board.post.repository.PostViewRepository;
+import com.example.board.post.support.PostViewCleanup;
 import com.example.board.support.TestTokenFactory;
 import com.jayway.jsonpath.JsonPath;
 import com.sun.net.httpserver.HttpExchange;
@@ -25,13 +30,24 @@ import java.io.InputStream;
 import java.io.UncheckedIOException;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
+import java.security.GeneralSecurityException;
 import java.time.Duration;
+import java.time.LocalDateTime;
+import java.time.temporal.ChronoUnit;
+import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
+import javax.crypto.Mac;
+import javax.crypto.spec.SecretKeySpec;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -42,15 +58,19 @@ import org.junit.jupiter.params.provider.ValueSource;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.core.env.Environment;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
+import org.springframework.test.context.bean.override.mockito.MockitoBean;
+import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.ResultMatcher;
 import org.springframework.test.web.servlet.MvcResult;
+import org.springframework.test.web.servlet.request.RequestPostProcessor;
 import org.springframework.transaction.PlatformTransactionManager;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -81,6 +101,12 @@ import org.springframework.transaction.support.TransactionTemplate;
  * {@code @AfterEach} 가 지운다. 533·534·756 은 2026-11-16 에, 나머지는 2026-11-13 에 테스트 소스
  * 전체에서 그 값을 쓰는 곳이 없는 것을 확인하고 골랐다.
  *
+ * <p>B-21 의 상세 조회 테스트(sp-docs/plan/phase2-board.md B-21 의 검증표)는 1201~1249 를 쓴다.
+ * 2026-11-16 에 테스트 소스 전체에서 그 값을 쓰는 곳이 없는 것을 확인하고 골랐다. 그 대역의 글은
+ * 좋아요 행을 가질 수 있어({@code fk_post_like_post_id}) {@code @AfterEach} 가 그것을 먼저 지우고,
+ * 상세 조회가 남긴 판정 행도 먼저 지운다 — {@code post_view.post_id} 에는 FK 가 없어 글을 지워도
+ * 남는다.
+ *
  * <p><b>목록 쪽 단언은 검색 조건으로 범위를 좁힌다.</b> 이 클래스는 롤백에 기대지 않고 커밋하므로
  * 테이블 전체를 세는 단언은 다른 클래스의 픽스처에 흔들린다. 전체 건수를 보는 것은 롤백되는
  * {@code PostQueryRepositoryTest} 가 맡는다.
@@ -110,13 +136,13 @@ class PostControllerTest {
 	 * 기대값이 함께 움직여 단언이 아무것도 보지 못한다.
 	 *
 	 * <p><b>sp-docs/api-contract.md §4.3 의 상세 줄 전체가 아니다.</b> 목록 항목의 키에
-	 * {@code content} 를 더한 것이고, 그 줄의 {@code liked}·{@code attachments} 는 B-19
-	 * (2026-11-13)가 싣지 않았다 — 계획이 그 둘을 B-21·B-24 에 배정했다
-	 * (sp-docs/plan/phase2-board.md 의 B-19 완료 기준).
+	 * {@code content}·{@code liked} 를 더한 것이고, 그 줄의 {@code attachments} 는 B-21
+	 * (2026-11-16) 시점에 싣지 않았다 — 계획이 그것을 B-24 에 배정했다
+	 * (sp-docs/plan/phase2-board.md 의 B-24).
 	 */
 	private static final Set<String> DETAIL_KEYS = Set.of(
 			"id", "title", "category", "content", "writerId", "writerNickname",
-			"viewCount", "commentCount", "likeCount", "createdAt");
+			"viewCount", "commentCount", "likeCount", "liked", "createdAt");
 
 	/**
 	 * <b>목록 항목</b>의 키 집합. sp-docs/api-contract.md §4.3 의 <b>목록 줄 그대로다</b>
@@ -158,6 +184,31 @@ class PostControllerTest {
 	@Autowired
 	private PlatformTransactionManager transactionManager;
 
+	/**
+	 * 조회수 판정의 존재 확인에 끼워넣기를 거는 자리다 (B-21). 대역으로 바꾸지 않은 메서드는 실제 빈에
+	 * 위임되므로 다른 테스트에는 그대로다.
+	 */
+	@MockitoSpyBean
+	private PostViewRepository postViewRepository;
+
+	/**
+	 * 판정 행의 정리 작업을 대역으로 바꾼다 — 이 컨텍스트에서는 판정 행을 지우지 않는다.
+	 *
+	 * <p>정리 작업은 컨텍스트가 뜬 직후부터 주기마다 스케줄러 스레드에서 {@code postViewRepository} 의
+	 * 삭제를 부른다 ({@link PostViewCleanup#run}). 이 클래스는 그 스파이에 스텁을 걸므로, 스텁을 거는
+	 * 동안 그 호출이 끼면 스텁이 그 호출에 걸린다 — 매니저 스파이로 커밋을 세던 테스트가 정리를 5ms
+	 * 주기로 돌린 프로브에서 스텁을 거는 줄의 {@code UnfinishedStubbingException} 으로 빨갰다
+	 * (2026-11-17 B-21 리뷰·수정 실측). 스텁을 거는 동작 자체가 겨루므로 스텁의 답에서 스레드를
+	 * 걸러서는 막지 못한다. 정리 작업 자체(지우는 행·등록된 주기·삭제의 예외)는
+	 * {@code PostViewCleanupTest} 가 본다.
+	 */
+	@MockitoBean
+	private PostViewCleanup postViewCleanup;
+
+	/** 비로그인 판정 키의 기대값을 계산할 비밀키를 읽는다 — 컨텍스트의 설정값 문자열 그대로다. */
+	@Autowired
+	private Environment environment;
+
 	@BeforeEach
 	void 스텁_초기화() {
 		REQUEST_COUNT.set(0);
@@ -167,6 +218,13 @@ class PostControllerTest {
 
 	@AfterEach
 	void 픽스처_정리() {
+		// post_view.post_id 에는 FK 가 없어 글을 지워도 판정 행이 남는다 — 글보다 먼저 지운다
+		this.jdbcTemplate.update("DELETE FROM post_view WHERE post_id IN (SELECT id FROM post "
+				+ "WHERE writer_id BETWEEN 521 AND 539 OR writer_id BETWEEN 1201 AND 1249)");
+		// post_like.post_id 에 FK 가 있으므로 (fk_post_like_post_id) 좋아요를 먼저 지운다
+		this.jdbcTemplate.update("DELETE FROM post_like WHERE post_id IN "
+				+ "(SELECT id FROM post WHERE writer_id BETWEEN 1201 AND 1249)");
+		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 1201 AND 1249");
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 521 AND 539");
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 621 AND 639");
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 741 AND 759");
@@ -407,7 +465,7 @@ class PostControllerTest {
 	 * sp-docs/domain-model.md §1.1).
 	 */
 	@Test
-	@DisplayName("상세 응답 키는 목록 항목의 키에 content 를 더한 것이고 deleted·updatedAt 이 없다")
+	@DisplayName("상세 응답 키는 목록 항목의 키에 content·liked 를 더한 것이고 deleted·updatedAt 이 없다")
 	void 상세_응답_키_집합() throws Exception {
 		Post post = savedPost(523L, "키집합작성자", "키 집합", "본문");
 
@@ -436,14 +494,22 @@ class PostControllerTest {
 				.andExpect(jsonPath("$.data.likeCount").value(2));
 	}
 
+	/**
+	 * <b>같은 조회자는 24시간에 한 번, 서로 다른 조회자는 각각 센다</b>
+	 * (sp-docs/requirements/board.md §9.2). 1차의 이 테스트는 상세 조회 2회에 {@code viewCount} 2
+	 * 를 기대했다 — 그 시점의 계약이다 (sp-docs/api-contract.md §4.8 의 블록인용).
+	 */
 	@Test
-	@DisplayName("상세 조회 2회면 viewCount 가 2다")
-	void 상세_조회_2회면_조회수가_2() throws Exception {
+	@DisplayName("같은 조회자의 재조회는 viewCount 를 올리지 않고 다른 조회자의 조회는 올린다")
+	void 같은_조회자의_재조회는_세지_않고_다른_조회자는_센다() throws Exception {
 		Post post = savedPost(524L, "조회수작성자", "조회수", "본문");
 
 		this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
 				.andExpect(jsonPath("$.data.viewCount").value(1));
 		this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
+				.andExpect(jsonPath("$.data.viewCount").value(1));
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(ACCOUNT_ID)))
 				.andExpect(jsonPath("$.data.viewCount").value(2));
 
 		assertThat(this.postRepository.findById(post.getId()).orElseThrow().getViewCount())
@@ -468,6 +534,405 @@ class PostControllerTest {
 		this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
 				.andExpect(status().isNotFound())
 				.andExpect(jsonPath("$.error.code").value("P001"));
+	}
+
+	// --- 상세 조회의 선택적 인증과 조회수 판정 (B-21, sp-docs/api-contract.md §4.8) ---
+
+	/**
+	 * 검증표 <b>"비로그인 첫 조회 → 200, {@code viewCount} +1, 판정 행의 키가 {@code i:} + 소문자
+	 * hex 64자"</b> (sp-docs/plan/phase2-board.md B-21). 키의 모양은 sp-docs/requirements/board.md
+	 * §9.1 이다.
+	 */
+	@Test
+	@DisplayName("비로그인 첫 조회는 200 이고 viewCount 가 1 오르며 판정 키가 i: 와 소문자 hex 64자다")
+	void 비로그인_첫_조회는_세고_판정_키가_i_와_소문자_hex_다() throws Exception {
+		Post post = savedPost(1201L, "판정작성자", "비로그인 첫 조회", "본문");
+
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.viewCount").value(1));
+
+		assertThat(커밋된_조회수(post)).isEqualTo(1L);
+		List<String> 키 = 판정_키(post);
+		assertThat(키).hasSize(1);
+		assertThat(키.get(0)).matches("i:[0-9a-f]{64}");
+	}
+
+	/**
+	 * 검증표 <b>"비로그인 판정 키의 값 → {@code i:} 뒤가 테스트 비밀키로 계산한
+	 * {@code HMAC-SHA256(비밀키, remoteAddr)} 의 소문자 hex 와 같다"</b>.
+	 *
+	 * <p>기대값은 이 테스트가 JDK 로 직접 계산한다({@link #주소의_판정_키}). 키 없는 SHA-256 이나 설정
+	 * 밖의 키로 바꾸면 깨진다.
+	 */
+	@Test
+	@DisplayName("비로그인 판정 키는 설정의 비밀키로 계산한 접속 주소의 HMAC-SHA256 소문자 hex 다")
+	void 비로그인_판정_키는_설정의_비밀키로_계산한_주소의_HMAC_이다() throws Exception {
+		Post post = savedPost(1202L, "판정작성자", "판정 키의 값", "본문");
+
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()).with(remoteAddr("198.51.100.23")))
+				.andExpect(status().isOk());
+
+		assertThat(판정_키(post)).containsExactly(주소의_판정_키("198.51.100.23"));
+	}
+
+	/**
+	 * 검증표 <b>"같은 주소의 재조회 (24시간 안) → {@code viewCount} 불변, {@code viewed_at} 불변"</b>.
+	 *
+	 * <p>두 조회 사이에 기준 시각을 한 시간 앞으로 옮긴다. 같은 초 안의 두 조회라면 창을 미는 구현도
+	 * 기준 시각에 같은 값을 쓰므로 「불변」 이 관측되지 않는다 (sp-docs/requirements/board.md §9.2 —
+	 * 24시간 안의 조회는 창을 밀지 않는다).
+	 */
+	@Test
+	@DisplayName("같은 주소의 24시간 안 재조회는 viewCount 를 올리지 않고 기준 시각을 밀지 않는다")
+	void 같은_주소의_24시간_안_재조회는_세지_않고_기준_시각을_밀지_않는다() throws Exception {
+		Post post = savedPost(1203L, "판정작성자", "재조회", "본문");
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
+				.andExpect(status().isOk());
+		LocalDateTime 한_시간_전 = LocalDateTime.now().minusHours(1).truncatedTo(ChronoUnit.SECONDS);
+		기준_시각을_옮긴다(post, 한_시간_전);
+
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.viewCount").value(1));
+
+		assertThat(커밋된_조회수(post)).isEqualTo(1L);
+		assertThat(기준_시각들(post)).containsExactly(한_시간_전);
+	}
+
+	/**
+	 * 검증표 <b>"로그인 조회 → 키가 {@code a:{accountId}}"</b> (sp-docs/requirements/board.md §9.1).
+	 * 조회자는 작성자가 아니다 — 키가 토큰의 계정인지 글의 작성자인지가 갈린다.
+	 */
+	@Test
+	@DisplayName("로그인 조회의 판정 키는 a: 와 토큰의 계정 id 다")
+	void 로그인_조회의_판정_키는_계정이다() throws Exception {
+		Post post = savedPost(1204L, "판정작성자", "로그인 조회", "본문");
+
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(1205L)))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.viewCount").value(1));
+
+		assertThat(판정_키(post)).containsExactly("a:1205");
+	}
+
+	/**
+	 * 검증표 <b>"작성자가 자기 글을 처음 조회 → {@code viewCount} +1"</b> — 작성자의 조회도 센다
+	 * (sp-docs/requirements/board.md §9.2).
+	 */
+	@Test
+	@DisplayName("작성자가 자기 글을 처음 보면 viewCount 가 1 오른다")
+	void 작성자의_첫_조회도_센다() throws Exception {
+		Post post = savedPost(1206L, "판정작성자", "작성자 조회", "본문");
+
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(1206L)))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.viewCount").value(1));
+
+		assertThat(커밋된_조회수(post)).isEqualTo(1L);
+	}
+
+	/**
+	 * 검증표 <b>"같은 사람의 로그인 전·후 조회 → 두 조회자 — 각각 +1"</b>. 같은 주소에서 토큰 없이 한
+	 * 번, 토큰을 실어 한 번 본다 (sp-docs/requirements/board.md §9.2).
+	 */
+	@Test
+	@DisplayName("같은 주소에서 로그인 전과 후에 보면 두 조회자로 각각 센다")
+	void 로그인_전후는_두_조회자다() throws Exception {
+		Post post = savedPost(1207L, "판정작성자", "로그인 전후", "본문");
+
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()).with(remoteAddr("198.51.100.7")))
+				.andExpect(jsonPath("$.data.viewCount").value(1));
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()).with(remoteAddr("198.51.100.7"))
+						.header(HttpHeaders.AUTHORIZATION, bearer(1208L)))
+				.andExpect(jsonPath("$.data.viewCount").value(2));
+
+		assertThat(판정_키(post)).containsExactlyInAnyOrder(주소의_판정_키("198.51.100.7"), "a:1208");
+	}
+
+	/** 검증표 <b>"다른 {@code remoteAddr} → 다른 키"</b>. */
+	@Test
+	@DisplayName("접속 주소가 다른 비로그인 조회는 다른 판정 키라 각각 센다")
+	void 다른_주소는_다른_판정_키다() throws Exception {
+		Post post = savedPost(1209L, "판정작성자", "다른 주소", "본문");
+
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()).with(remoteAddr("198.51.100.31")))
+				.andExpect(jsonPath("$.data.viewCount").value(1));
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()).with(remoteAddr("198.51.100.32")))
+				.andExpect(jsonPath("$.data.viewCount").value(2));
+
+		assertThat(판정_키(post)).containsExactlyInAnyOrder(
+				주소의_판정_키("198.51.100.31"), 주소의_판정_키("198.51.100.32"));
+	}
+
+	/**
+	 * 검증표 <b>"같은 {@code remoteAddr} 에 {@code X-Forwarded-For} 만 다르게 → 같은 키"</b>. 그 헤더는
+	 * 클라이언트가 임의로 쓴다 (sp-docs/security.md §9). 키가 그 헤더의 값이 아니라 접속 주소의 HMAC
+	 * 인 것까지 본다.
+	 *
+	 * <p>{@code MockMvc} 는 Tomcat 을 띄우지 않는다 — {@code forward-headers-strategy} 가
+	 * {@code native} 일 때 컨테이너가 하는 주소 바꾸기는 여기서 보이지 않는다. 기동한 board 에서의 측정은
+	 * sp-docs/plan/phase2-board.md §4.1 이 통합에 제안했다.
+	 */
+	@Test
+	@DisplayName("접속 주소가 같고 X-Forwarded-For 만 다르면 같은 판정 키라 한 번만 센다")
+	void X_Forwarded_For_만_다르면_같은_판정_키다() throws Exception {
+		Post post = savedPost(1210L, "판정작성자", "전달 헤더", "본문");
+
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()).with(remoteAddr("198.51.100.41"))
+						.header("X-Forwarded-For", "203.0.113.51"))
+				.andExpect(jsonPath("$.data.viewCount").value(1));
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()).with(remoteAddr("198.51.100.41"))
+						.header("X-Forwarded-For", "203.0.113.52"))
+				.andExpect(jsonPath("$.data.viewCount").value(1));
+
+		assertThat(판정_키(post)).containsExactly(주소의_판정_키("198.51.100.41"));
+	}
+
+	/**
+	 * 검증표 <b>"판정 행의 {@code viewed_at} 을 24시간보다 이전으로 옮긴 뒤 조회 → +1,
+	 * {@code viewed_at} 이 새 시각"</b>. 새 시각은 요청 동안의 앱 시계다 — 판정은 초 아래를 자르므로
+	 * 요청 전의 시각도 초 단위로 잘라 비교한다.
+	 */
+	@Test
+	@DisplayName("기준 시각이 24시간을 넘긴 뒤의 조회는 세고 그 시각이 새 기준이 된다")
+	void 창이_지난_뒤의_조회는_세고_기준_시각이_새_시각이다() throws Exception {
+		Post post = savedPost(1211L, "판정작성자", "창이 지난 조회", "본문");
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
+				.andExpect(status().isOk());
+		기준_시각을_옮긴다(post, LocalDateTime.now().minusHours(24).minusMinutes(1));
+
+		LocalDateTime 요청_전 = LocalDateTime.now().truncatedTo(ChronoUnit.SECONDS);
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.viewCount").value(2));
+		LocalDateTime 요청_후 = LocalDateTime.now();
+
+		assertThat(커밋된_조회수(post)).isEqualTo(2L);
+		List<LocalDateTime> 기준_시각 = 기준_시각들(post);
+		assertThat(기준_시각).hasSize(1);
+		assertThat(기준_시각.get(0)).isBetween(요청_전, 요청_후);
+	}
+
+	/**
+	 * 검증표 <b>"판정 INSERT 가 UNIQUE 충돌 (끼워넣기를 강제한다) → 200 — 500 이 아니다, 집계
+	 * 불변"</b>.
+	 *
+	 * <p>존재 확인 자리에서 끼운다. 그 확인의 대역이 같은 키의 판정 행과 +1 을 다른 스레드에서 커밋한
+	 * 뒤 「없음」 을 돌려준다 — 확인이 그 커밋 앞에서 읽은 답이다. 그러면 이 요청의 INSERT 가 UNIQUE
+	 * 충돌이다 (sp-docs/requirements/board.md §9.3).
+	 *
+	 * <p>끼운 쪽의 +1 은 남고 이 요청은 더하지 않는다 — 집계는 1 이다. 응답도 1 이다 — 판정이 끝난 뒤에
+	 * 시작한 읽기가 끼운 쪽의 커밋을 본다.
+	 */
+	@Test
+	@DisplayName("판정 INSERT 가 UNIQUE 충돌이면 200 이고 그 요청은 집계를 바꾸지 않는다")
+	void 판정_INSERT_의_UNIQUE_충돌은_200_이고_세지_않는다() throws Exception {
+		Post post = savedPost(1212L, "판정작성자", "UNIQUE 충돌", "본문");
+		AtomicInteger 끼운_행 = new AtomicInteger(-1);
+		willAnswer(invocation -> {
+			Long postId = invocation.getArgument(0);
+			String viewerKey = invocation.getArgument(1);
+			끼운_행.set(다른_트랜잭션에서_같은_키로_센다(postId, viewerKey));
+			return false;
+		}).given(this.postViewRepository).existsByPostIdAndViewerKey(anyLong(), anyString());
+
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.viewCount").value(1));
+
+		assertThat(끼운_행.get()).as("끼운 판정 행이 먼저 커밋돼야 이 요청의 INSERT 가 충돌한다").isEqualTo(1);
+		assertThat(커밋된_조회수(post)).as("충돌한 요청은 세지 않는다").isEqualTo(1L);
+		assertThat(판정_키(post)).hasSize(1);
+	}
+
+	/**
+	 * 검증표 <b>"응답의 {@code viewCount} → 판정이 반영된 값 — 집계된 조회면 증가 뒤의 값"</b> 의 세지 않은
+	 * 쪽이다 — 24시간 안의 재조회는 집계하지 않고 지금의 값을 돌려준다 (sp-docs/api-contract.md §4.8).
+	 *
+	 * <p>재조회의 존재 확인 자리에서 다른 조회자의 +1 을 다른 스레드로 커밋시키고, 응답이 그 커밋을 싣는지
+	 * 본다. 요청 동안 열려 있는 영속성 컨텍스트에 판정 전에 읽은 글이 남아 있으면 응답이 그 사본의 값이
+	 * 된다 — 404 판정이 엔티티를 읽지 않는 이유다 ({@code PostReader#requireActive}). 집계된 조회에서는
+	 * {@code PostRepository#increaseViewCount} 의 비우기가 그 사본을 치우므로 이 결함은 세지 않은
+	 * 재조회에서 드러난다 — 404 판정이 엔티티를 읽는 변이에서 집계된 조회의 응답을 보는 테스트는
+	 * 녹색이었고 이 테스트가 빨갰다 (2026-11-16 B-21 실측).
+	 *
+	 * <p>응답의 읽기가 판정 커밋 뒤에 시작했는지는 이 테스트로 갈리지 않는다 — H2 의 테스트 연결은 커밋된
+	 * 읽기라(2026-11-16 B-21 실측) 판정 전에 시작한 트랜잭션도 그 커밋을 본다. 그 경계는
+	 * {@code ViewCountJudgeTest} 가 물리 트랜잭션의 순서로 본다.
+	 */
+	@Test
+	@DisplayName("세지 않은 재조회의 응답도 판정 사이에 커밋된 다른 조회의 증가를 싣는다")
+	void 세지_않은_재조회의_응답도_판정_뒤의_값이다() throws Exception {
+		Post post = savedPost(1213L, "판정작성자", "세지 않은 재조회", "본문");
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
+				.andExpect(jsonPath("$.data.viewCount").value(1));
+		AtomicInteger 끼운_증가 = new AtomicInteger(-1);
+		willAnswer(invocation -> {
+			끼운_증가.set(다른_트랜잭션에서_조회수를_올린다(post.getId()));
+			return true;
+		}).given(this.postViewRepository).existsByPostIdAndViewerKey(anyLong(), anyString());
+
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.viewCount").value(2));
+
+		assertThat(끼운_증가.get()).as("끼운 증가가 커밋돼야 이 측정이 일한다").isEqualTo(1);
+		assertThat(판정_키(post)).as("재조회는 판정 행을 더하지 않는다").hasSize(1);
+	}
+
+	/**
+	 * 검증표 <b>"없는·삭제된 글 → 404 {@code P001}, 판정 행 0"</b> 의 없는 글이다. 판정은 404 판정
+	 * 뒤다 (sp-docs/domain-model.md §4.5) — {@code post_view.post_id} 에 FK 가 없으므로 판정이 먼저면
+	 * 없는 글의 id 로 행이 생긴다. 자동 증가 id 는 음수가 되지 않으므로 음수 id 는 없는 글이다.
+	 */
+	@Test
+	@DisplayName("없는 글의 상세 조회는 404 P001 이고 판정 행을 만들지 않는다")
+	void 없는_글은_404_이고_판정_행이_없다() throws Exception {
+		long 없는_id = -1214L;
+		try {
+			this.mockMvc.perform(get(PATH + "/{id}", 없는_id))
+					.andExpect(status().isNotFound())
+					.andExpect(jsonPath("$.error.code").value("P001"));
+
+			assertThat(판정_행_수(없는_id)).isZero();
+		}
+		finally {
+			// 판정이 404 판정보다 먼저인 구현이면 남는다 — 다음 실행에 끌고 가지 않는다
+			this.jdbcTemplate.update("DELETE FROM post_view WHERE post_id = ?", 없는_id);
+		}
+	}
+
+	/** 검증표 <b>"없는·삭제된 글 → 404 {@code P001}, 판정 행 0"</b> 의 삭제된 글이다. */
+	@Test
+	@DisplayName("삭제된 글의 상세 조회는 404 P001 이고 판정 행을 만들지 않으며 조회수가 그대로다")
+	void 삭제된_글은_404_이고_판정_행이_없다() throws Exception {
+		Post post = savedPost(1215L, "판정작성자", "삭제된 글", "본문");
+		post.softDelete();
+		this.postRepository.saveAndFlush(post);
+
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
+				.andExpect(status().isNotFound())
+				.andExpect(jsonPath("$.error.code").value("P001"));
+
+		assertThat(판정_키(post)).isEmpty();
+		assertThat(커밋된_조회수(post)).isZero();
+	}
+
+	/**
+	 * 검증표 <b>"{@code liked} — 토큰 없음 / 누른 계정 / 누르지 않은 계정 → {@code null} /
+	 * {@code true} / {@code false}"</b> (sp-docs/api-contract.md §4.3 §4.8).
+	 *
+	 * <p><b>대각선을 피한다.</b> 대상 글에는 다른 계정의 좋아요가 있고, 누르지 않은 계정은 다른 글을
+	 * 눌렀다 — 확인이 글이나 계정 하나만 보면 누르지 않은 계정이 {@code true} 가 된다. {@code null}
+	 * 은 키가 있고 값이 없는 것으로 본다 — 키가 빠진 응답과 다르다 (§4.3).
+	 */
+	@Test
+	@DisplayName("상세의 liked 는 토큰이 없으면 null, 누른 계정이면 true, 누르지 않은 계정이면 false 다")
+	void 상세의_liked_는_요청한_계정의_좋아요다() throws Exception {
+		Post 대상 = savedPost(1216L, "판정작성자", "좋아요 대상", "본문");
+		Post 다른_글 = savedPost(1216L, "판정작성자", "다른 글", "본문");
+		누른_것으로_둔다(대상, 1217L);
+		누른_것으로_둔다(다른_글, 1218L);
+
+		MvcResult 토큰_없음 = this.mockMvc.perform(get(PATH + "/{id}", 대상.getId()))
+				.andExpect(status().isOk())
+				.andReturn();
+		Map<String, Object> data = JsonPath.read(bodyOf(토큰_없음), "$.data");
+		assertThat(data).as("토큰이 없으면 키가 있고 값이 null 이다").containsEntry("liked", null);
+
+		this.mockMvc.perform(get(PATH + "/{id}", 대상.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(1217L)))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.liked").value(true));
+		this.mockMvc.perform(get(PATH + "/{id}", 대상.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(1218L)))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.liked").value(false));
+	}
+
+	/**
+	 * 검증표 <b>"작성 응답의 {@code liked} / 수정 응답의 {@code liked} → {@code false} / 요청한 계정의
+	 * 실제 상태"</b> 의 작성 쪽이다 (sp-docs/api-contract.md §4.4).
+	 */
+	@Test
+	@DisplayName("작성 응답의 liked 는 false 다")
+	void 작성_응답의_liked_는_false_다() throws Exception {
+		respondWithActiveProfile(1219L);
+
+		this.mockMvc.perform(post(PATH)
+						.header(HttpHeaders.AUTHORIZATION, bearer(1219L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("좋아요 없는 새 글", "본문")))
+				.andExpect(status().isCreated())
+				.andExpect(jsonPath("$.data.liked").value(false));
+	}
+
+	/**
+	 * 검증표 <b>"작성 응답의 {@code liked} / 수정 응답의 {@code liked} → {@code false} / 요청한 계정의
+	 * 실제 상태"</b> 의 수정 쪽이다 (sp-docs/api-contract.md §4.4). 작성자가 자기 글 하나는 눌렀고 다른 하나는 다른 계정만 눌렀다 — 확인이 글이나 계정 하나만
+	 * 보면 둘째가 {@code true} 가 된다.
+	 */
+	@Test
+	@DisplayName("수정 응답의 liked 는 요청한 계정이 그 글을 눌렀는지다")
+	void 수정_응답의_liked_는_요청한_계정의_실제_상태다() throws Exception {
+		Post 누른_글 = savedPost(1220L, "판정작성자", "누른 글", "본문");
+		Post 남만_누른_글 = savedPost(1220L, "판정작성자", "남만 누른 글", "본문");
+		누른_것으로_둔다(누른_글, 1220L);
+		누른_것으로_둔다(남만_누른_글, 1221L);
+
+		this.mockMvc.perform(put(PATH + "/{id}", 누른_글.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(1220L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("고친 제목", "고친 본문")))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.liked").value(true));
+		this.mockMvc.perform(put(PATH + "/{id}", 남만_누른_글.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(1220L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("고친 제목", "고친 본문")))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.liked").value(false));
+	}
+
+	/**
+	 * 검증표 <b>"claim 이 계약 밖인 토큰으로 상세 조회 → 401 {@code A002}"</b>
+	 * (sp-docs/requirements/board.md §9.1). 서명이 유효해 필터 체인은 지나고 선택적 리졸버가 막는다 —
+	 * 익명으로 낮추지 않는다 (sp-docs/api-contract.md §4.8). 판정에 닿지 않으므로 행도 증가도 없다.
+	 */
+	@ParameterizedTest(name = "{0}")
+	@ValueSource(strings = {"role 이 열거 밖", "sub 누락"})
+	@DisplayName("claim 이 계약 밖인 토큰의 상세 조회는 401 A002 이고 판정하지 않는다")
+	void claim_이_계약_밖인_토큰은_401_A002_다(String 종류) throws Exception {
+		Post post = savedPost(1222L, "판정작성자", "claim 위반", "본문");
+		String token = "sub 누락".equals(종류)
+				? TestTokenFactory.tokenWithoutSubject(ROLE)
+				: TestTokenFactory.accessToken(1223L, "BOGUS");
+
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId())
+						.header(HttpHeaders.AUTHORIZATION, "Bearer " + token))
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("A002"));
+
+		assertThat(판정_키(post)).isEmpty();
+		assertThat(커밋된_조회수(post)).isZero();
+	}
+
+	/**
+	 * 검증표 <b>"판정 행 → {@code viewer_key} 에 주소 문자열이 들어 있지 않다"</b> — 원 IP 를 저장하지
+	 * 않는다 (sp-docs/security.md §9).
+	 */
+	@Test
+	@DisplayName("판정 행의 viewer_key 에 접속 주소 문자열이 들어 있지 않다")
+	void 판정_행에_주소_문자열이_없다() throws Exception {
+		Post post = savedPost(1224L, "판정작성자", "주소 비저장", "본문");
+
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()).with(remoteAddr("203.0.113.7")))
+				.andExpect(status().isOk());
+
+		assertThat(판정_키(post)).hasSize(1).noneMatch(key -> key.contains("203.0.113.7"));
 	}
 
 	// --- 목록·검색 (P-02, P-03, sp-docs/api-contract.md §4.1 §7.1) ---
@@ -1644,6 +2109,109 @@ class PostControllerTest {
 
 	private static String bodyOf(MvcResult result) throws Exception {
 		return result.getResponse().getContentAsString(StandardCharsets.UTF_8);
+	}
+
+	/** 접속 주소를 정한다. {@code MockMvc} 의 기본값은 {@code 127.0.0.1} 이다. */
+	private static RequestPostProcessor remoteAddr(String address) {
+		return request -> {
+			request.setRemoteAddr(address);
+			return request;
+		};
+	}
+
+	/**
+	 * 이 주소의 비로그인 판정 키 — {@code i:} + {@code HMAC-SHA256(비밀키, 주소)} 의 소문자 hex
+	 * (sp-docs/requirements/board.md §9.1). 비밀키는 컨텍스트의 설정값 문자열의 UTF-8 바이트다
+	 * (sp-docs/tech-stack.md §4.5). {@code application-test.yml} 의 리터럴을 옮겨 적지 않는다 — 환경변수
+	 * {@code VIEW_COUNT_HMAC_SECRET} 이 그 값을 덮는 실행에서도 서버와 같은 값을 쓴다.
+	 */
+	private String 주소의_판정_키(String address) throws GeneralSecurityException {
+		byte[] secret = this.environment.getRequiredProperty("view-count.hmac-secret")
+				.getBytes(StandardCharsets.UTF_8);
+		Mac mac = Mac.getInstance("HmacSHA256");
+		mac.init(new SecretKeySpec(secret, "HmacSHA256"));
+		return "i:" + HexFormat.of().formatHex(mac.doFinal(address.getBytes(StandardCharsets.UTF_8)));
+	}
+
+	private List<String> 판정_키(Post post) {
+		return this.jdbcTemplate.queryForList(
+				"SELECT viewer_key FROM post_view WHERE post_id = ?", String.class, post.getId());
+	}
+
+	private List<LocalDateTime> 기준_시각들(Post post) {
+		return this.jdbcTemplate.queryForList(
+				"SELECT viewed_at FROM post_view WHERE post_id = ?", LocalDateTime.class, post.getId());
+	}
+
+	private int 판정_행_수(long postId) {
+		Integer count = this.jdbcTemplate.queryForObject(
+				"SELECT COUNT(*) FROM post_view WHERE post_id = ?", Integer.class, postId);
+		return count == null ? 0 : count;
+	}
+
+	/** 판정 행의 기준 시각을 옮긴다 — 시간이 흐른 것을 흉내 낸다. 영향 행이 1 이 아니면 그 자리에서 터진다. */
+	private void 기준_시각을_옮긴다(Post post, LocalDateTime viewedAt) {
+		int updated = this.jdbcTemplate.update(
+				"UPDATE post_view SET viewed_at = ? WHERE post_id = ?", viewedAt, post.getId());
+		if (updated != 1) {
+			throw new IllegalStateException("판정 행이 1 행이 아니다: " + updated);
+		}
+	}
+
+	private long 커밋된_조회수(Post post) {
+		Long count = this.jdbcTemplate.queryForObject(
+				"SELECT view_count FROM post WHERE id = ?", Long.class, post.getId());
+		return count == null ? 0 : count;
+	}
+
+	/**
+	 * 좋아요의 근거 행만 둔다 — {@code liked} 는 그 행이 있는지다 (sp-docs/domain-model.md §6.1).
+	 * 영향 행이 1 이 아니면 그 자리에서 터진다.
+	 */
+	private void 누른_것으로_둔다(Post post, long accountId) {
+		int inserted = this.jdbcTemplate.update(
+				"INSERT INTO post_like (post_id, account_id, created_at) VALUES (?, ?, ?)",
+				post.getId(), accountId, LocalDateTime.now().truncatedTo(ChronoUnit.SECONDS));
+		if (inserted != 1) {
+			throw new IllegalStateException("좋아요 픽스처가 1 행이 아니다: " + inserted);
+		}
+	}
+
+	/**
+	 * 같은 키의 판정 행과 +1 을 다른 스레드에서 커밋한다 — 같은 키의 동시 첫 조회가 먼저 끝난 모양이다.
+	 * 판정 행의 영향 행 수를 돌려준다.
+	 */
+	private int 다른_트랜잭션에서_같은_키로_센다(Long postId, String viewerKey) {
+		return 다른_스레드에서(() -> {
+			int inserted = this.jdbcTemplate.update(
+					"INSERT INTO post_view (post_id, viewer_key, viewed_at) VALUES (?, ?, ?)",
+					postId, viewerKey, LocalDateTime.now().truncatedTo(ChronoUnit.SECONDS));
+			this.jdbcTemplate.update("UPDATE post SET view_count = view_count + 1 WHERE id = ?", postId);
+			return inserted;
+		});
+	}
+
+	/** 다른 조회자의 +1 을 다른 스레드에서 커밋한다. 영향 행 수를 돌려준다. */
+	private int 다른_트랜잭션에서_조회수를_올린다(Long postId) {
+		return 다른_스레드에서(() -> this.jdbcTemplate.update(
+				"UPDATE post SET view_count = view_count + 1 WHERE id = ?", postId));
+	}
+
+	/**
+	 * 쓰기를 <b>다른 스레드에서</b> 커밋까지 돌린다. 부르는 스레드에는 판정 트랜잭션이 묶여 있어 같은
+	 * 스레드의 {@code JdbcTemplate} 은 그 트랜잭션에 참여한다 — 따로 커밋되지 않는다.
+	 */
+	private static int 다른_스레드에서(Callable<Integer> 쓰기) {
+		ExecutorService 다른_스레드 = Executors.newSingleThreadExecutor();
+		try {
+			return 다른_스레드.submit(쓰기).get(10, TimeUnit.SECONDS);
+		}
+		catch (InterruptedException | ExecutionException | TimeoutException ex) {
+			throw new IllegalStateException("끼운 쓰기가 커밋되지 않았다 — 이 측정은 끼워넣기를 볼 수 없다", ex);
+		}
+		finally {
+			다른_스레드.shutdownNow();
+		}
 	}
 
 	// --- member 스텁 서버 (sp-docs/api-contract.md §5 의 봉투) ---

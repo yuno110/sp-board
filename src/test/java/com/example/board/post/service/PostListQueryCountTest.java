@@ -8,16 +8,21 @@ import com.example.board.post.dto.PostSearchCondition;
 import com.example.board.post.dto.SearchType;
 import com.example.board.post.entity.Post;
 import com.example.board.post.repository.PostRepository;
-import jakarta.persistence.EntityManagerFactory;
-import org.hibernate.SessionFactory;
-import org.hibernate.stat.Statistics;
+import java.util.concurrent.atomic.AtomicLong;
+import org.hibernate.cfg.AvailableSettings;
+import org.hibernate.resource.jdbc.spi.StatementInspector;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.autoconfigure.orm.jpa.HibernatePropertiesCustomizer;
 import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.context.TestConfiguration;
+import org.springframework.context.annotation.Bean;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.lang.Nullable;
 import org.springframework.test.context.ActiveProfiles;
+import org.springframework.test.context.ContextConfiguration;
 
 /**
  * 목록 조회에 N+1 이 없다는 것의 <b>관측 수단</b>이다
@@ -30,15 +35,21 @@ import org.springframework.test.context.ActiveProfiles;
  * <b>같은 조건에서 행 수만 바꾼 두 측정이 같은지</b> 본다 — N+1 이 생기면 집계가 행 수에
  * 비례해 갈라진다.
  *
- * <h2>수단은 Hibernate 통계다</h2>
+ * <h2>수단은 테스트 스레드의 {@code StatementInspector} 다</h2>
  *
- * <p>{@code hibernate.generate_statistics} 를 <b>테스트 프로파일에만</b> 켜고
- * ({@code src/test/resources/application-test.yml}) {@code getPrepareStatementCount()} 를
- * 읽는다. 측정 직전에 {@link Statistics#clear()} 로 비우므로 픽스처 저장이 섞이지 않는다.
+ * <p>{@link StatementCounter} 를 Hibernate 에 꽂고, 측정하는 조회를 부른 스레드가 그 조회 동안 낸
+ * 문장만 센다. 세는 구간이 조회 한 번이므로 픽스처 저장이 섞이지 않는다.
+ *
+ * <p><b>Hibernate 통계를 쓰지 않는다.</b> 통계는 세션 팩토리 전체의 집계라 다른 스레드의 문장도
+ * 센다 — 판정 행의 정리 작업({@code PostViewCleanup}, B-21)이 스케줄러 스레드에서 낸
+ * {@code delete from post_view} 가 한 측정의 구간에 들어오면 그 측정의 집계가 늘어 두 집계가
+ * 갈라진다. 정리를 5ms 주기로 돌린 프로브에서 두 테스트가 그렇게 빨갰다 (2026-11-17 B-21 리뷰·수정
+ * 실측 — 통계로 세던 판).
  *
  * <p><b>이 수단이 실제로 N+1 을 잡는다</b>(실측). 서비스의 매핑에서 행마다
  * {@code postRepository.findByIdAndDeletedFalse} 를 부르는 변이를 넣으니 두 집계가
- * <b>5 와 32</b> 로 갈라졌다 — 올바른 구현에서는 둘 다 <b>2</b> 였다. 변이는 되돌렸다.
+ * <b>5 와 32</b> 로 갈라졌다 — 올바른 구현에서는 둘 다 <b>2</b> 였다. 이 수단으로 2026-11-17 B-21 에
+ * 다시 잰 값이고 통계로 세던 판의 실측과 같다. 변이는 되돌렸다.
  *
  * <h2>두 목록을 따로 재는 이유 — 변환 지점이 공유가 아니다</h2>
  *
@@ -47,10 +58,11 @@ import org.springframework.test.context.ActiveProfiles;
  *
  * <p><b>변환 지점은 공유가 아니다.</b> {@code PostService.getList} 와
  * {@code PostService.getMyPosts} 가 {@code .map(PostResponse::from)} <b>호출 자리를 각자</b>
- * 갖는다. 실측: 행당 파생 쿼리를 {@code getMyPosts} 쪽 매핑에 넣으면 아래 첫 테스트가
- * 갈라지지만 <b>두 번째는 통과하고</b>, {@code getList} 쪽 매핑에 넣으면 그 반대다. 한
- * 경로만 재면 <b>다른 경로의 매핑에 들어온 N+1 이 덮이지 않는다</b> — 그래서 두 측정은
- * 복제가 아니라 서로 다른 결함을 본다 (sp-docs/AGENTS.md 불변식 11).
+ * 갖는다. 실측: 행당 파생 쿼리를 {@code getMyPosts} 쪽 매핑에 넣으면 내가 쓴 글 목록의 측정이
+ * 갈라지지만 <b>검색 목록의 측정은 통과하고</b>, {@code getList} 쪽 매핑에 넣으면 그 반대다 (이
+ * 수단으로 2026-11-17 B-21 에 다시 쟀다). 한 경로만 재면 <b>다른 경로의 매핑에 들어온 N+1 이
+ * 덮이지 않는다</b> — 그래서 두 측정은 복제가 아니라 서로 다른 결함을 본다 (sp-docs/AGENTS.md
+ * 불변식 11).
  *
  * <p>덮이지 않는 것이 하나 남는다. {@code PostResponse.from} <b>자체</b>에 생긴 N+1 은 두
  * 측정이 함께 잡으므로 어느 쪽이 깨졌는지 가리지 못한다 — 그것은 이 측정의 몫이 아니다.
@@ -68,6 +80,7 @@ import org.springframework.test.context.ActiveProfiles;
  */
 @SpringBootTest
 @ActiveProfiles("test")
+@ContextConfiguration(classes = PostListQueryCountTest.StatementCounterConfig.class)
 class PostListQueryCountTest {
 
 	private static final long FEW_ROWS_WRITER = 881L;
@@ -104,7 +117,7 @@ class PostListQueryCountTest {
 	private JdbcTemplate jdbcTemplate;
 
 	@Autowired
-	private EntityManagerFactory entityManagerFactory;
+	private StatementCounter 문장_수;
 
 	@AfterEach
 	void 픽스처_정리() {
@@ -148,7 +161,7 @@ class PostListQueryCountTest {
 	 * <li>돌아온 행 수가 <b>3 과 30 이라는 것</b> — 행 수가 실제로 달라지지 않았으면 집계가
 	 * 같은 것은 아무 의미가 없다. 기대값은 상수가 아니라 리터럴이므로 픽스처 상수를 바꾸면
 	 * 여기서 깨진다
-	 * <li>집계가 <b>0 이 아니라는 것</b> — {@code generate_statistics} 가 꺼지면 두 집계가
+	 * <li>집계가 <b>0 이 아니라는 것</b> — 수집기가 Hibernate 에 꽂히지 않으면 두 집계가
 	 * 모두 0 이 되어 마지막 단언이 조용히 통과한다. 수단 자체가 살아 있는지를 이것이 본다
 	 * (sp-docs/process/review-policy.md §4.1 의 "실패할 수 없는 단언")
 	 * <li>두 집계가 <b>같다는 것</b> — N+1 이 없다는 것이다
@@ -160,7 +173,7 @@ class PostListQueryCountTest {
 				.isEqualTo(3);
 		assertThat(many.rows()).isEqualTo(30);
 		assertThat(few.statements())
-				.as("통계가 꺼져 있으면 두 집계가 모두 0 이고 아래 단언이 무의미해진다")
+				.as("수집기가 꽂히지 않았으면 두 집계가 모두 0 이고 두 집계가 같다는 단언이 무의미해진다")
 				.isPositive();
 		assertThat(many.statements())
 				.as("행 수가 열 배인데 statement 가 늘면 N+1 이다 "
@@ -171,16 +184,20 @@ class PostListQueryCountTest {
 	/**
 	 * 한 번의 목록 조회가 발행한 statement 수와 돌아온 행 수.
 	 *
-	 * <p>{@code clear()} 를 조회 <b>직전</b>에 한다 — 픽스처 저장의 INSERT 가 섞이면 집계가
-	 * 행 수에 비례하게 되어 올바른 구현에서도 갈라진다.
+	 * <p>세는 구간은 조회 <b>한 번</b>이다 — 픽스처 저장의 INSERT 가 섞이면 집계가 행 수에
+	 * 비례하게 되어 올바른 구현에서도 갈라진다.
 	 */
 	private Measurement measure(ListQuery query) {
-		Statistics statistics = this.entityManagerFactory.unwrap(SessionFactory.class).getStatistics();
-		statistics.clear();
+		this.문장_수.시작한다();
+		PageResponse<PostResponse> response;
+		try {
+			response = query.fetch();
+		}
+		finally {
+			this.문장_수.멈춘다();
+		}
 
-		PageResponse<PostResponse> response = query.fetch();
-
-		return new Measurement(response.content().size(), statistics.getPrepareStatementCount());
+		return new Measurement(response.content().size(), this.문장_수.센_수());
 	}
 
 	/** {@code nickname} 이 {@code null} 이면 검색 조건이 없는 조건이다 (내가 쓴 글 목록용). */
@@ -211,6 +228,63 @@ class PostListQueryCountTest {
 	}
 
 	private record Measurement(int rows, long statements) {
+	}
+
+	/**
+	 * 세기 시작한 스레드가 낸 SQL 의 수를 센다. Hibernate 의 {@code StatementInspector} 라 문장이
+	 * JDBC 로 넘어가기 전에 불린다.
+	 *
+	 * <p><b>세기 시작한 스레드의 문장만 센다.</b> 측정하는 조회는 그 스레드에서 돌고, 판정 행의 정리
+	 * 작업({@code PostViewCleanup})의 문장은 스케줄러 스레드에서 난다.
+	 */
+	static class StatementCounter implements StatementInspector {
+
+		private final AtomicLong 수 = new AtomicLong();
+
+		@Nullable
+		private volatile Thread 셀_스레드;
+
+		@Override
+		public String inspect(String sql) {
+			if (Thread.currentThread() == this.셀_스레드) {
+				this.수.incrementAndGet();
+			}
+			return sql;
+		}
+
+		/** 부르는 스레드의 문장을 0 부터 세기 시작한다. */
+		void 시작한다() {
+			this.수.set(0);
+			this.셀_스레드 = Thread.currentThread();
+		}
+
+		void 멈춘다() {
+			this.셀_스레드 = null;
+		}
+
+		long 센_수() {
+			return this.수.get();
+		}
+
+	}
+
+	/**
+	 * {@link StatementCounter} 를 Hibernate 에 꽂는다. {@code @TestConfiguration} 이므로
+	 * {@code @SpringBootConfiguration} 탐색을 막지 않고 덧붙는다.
+	 */
+	@TestConfiguration
+	static class StatementCounterConfig {
+
+		@Bean
+		StatementCounter statementCounter() {
+			return new StatementCounter();
+		}
+
+		@Bean
+		HibernatePropertiesCustomizer statementCounterRegistration(StatementCounter counter) {
+			return properties -> properties.put(AvailableSettings.STATEMENT_INSPECTOR, counter);
+		}
+
 	}
 
 }

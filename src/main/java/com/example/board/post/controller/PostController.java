@@ -4,6 +4,7 @@ import com.example.board.global.common.ApiResponse;
 import com.example.board.global.common.PageResponse;
 import com.example.board.global.security.CurrentMember;
 import com.example.board.global.security.LoginMember;
+import com.example.board.global.security.OptionalCurrentMember;
 import com.example.board.post.dto.PostCreateRequest;
 import com.example.board.post.dto.PostDetailResponse;
 import com.example.board.post.dto.PostResponse;
@@ -13,6 +14,7 @@ import com.example.board.post.dto.PostUpdateRequest;
 import com.example.board.post.dto.SearchType;
 import com.example.board.post.entity.PostCategory;
 import com.example.board.post.service.PostService;
+import jakarta.servlet.http.HttpServletRequest;
 import jakarta.validation.Valid;
 import jakarta.validation.constraints.Min;
 import lombok.RequiredArgsConstructor;
@@ -144,14 +146,25 @@ public class PostController {
 	}
 
 	/**
-	 * 게시글 상세 조회. <b>비로그인 허용이고</b> 조회수가 1 증가한다
-	 * (sp-docs/requirements/board.md §1 P-04 P-05).
+	 * 게시글 상세 조회. <b>인증은 선택이고</b> 조회수는 판정을 거쳐 센다
+	 * (sp-docs/requirements/board.md §1 P-04 P-05 §9, sp-docs/api-contract.md §4.8).
 	 *
-	 * <p>{@code @CurrentMember} 를 받지 않는다 — 무토큰 요청에서 해석할 Claim 이 없다.
+	 * <p>{@code @OptionalCurrentMember} 로 받는다 — 토큰이 없으면 {@code null} 이고, 실린 토큰의
+	 * claim 이 계약 밖이면 그 리졸버가 401 {@code A002} 로 막는다. 익명으로 낮추지 않는다
+	 * (sp-docs/requirements/board.md §9.1).
+	 *
+	 * <p><b>주소는 {@code getRemoteAddr()} 만 쓴다</b> (sp-docs/security.md §9). 이 핸들러는
+	 * {@code X-Forwarded-For} 같은 헤더를 읽지 않는다 — 클라이언트가 임의로 쓰는 헤더다. 그 헤더로
+	 * {@code remoteAddr} 가 바뀌지 않게 하는 것은 {@code server.forward-headers-strategy: none} 이다
+	 * (sp-docs/tech-stack.md §4.5).
 	 */
 	@GetMapping("/{id}")
-	public ApiResponse<PostDetailResponse> getDetail(@PathVariable Long id) {
-		return ApiResponse.success(this.postService.getDetail(id));
+	public ApiResponse<PostDetailResponse> getDetail(
+			@PathVariable Long id,
+			@OptionalCurrentMember LoginMember loginMember,
+			HttpServletRequest request) {
+
+		return ApiResponse.success(this.postService.getDetail(id, loginMember, request.getRemoteAddr()));
 	}
 
 	/**
