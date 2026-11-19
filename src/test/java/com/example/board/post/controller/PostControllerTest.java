@@ -38,6 +38,7 @@ import java.util.HexFormat;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
@@ -135,14 +136,14 @@ class PostControllerTest {
 	 * 상세 응답의 키 집합. <b>리터럴로 적는다</b> — DTO 의 필드에서 뽑아 오면 필드가 늘거나 줄 때
 	 * 기대값이 함께 움직여 단언이 아무것도 보지 못한다.
 	 *
-	 * <p><b>sp-docs/api-contract.md §4.3 의 상세 줄 전체가 아니다.</b> 목록 항목의 키에
-	 * {@code content}·{@code liked} 를 더한 것이고, 그 줄의 {@code attachments} 는 B-21
-	 * (2026-11-16) 시점에 싣지 않았다 — 계획이 그것을 B-24 에 배정했다
-	 * (sp-docs/plan/phase2-board.md 의 B-24).
+	 * <p><b>sp-docs/api-contract.md §4.3 의 상세 줄 그대로다</b> — 목록 항목의 키(아래
+	 * {@code LIST_ITEM_KEYS})에 {@code content}·{@code liked}·{@code attachments} 를 더한 것이다. B-19 가
+	 * {@code category}·{@code likeCount} 를, B-21 이 {@code liked} 를, B-24 가 {@code attachments} 를
+	 * 더했다. 작성·수정·상세가 이 하나를 쓴다 (§4.4 — 쓰기 응답이 세 번째 모양을 만들지 않는다).
 	 */
 	private static final Set<String> DETAIL_KEYS = Set.of(
 			"id", "title", "category", "content", "writerId", "writerNickname",
-			"viewCount", "commentCount", "likeCount", "liked", "createdAt");
+			"viewCount", "commentCount", "likeCount", "liked", "attachments", "createdAt");
 
 	/**
 	 * <b>목록 항목</b>의 키 집합. sp-docs/api-contract.md §4.3 의 <b>목록 줄 그대로다</b>
@@ -224,6 +225,9 @@ class PostControllerTest {
 		// post_like.post_id 에 FK 가 있으므로 (fk_post_like_post_id) 좋아요를 먼저 지운다
 		this.jdbcTemplate.update("DELETE FROM post_like WHERE post_id IN "
 				+ "(SELECT id FROM post WHERE writer_id BETWEEN 1201 AND 1249)");
+		// attachment.post_id 에 FK 가 있으므로 (fk_attachment_post_id) 첨부를 먼저 지운다 (B-24)
+		this.jdbcTemplate.update("DELETE FROM attachment WHERE post_id IN "
+				+ "(SELECT id FROM post WHERE writer_id BETWEEN 1201 AND 1249)");
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 1201 AND 1249");
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 521 AND 539");
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 621 AND 639");
@@ -250,6 +254,9 @@ class PostControllerTest {
 				.andExpect(jsonPath("$.data.writerNickname").value(MEMBER_NICKNAME))
 				.andExpect(jsonPath("$.data.viewCount").value(0))
 				.andExpect(jsonPath("$.data.commentCount").value(0))
+				// 첨부는 글을 만든 뒤 올린다 — 작성 응답은 빈 배열이고 키는 있다 (sp-docs/api-contract.md §4.4)
+				.andExpect(jsonPath("$.data.attachments").isArray())
+				.andExpect(jsonPath("$.data.attachments", hasSize(0)))
 				.andReturn();
 
 		assertThat(dataKeys(result))
@@ -465,7 +472,7 @@ class PostControllerTest {
 	 * sp-docs/domain-model.md §1.1).
 	 */
 	@Test
-	@DisplayName("상세 응답 키는 목록 항목의 키에 content·liked 를 더한 것이고 deleted·updatedAt 이 없다")
+	@DisplayName("상세 응답 키는 목록 항목의 키에 content·liked·attachments 를 더한 것이고 deleted·updatedAt 이 없다")
 	void 상세_응답_키_집합() throws Exception {
 		Post post = savedPost(523L, "키집합작성자", "키 집합", "본문");
 
@@ -1950,6 +1957,100 @@ class PostControllerTest {
 				.andReturn();
 
 		assertThat(itemTitles(result)).containsExactly("내 자유 글");
+	}
+
+	// --- 첨부 목록 (B-24, sp-docs/api-contract.md §4.3 §4.7 §9.6) ---
+
+	/** sp-docs/api-contract.md §4.7 의 첨부 하나의 모양. 리터럴이다. */
+	private static final Set<String> ATTACHMENT_KEYS =
+			Set.of("id", "originalFilename", "contentType", "size", "createdAt");
+
+	/**
+	 * sp-docs/plan/phase2-board.md B-24 검증표 <b>「상세의 {@code attachments} → 활성만, {@code id}
+	 * 오름차순, 원소의 키가 §4.7 의 모양」</b>. 지운 첨부를 가운데 둔다. 정렬을 뺀 변이는 H2 의 결과로는
+	 * 보이지 않아 {@code PostServiceTest} 가 문장으로 본다.
+	 */
+	@Test
+	@DisplayName("상세의 attachments 는 활성 첨부만 id 오름차순으로 싣고 원소가 §4.7 의 모양이다")
+	void 상세의_attachments_는_활성만_올린_순서다() throws Exception {
+		Post post = savedPost(1225L, "첨부작성자", "첨부 상세", "본문");
+		long 첫째 = 첨부_행을_둔다(post, "first.png", false);
+		첨부_행을_둔다(post, "deleted.png", true);
+		long 셋째 = 첨부_행을_둔다(post, "third.png", false);
+
+		MvcResult result = this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.attachments", hasSize(2)))
+				.andExpect(jsonPath("$.data.attachments[0].originalFilename").value("first.png"))
+				.andExpect(jsonPath("$.data.attachments[0].contentType").value("image/png"))
+				.andExpect(jsonPath("$.data.attachments[0].size").value(7))
+				.andExpect(jsonPath("$.data.attachments[1].originalFilename").value("third.png"))
+				.andReturn();
+
+		assertThat(attachmentIds(result)).containsExactly(첫째, 셋째);
+		assertThat(attachmentKeys(result)).allSatisfy(keys -> assertThat(keys).isEqualTo(ATTACHMENT_KEYS));
+		assertThat(dataKeys(result)).isEqualTo(DETAIL_KEYS);
+	}
+
+	/** 첨부가 없는 글의 상세는 빈 배열이고 키는 빠지지 않는다 (sp-docs/api-contract.md §4.3 의 표). */
+	@Test
+	@DisplayName("첨부가 없는 글의 상세 attachments 는 빈 배열이다")
+	void 첨부가_없으면_빈_배열() throws Exception {
+		Post post = savedPost(1226L, "첨부작성자", "첨부 없음", "본문");
+
+		this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
+				.andExpect(status().isOk())
+				.andExpect(jsonPath("$.data.attachments").isArray())
+				.andExpect(jsonPath("$.data.attachments", hasSize(0)));
+	}
+
+	/**
+	 * B-24 검증표 <b>「수정 응답의 {@code attachments} → 상세와 같다 — 활성만, {@code id} 오름차순」</b>.
+	 * 같은 글의 상세 응답과 배열 전체를 비교한다.
+	 */
+	@Test
+	@DisplayName("수정 응답의 attachments 는 상세와 같다 — 활성만, id 오름차순")
+	void 수정_응답의_attachments_는_상세와_같다() throws Exception {
+		Post post = savedPost(1227L, "첨부작성자", "첨부 수정", "본문");
+		long 첫째 = 첨부_행을_둔다(post, "first.png", false);
+		첨부_행을_둔다(post, "deleted.png", true);
+		long 셋째 = 첨부_행을_둔다(post, "third.png", false);
+
+		MvcResult 수정 = this.mockMvc.perform(put(PATH + "/" + post.getId())
+						.header(HttpHeaders.AUTHORIZATION, bearer(1227L))
+						.contentType(MediaType.APPLICATION_JSON)
+						.content(body("바뀐 제목", "바뀐 본문")))
+				.andExpect(status().isOk())
+				.andReturn();
+		MvcResult 상세 = this.mockMvc.perform(get(PATH + "/{id}", post.getId()))
+				.andExpect(status().isOk())
+				.andReturn();
+
+		assertThat(attachmentIds(수정)).containsExactly(첫째, 셋째);
+		List<Object> 수정_첨부 = JsonPath.read(bodyOf(수정), "$.data.attachments");
+		List<Object> 상세_첨부 = JsonPath.read(bodyOf(상세), "$.data.attachments");
+		assertThat(수정_첨부).isEqualTo(상세_첨부);
+	}
+
+	/** 첨부 행 하나를 첨부 API 를 거치지 않고 둔다. 파일은 두지 않는다 — 상세·수정은 파일을 열지 않는다. */
+	private long 첨부_행을_둔다(Post post, String originalFilename, boolean deleted) {
+		String storageKey = UUID.randomUUID().toString();
+		this.jdbcTemplate.update("INSERT INTO attachment (post_id, storage_key, original_filename, "
+						+ "content_type, size, deleted, created_at, updated_at) "
+						+ "VALUES (?, ?, ?, 'image/png', 7, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+				post.getId(), storageKey, originalFilename, deleted);
+		return this.jdbcTemplate.queryForObject(
+				"SELECT id FROM attachment WHERE storage_key = ?", Long.class, storageKey);
+	}
+
+	private static List<Long> attachmentIds(MvcResult result) throws Exception {
+		List<Number> ids = JsonPath.read(bodyOf(result), "$.data.attachments[*].id");
+		return ids.stream().map(Number::longValue).toList();
+	}
+
+	private static List<Set<String>> attachmentKeys(MvcResult result) throws Exception {
+		List<Map<String, Object>> items = JsonPath.read(bodyOf(result), "$.data.attachments");
+		return items.stream().map(Map::keySet).toList();
 	}
 
 	// --- 헬퍼 ---

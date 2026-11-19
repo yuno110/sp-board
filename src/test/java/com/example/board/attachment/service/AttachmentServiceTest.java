@@ -6,7 +6,12 @@ import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.BDDMockito.then;
 import static org.mockito.BDDMockito.willAnswer;
 import static org.mockito.BDDMockito.willThrow;
+import static org.mockito.Mockito.never;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.example.board.attachment.dto.AttachmentResponse;
 import com.example.board.attachment.repository.AttachmentRepository;
 import com.example.board.attachment.storage.AttachmentStorage;
@@ -19,7 +24,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Locale;
+import java.util.Set;
 import java.util.UUID;
+import java.util.concurrent.BrokenBarrierException;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutionException;
@@ -28,13 +38,16 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
+import org.hibernate.resource.jdbc.spi.StatementInspector;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.dao.DataIntegrityViolationException;
@@ -47,7 +60,8 @@ import org.springframework.test.context.bean.override.mockito.MockitoSpyBean;
 
 /**
  * sp-docs/plan/phase2-board.md B-23 검증 표 중 HTTP 로 만들 수 없는 경로다 — 동시 올리기, INSERT 가
- * 실패하는 경로, 판정과 조건부 UPDATE 사이에 지워진 글. 상태 코드·응답·판정 순서는
+ * 실패하는 경로, 판정과 조건부 UPDATE 사이에 지워진 글. B-24 검증 표의 같은 첨부의 동시 지우기도
+ * 여기다. 상태 코드·응답·판정 순서는
  * {@link com.example.board.attachment.controller.AttachmentControllerTest} 가 본다.
  *
  * <p>정본은 sp-docs/domain-model.md §6.2 (흐름·상한의 원자적 판정·실패하면 쓴 파일을 지운다),
@@ -88,6 +102,9 @@ class AttachmentServiceTest {
 	@DynamicPropertySource
 	static void storageRoot(DynamicPropertyRegistry registry) {
 		registry.add("attachment.storage-root", () -> storageRoot.toString());
+		// Hibernate 가 이 이름으로 인스턴스를 만든다 — 훅은 정적 필드라 테스트가 건다
+		registry.add("spring.jpa.properties.hibernate.session_factory.statement_inspector",
+				PostUpdateBarrier.class::getName);
 	}
 
 	@Autowired
@@ -114,6 +131,7 @@ class AttachmentServiceTest {
 
 	@AfterEach
 	void 픽스처_정리() {
+		PostUpdateBarrier.푼다();
 		this.jdbcTemplate.update("DELETE FROM attachment WHERE post_id IN "
 				+ "(SELECT id FROM post WHERE writer_id BETWEEN 1401 AND 1449)");
 		this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 1401 AND 1449");
@@ -216,7 +234,203 @@ class AttachmentServiceTest {
 		assertThat(활성_첨부_수(post)).isZero();
 	}
 
+	/**
+	 * B-24 검증 표 <b>「같은 첨부의 동시 지우기 N건 — 판정 읽기가 어느 쓰기보다 먼저 일어나게 강제한다 →
+	 * 성공 1, 나머지 404 {@code AT001}, {@code attachment_count} 가 1 만 준다」</b>
+	 * (sp-docs/domain-model.md §6.2 — 첨부의 조건부 전환이 최종 판정이다).
+	 *
+	 * <p><b>끼워넣기를 강제한다.</b> 스레드는 출발선에서 함께 출발하고, 판정 읽기를 지나 첫 쓰기
+	 * ({@code update post …}, 집계 감소)가 발행되기 직전에 집결지를 기다린다 — 모든 요청이 그 첨부를
+	 * 활성으로 읽은 뒤에야 첫 쓰기가 실행된다. 그래서 전환에 {@code deleted = false} 조건이 없거나 영향 행
+	 * 수를 보지 않는 변이는 모든 요청을 성공시켜 집계를 여러 번 줄인다.
+	 *
+	 * <p>집계를 활성 첨부 수(3)로 둔다 — 0 에 닿지 않으므로 「1 만 준다」 가 감소의 0 행 가드에 가려지지
+	 * 않는다. 파일은 어느 경우에도 지우지 않는다 (sp-docs/requirements/board.md §11).
+	 */
+	@Test
+	@DisplayName("같은 첨부를 동시에 지우면 하나만 204 이고 나머지는 AT001, 집계는 한 번만 준다")
+	void 동시_지우기는_집계를_한_번만_줄인다() throws Exception {
+		Post post = 게시글을_만든다(1404L);
+		파일과_첨부를_둔다(post, 3);
+		long 대상 = this.jdbcTemplate.queryForObject(
+				"SELECT MIN(id) FROM attachment WHERE post_id = ?", Long.class, post.getId());
+		CyclicBarrier 집결지 = new CyclicBarrier(동시_요청);
+		PostUpdateBarrier.건다(() -> {
+			try {
+				집결지.await(대기_한도_초, TimeUnit.SECONDS);
+			}
+			catch (InterruptedException | BrokenBarrierException | TimeoutException ex) {
+				throw new IllegalStateException("첫 쓰기 직전에 모든 스레드가 모이지 않았다 — 끼워넣기가 "
+						+ "강제되지 않았으므로 이 측정은 이중 감소를 볼 수 없다", ex);
+			}
+		});
+
+		List<Object> 결과 = 동시에_실행한다(() -> {
+			this.attachmentService.delete(대상, 1404L);
+			return 성공;
+		});
+
+		assertThat(결과).filteredOn(성공::equals).as("같은 첨부는 한 번만 지워진다").hasSize(1);
+		assertThat(결과).filteredOn(r -> !성공.equals(r)).hasSize(동시_요청 - 1)
+				.allSatisfy(failure -> assertThat(failure).isInstanceOfSatisfying(BusinessException.class,
+						ex -> assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.ATTACHMENT_NOT_FOUND)));
+		assertThat(PostUpdateBarrier.통과한_스레드_수())
+				.as("모든 요청이 판정을 지나 첫 쓰기에 닿았다 — 강제가 일어났다").isEqualTo(동시_요청);
+		assertThat(커밋된_집계(post)).as("집계가 1 만 준다").isEqualTo(2);
+		assertThat(활성_첨부_수(post)).isEqualTo(2);
+		assertThat(this.jdbcTemplate.queryForObject(
+				"SELECT deleted FROM attachment WHERE id = ?", Boolean.class, 대상)).isTrue();
+		assertThat(저장된_파일()).as("파일은 지우지 않는다").hasSize(3);
+		then(this.attachmentStorage).should(never()).delete(any());
+	}
+
+	/**
+	 * B-24 검증 표 「집계가 0 인데 활성 첨부를 지우기 → WARN」 의 동시 판이다. <b>WARN 은 전환이 1 행인
+	 * 요청에서만 정확히 1 회</b>이고, 지는 요청은 남기지 않는다 — sp-docs/domain-model.md §6.2 의 WARN
+	 * 조건(1) 이 0 행이고 2) 가 1 행, 2026-11-19 {@code D-23})을 고정한다.
+	 *
+	 * <p>집계가 0 이므로 모든 요청의 감소가 0 행이다. 그래서 WARN 을 감소 직후에 남기는 변이는 요청 수만큼
+	 * 남긴다. 끼워넣기는 위 테스트와 같다 — 모든 요청이 첨부를 활성으로 읽은 뒤에야 첫 쓰기가 실행된다.
+	 */
+	@Test
+	@DisplayName("집계 0 인 글의 같은 활성 첨부를 동시에 지우면 하나만 204 이고 WARN 은 정확히 1 회다")
+	void 집계_0_의_동시_지우기는_WARN_이_한_번이다() throws Exception {
+		Post post = 게시글을_만든다(1405L);
+		파일과_첨부를_둔다(post, 1);
+		this.jdbcTemplate.update("UPDATE post SET attachment_count = 0 WHERE id = ?", post.getId());
+		long 대상 = this.jdbcTemplate.queryForObject(
+				"SELECT id FROM attachment WHERE post_id = ?", Long.class, post.getId());
+		CyclicBarrier 집결지 = new CyclicBarrier(동시_요청);
+		PostUpdateBarrier.건다(() -> {
+			try {
+				집결지.await(대기_한도_초, TimeUnit.SECONDS);
+			}
+			catch (InterruptedException | BrokenBarrierException | TimeoutException ex) {
+				throw new IllegalStateException("첫 쓰기 직전에 모든 스레드가 모이지 않았다", ex);
+			}
+		});
+
+		Logger logger = (Logger) LoggerFactory.getLogger(AttachmentService.class);
+		ListAppender<ILoggingEvent> appender = new ListAppender<>();
+		appender.start();
+		Level original = logger.getLevel();
+		logger.setLevel(Level.TRACE);
+		logger.addAppender(appender);
+		List<Object> 결과;
+		try {
+			결과 = 동시에_실행한다(() -> {
+				this.attachmentService.delete(대상, 1405L);
+				return 성공;
+			});
+		}
+		finally {
+			logger.detachAppender(appender);
+			logger.setLevel(original);
+			appender.stop();
+		}
+
+		assertThat(결과).filteredOn(성공::equals).hasSize(1);
+		assertThat(결과).filteredOn(r -> !성공.equals(r)).hasSize(동시_요청 - 1)
+				.allSatisfy(failure -> assertThat(failure).isInstanceOfSatisfying(BusinessException.class,
+						ex -> assertThat(ex.getErrorCode()).isEqualTo(ErrorCode.ATTACHMENT_NOT_FOUND)));
+		assertThat(PostUpdateBarrier.통과한_스레드_수()).isEqualTo(동시_요청);
+		assertThat(appender.list).extracting(ILoggingEvent::getLevel)
+				.as("어긋난 상태는 전환에 성공한 요청 하나만 알린다 — 되돌아간 요청은 WARN 을 남기지 않는다")
+				.containsExactly(Level.WARN);
+		assertThat(커밋된_집계(post)).as("음수로 내리지 않는다").isZero();
+		assertThat(활성_첨부_수(post)).isZero();
+	}
+
 	// --- 도구 ---
+
+	/** 동시 지우기의 성공 표지. 지우기는 돌려주는 값이 없다. */
+	private static final String 성공 = "204";
+
+	/**
+	 * {@code 동시_요청} 개의 스레드가 출발선에서 함께 출발해 같은 작업을 돌린다. 결과는 성공이면 작업이
+	 * 돌려준 값, 실패면 그 예외다. 한도 안에 끝나지 않은 요청은 {@link TimeoutException} 으로 담긴다.
+	 * 스레드 이름은 {@link PostUpdateBarrier#스레드_접두어} 로 시작한다 — 훅은 그 스레드에서만 돈다.
+	 */
+	private List<Object> 동시에_실행한다(Callable<Object> 작업) throws InterruptedException {
+		AtomicInteger 번호 = new AtomicInteger();
+		ExecutorService 풀 = Executors.newFixedThreadPool(동시_요청,
+				runnable -> new Thread(runnable, PostUpdateBarrier.스레드_접두어 + 번호.incrementAndGet()));
+		CountDownLatch 출발선 = new CountDownLatch(1);
+		try {
+			List<Future<Object>> futures = new ArrayList<>();
+			for (int i = 0; i < 동시_요청; i++) {
+				futures.add(풀.submit(() -> {
+					if (!출발선.await(대기_한도_초, TimeUnit.SECONDS)) {
+						throw new IllegalStateException("출발 신호가 오지 않았다");
+					}
+					return 작업.call();
+				}));
+			}
+			출발선.countDown();
+
+			List<Object> 결과 = new ArrayList<>();
+			for (Future<Object> future : futures) {
+				try {
+					결과.add(future.get(대기_한도_초 * 3L, TimeUnit.SECONDS));
+				}
+				catch (ExecutionException ex) {
+					결과.add(ex.getCause());
+				}
+				catch (TimeoutException ex) {
+					결과.add(ex);
+				}
+			}
+			return 결과;
+		}
+		finally {
+			풀.shutdownNow();
+		}
+	}
+
+	/**
+	 * {@code update post …} 가 발행되기 직전에 훅을 돌리는 Hibernate {@link StatementInspector}.
+	 * {@code @DynamicPropertySource} 가 클래스 이름으로 꽂고 Hibernate 가 인스턴스를 만들므로 훅은 정적
+	 * 필드다.
+	 *
+	 * <p><b>{@link #스레드_접두어} 로 시작하는 스레드에서만, 스레드마다 한 번만 돈다.</b> 다른 스레드(예:
+	 * 판정 행 정리의 스케줄러, B-21)의 문장에 훅이 걸리지 않게 하고, 한 스레드가 두 번 모여 집결지를
+	 * 다시 닫지 않게 한다. 훅이 걸려 있지 않으면 문장을 그대로 돌려줄 뿐이다.
+	 */
+	public static class PostUpdateBarrier implements StatementInspector {
+
+		static final String 스레드_접두어 = "b24-동시-지우기-";
+
+		private static volatile Runnable 훅;
+
+		private static final Set<String> 통과한_스레드 = ConcurrentHashMap.newKeySet();
+
+		static void 건다(Runnable 걸_훅) {
+			통과한_스레드.clear();
+			훅 = 걸_훅;
+		}
+
+		static void 푼다() {
+			훅 = null;
+			통과한_스레드.clear();
+		}
+
+		static int 통과한_스레드_수() {
+			return 통과한_스레드.size();
+		}
+
+		@Override
+		public String inspect(String sql) {
+			Runnable 지금_훅 = 훅;
+			String 스레드 = Thread.currentThread().getName();
+			if (지금_훅 != null && 스레드.startsWith(스레드_접두어)
+					&& sql.toLowerCase(Locale.ROOT).trim().startsWith("update post")
+					&& 통과한_스레드.add(스레드)) {
+				지금_훅.run();
+			}
+			return sql;
+		}
+
+	}
 
 	/**
 	 * {@code 동시_요청} 개의 스레드가 출발선에서 함께 출발해 같은 글에 올린다. 결과는 성공이면

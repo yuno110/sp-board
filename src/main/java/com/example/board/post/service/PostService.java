@@ -1,5 +1,7 @@
 package com.example.board.post.service;
 
+import com.example.board.attachment.dto.AttachmentResponse;
+import com.example.board.attachment.repository.AttachmentRepository;
 import com.example.board.client.MemberClient;
 import com.example.board.comment.repository.CommentRepository;
 import com.example.board.global.common.PageResponse;
@@ -20,6 +22,7 @@ import com.example.board.post.repository.PostRepository;
 import com.example.board.post.support.PostReader;
 import com.example.board.post.support.ViewCountJudge;
 import com.example.board.post.support.ViewerKeyFactory;
+import java.util.List;
 import org.springframework.lang.Nullable;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
@@ -69,6 +72,9 @@ public class PostService {
 	/** 상세·수정 응답의 {@code liked} (sp-docs/api-contract.md §4.3, sp-docs/conventions.md §1.3). */
 	private final PostLikeRepository postLikeRepository;
 
+	/** 상세·수정 응답의 {@code attachments} (sp-docs/api-contract.md §4.3, sp-docs/conventions.md §1.3). */
+	private final AttachmentRepository attachmentRepository;
+
 	/**
 	 * 상세 조회의 읽기 트랜잭션. <b>{@code @Transactional} 로 메서드 전체를 감쌀 수 없어서</b>
 	 * 템플릿을 쓴다 — 감싸면 판정이 그 트랜잭션에 참여한다 ({@link #getDetail}).
@@ -84,6 +90,7 @@ public class PostService {
 			ViewCountJudge viewCountJudge,
 			ViewerKeyFactory viewerKeyFactory,
 			PostLikeRepository postLikeRepository,
+			AttachmentRepository attachmentRepository,
 			PlatformTransactionManager transactionManager) {
 
 		this.postRepository = postRepository;
@@ -94,6 +101,7 @@ public class PostService {
 		this.viewCountJudge = viewCountJudge;
 		this.viewerKeyFactory = viewerKeyFactory;
 		this.postLikeRepository = postLikeRepository;
+		this.attachmentRepository = attachmentRepository;
 		this.insertTransaction = new TransactionTemplate(transactionManager);
 		this.readTransaction = new TransactionTemplate(transactionManager);
 		this.readTransaction.setReadOnly(true);
@@ -148,8 +156,9 @@ public class PostService {
 						.category(request.category())
 						.build()));
 
-		// 방금 만든 글이라 누른 사람이 없다 (sp-docs/api-contract.md §4.4)
-		return PostDetailResponse.from(saved, false);
+		// 방금 만든 글이라 누른 사람도 첨부도 없다 (sp-docs/api-contract.md §4.4) — 첨부는 글을 만든 뒤
+		// 올리므로 조회하지 않는다
+		return PostDetailResponse.from(saved, false, List.of());
 	}
 
 	/**
@@ -196,7 +205,7 @@ public class PostService {
 
 		// 3) 판정 커밋 뒤에 시작한 읽기
 		return this.readTransaction.execute(status -> PostDetailResponse.from(
-				this.postReader.getActiveById(id), likedBy(id, loginMember)));
+				this.postReader.getActiveById(id), likedBy(id, loginMember), attachmentsOf(id)));
 	}
 
 	/**
@@ -208,6 +217,20 @@ public class PostService {
 			return null;
 		}
 		return this.postLikeRepository.existsByPostIdAndAccountId(postId, loginMember.accountId());
+	}
+
+	/**
+	 * 상세·수정 응답의 {@code attachments}. 그 글의 활성 첨부를 올린 순서({@code id} 오름차순)로
+	 * 싣는다 (sp-docs/api-contract.md §4.3, sp-docs/requirements/board.md §11 의 「상세 응답」 줄).
+	 *
+	 * <p><b>{@code attachment} 를 읽는 문장은 하나다</b> — 그 글의 활성 첨부를 한 번에 읽는다. 첨부 하나의
+	 * 모양(§4.7)에 글의 값이 없어 첨부의 {@code post} 연관을 건드리지 않는다. 순서는 조회의
+	 * {@code ORDER BY} 가 정한다 — 그것이 없으면 MySQL 은 순서를 보장하지 않는다.
+	 */
+	private List<AttachmentResponse> attachmentsOf(Long postId) {
+		return this.attachmentRepository.findByPostIdAndDeletedFalseOrderByIdAsc(postId).stream()
+				.map(AttachmentResponse::from)
+				.toList();
 	}
 
 	/**
@@ -293,7 +316,7 @@ public class PostService {
 		post.changeCategory(request.category());
 
 		// 요청한 계정의 실제 상태다 (sp-docs/api-contract.md §4.4)
-		return PostDetailResponse.from(post, likedBy(id, loginMember));
+		return PostDetailResponse.from(post, likedBy(id, loginMember), attachmentsOf(id));
 	}
 
 	/**

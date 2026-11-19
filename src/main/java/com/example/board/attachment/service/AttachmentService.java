@@ -12,10 +12,12 @@ import com.example.board.post.support.PostReader;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.UncheckedIOException;
+import java.nio.file.NoSuchFileException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionTemplate;
 import org.springframework.web.multipart.MultipartFile;
 
@@ -37,7 +39,7 @@ import org.springframework.web.multipart.MultipartFile;
  * <p><b>개수 상한은 1) 의 조건부 UPDATE 하나가 판정한다</b> (§6.2). 미리 세어 보지 않는다 — §6.2 가
  * 막지 않지만 판정이 아니고, 상한에 걸린 요청은 쓴 파일을 지우는 것으로 끝난다.
  *
- * <p><b>트랜잭션은 템플릿이다.</b> 메서드에 {@code @Transactional} 을 붙이면 파일 쓰기까지 트랜잭션
+ * <p><b>올리기의 트랜잭션은 템플릿이다.</b> 그 메서드에 {@code @Transactional} 을 붙이면 파일 쓰기까지 트랜잭션
  * 안에 들어가고(§6.2 는 그것을 밖에 둔다), 커밋이 반환 뒤의 프록시에서 나서 커밋되지 않았는지를 이
  * 메서드가 보지 못한다 — 그것을 봐야 파일을 지울지 정한다.
  *
@@ -56,6 +58,10 @@ import org.springframework.web.multipart.MultipartFile;
  *
  * <p>{@code post} 패키지에서 참조하는 것은 {@link PostReader}·{@link PostRepository}·{@link Post} 다
  * (sp-docs/conventions.md §1.3 의 {@code attachment.*} 줄).
+ *
+ * <p><b>내려받기({@link #open})와 지우기({@link #delete})</b>는 B-24 다. 둘 다 파일을 지우지 않는다 —
+ * 행과 파일의 수명이 다르다 (sp-docs/domain-model.md §4.6). 지우기도 {@code MemberClient} 를 부르지
+ * 않는다.
  */
 @Service
 public class AttachmentService {
@@ -130,6 +136,97 @@ public class AttachmentService {
 			}
 		}
 		return AttachmentResponse.from(saved);
+	}
+
+	/**
+	 * 첨부 내려받기 (P-10). 그 첨부의 파일을 연 스트림과 서빙 헤더의 값을 돌려준다 — 바이트를 메모리에
+	 * 올리지 않는다. 스트림을 닫는 것은 부르는 쪽이다.
+	 *
+	 * <p><b>첨부와 글이 둘 다 활성일 때만 준다</b> (sp-docs/domain-model.md §4.6). 없는 첨부, 지운 첨부,
+	 * 지워진 글의 첨부는 모두 404 {@code AT001} 이다 (sp-docs/api-contract.md §4.7).
+	 *
+	 * <p><b>행은 있는데 저장소에 파일이 없으면 404 {@code AT001} 이고 WARN 을 남긴다</b> (§4.7) — 화면에서
+	 * 「없는 첨부」 와 구별할 쓸모가 없고, 운영이 알아야 할 일이다. 그 밖의 읽기 실패는 감추지 않는다
+	 * ({@link UncheckedIOException}, 500).
+	 *
+	 * <p>파일은 요청의 어떤 값으로도 열지 않는다 — id 로 찾은 행의 저장 이름으로 연다 (sp-docs/security.md
+	 * §8).
+	 *
+	 * <p>트랜잭션은 조회의 것이다 (sp-docs/conventions.md §5). 스트림은 그 안에서 열리지만 바이트는 반환
+	 * 뒤에 부르는 쪽이 흘려보낸다.
+	 */
+	@Transactional(readOnly = true)
+	public AttachmentContent open(Long id) {
+		Attachment attachment = this.attachmentRepository.findByIdAndDeletedFalse(id)
+				.filter(found -> !found.getPost().isDeleted())
+				.orElseThrow(() -> new BusinessException(ErrorCode.ATTACHMENT_NOT_FOUND));
+		InputStream content;
+		try {
+			content = this.attachmentStorage.open(attachment.getStorageKey());
+		}
+		catch (NoSuchFileException ex) {
+			log.warn("첨부 행은 있는데 저장소에 파일이 없다 — 404 AT001 로 답한다. attachmentId={}, storageKey={}",
+					id, attachment.getStorageKey());
+			throw new BusinessException(ErrorCode.ATTACHMENT_NOT_FOUND);
+		}
+		catch (IOException ex) {
+			throw new UncheckedIOException("첨부 파일을 열지 못했다", ex);
+		}
+		return new AttachmentContent(attachment.getContentType(), attachment.getOriginalFilename(),
+				attachment.getSize(), content);
+	}
+
+	/**
+	 * 첨부 지우기 (P-10). 행을 논리 삭제하고 그 글의 {@code attachment_count} 를 줄인다. <b>파일은
+	 * 지우지 않는다</b> (sp-docs/requirements/board.md §11 의 「삭제」 줄).
+	 *
+	 * <p><b>판정 순서</b>는 없는·이미 지운 첨부 404 {@code AT001} → 작성자인가 403 {@code P002} 다
+	 * (§11, sp-docs/api-contract.md §4.4). 그 글이 지워졌어도 지운 첨부는 {@code AT001} 이다 — 글의
+	 * 404 {@code P001} 판정이 없다. ADMIN 도 남의 글의 첨부는 403 {@code P002} 다 (§11 의 「누가」 줄)
+	 * — {@code role} 을 보지 않는다.
+	 *
+	 * <p><b>흐름은 sp-docs/domain-model.md §6.2 의 첨부 삭제다</b> — 한 트랜잭션에서
+	 * <ol>
+	 * <li>1) {@code attachment_count} 감소가 먼저다 ({@link PostRepository#decreaseAttachmentCount}).
+	 * 0 행이면 집계가 이미 0 이고, 2) 를 그대로 하며 집계는 0 에 둔다(음수로 내리지 않는다). <b>1) 의 0 행만으로는
+	 * 어긋난 상태가 아니다</b> — 같은 첨부의 동시 삭제에서 진 요청도 1) 이 0 행일 수 있다(아래 WARN 문단)
+	 * <li>2) 첨부의 조건부 전환 ({@link AttachmentRepository#softDeleteIfActive}). <b>최종 판정이다</b> —
+	 * 0 행이면 그 사이에 다른 요청이 지운 것이므로 던져서 1) 의 감소까지 되돌린다 (404 {@code AT001})
+	 * </ol>
+	 *
+	 * <p><b>위 404·403 판정은 락 전의 읽기라 같은 첨부의 동시 삭제를 거르지 못한다</b> (§6.2) — 모두
+	 * 활성으로 읽고 쓰기에 닿을 수 있다. 그 요청들 가운데 전환이 1 행인 요청만 감소를 남긴다. 조건 없이
+	 * 지우면 둘 다 성공해 집계가 두 번 줄고, 활성 첨부보다 작아진 집계 때문에 올리기의 상한 판정을 지나
+	 * 상한을 넘는 첨부가 들어간다 (§6.2).
+	 *
+	 * <p><b>어긋난 상태의 WARN 은 「1) 이 0 행이고 2) 가 1 행」 일 때만 남긴다</b> — §6.2 의 조건 그대로다
+	 * (2026-11-19 {@code D-23} 개정). 1) 이 0 행인 것은 동시 삭제에서 먼저 커밋한 요청이 집계를 0 으로 내린
+	 * 경우에도 나는데, 그 요청은 2) 에서 0 행을 보고 되돌아가므로 어긋난 상태가 아니다 — 1) 의 0 행에
+	 * WARN 을 붙이면 지는 요청마다 거짓 경보가 난다. 그래서 로그는 2) 뒤에 둔다. 문장의 순서는 §6.2
+	 * 그대로다. 이 조건은 {@code AttachmentServiceTest} 의 집계 0 동시 지우기 테스트가 고정한다 (WARN 정확히
+	 * 1 회).
+	 *
+	 * @param accountId 검증된 JWT 의 {@code sub}
+	 */
+	@Transactional
+	public void delete(Long id, Long accountId) {
+		Attachment attachment = this.attachmentRepository.findByIdAndDeletedFalse(id)
+				.orElseThrow(() -> new BusinessException(ErrorCode.ATTACHMENT_NOT_FOUND));
+		Post post = attachment.getPost();
+		if (!post.getWriterId().equals(accountId)) {
+			throw new BusinessException(ErrorCode.POST_FORBIDDEN);
+		}
+
+		// 1) post 먼저. 0행(집계가 이미 0)이어도 2)를 그대로 한다 — 집계는 0 에 둔다
+		boolean decreased = this.postRepository.decreaseAttachmentCount(post.getId()) == 1;
+		// 2) 조건부 전환이 최종 판정이다. 0행이면 이미 지워진 것 — 던져서 1)의 감소까지 되돌린다
+		if (this.attachmentRepository.softDeleteIfActive(id) == 0) {
+			throw new BusinessException(ErrorCode.ATTACHMENT_NOT_FOUND);
+		}
+		if (!decreased) {
+			log.warn("활성 첨부를 지웠는데 attachment_count 가 이미 0 이다 — 근거 행과 집계가 어긋났다. "
+					+ "집계는 0 에 둔다. postId={}, attachmentId={}", post.getId(), id);
+		}
 	}
 
 	/**

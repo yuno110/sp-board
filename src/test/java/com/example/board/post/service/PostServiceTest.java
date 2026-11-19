@@ -10,6 +10,7 @@ import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 
+import com.example.board.attachment.dto.AttachmentResponse;
 import com.example.board.client.MemberClient;
 import com.example.board.comment.dto.CommentCreateRequest;
 import com.example.board.comment.entity.Comment;
@@ -37,6 +38,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CyclicBarrier;
@@ -1201,6 +1203,9 @@ class PostServiceTest {
 
 		private static final long 같은_키_대역 = 935L;
 
+		/** 상세의 {@code attachments} 문장 (B-24). */
+		private static final long 첨부_대역 = 936L;
+
 		/** 집결지·끼워넣기에서 기다리는 한도. 넘으면 강제가 일어나지 않은 것이므로 시끄럽게 터진다. */
 		private static final int 집결_한도_초 = 10;
 
@@ -1241,6 +1246,9 @@ class PostServiceTest {
 			this.jdbcTemplate.update("DELETE FROM comment WHERE post_id IN "
 					+ "(SELECT id FROM post WHERE writer_id BETWEEN 931 AND 939)");
 			this.jdbcTemplate.update("DELETE FROM post_view WHERE post_id IN "
+					+ "(SELECT id FROM post WHERE writer_id BETWEEN 931 AND 939)");
+			// attachment.post_id 에 FK 가 있으므로 (fk_attachment_post_id) 첨부를 먼저 지운다 (B-24)
+			this.jdbcTemplate.update("DELETE FROM attachment WHERE post_id IN "
 					+ "(SELECT id FROM post WHERE writer_id BETWEEN 931 AND 939)");
 			this.jdbcTemplate.update("DELETE FROM post WHERE writer_id BETWEEN 931 AND 939");
 		}
@@ -1349,6 +1357,55 @@ class PostServiceTest {
 		}
 
 		/**
+		 * sp-docs/plan/phase2-board.md B-24 검증표 <b>「상세의 {@code attachments} → 활성만, {@code id}
+		 * 오름차순, 원소의 키가 §4.7 의 모양」</b>의 서비스 쪽과, 첨부를 읽는 문장이 하나라는 것.
+		 *
+		 * <p><b>{@code attachment} 를 읽는 SELECT 가 하나이고 {@code id} 로 정렬한다.</b> 첨부를 원소마다
+		 * 따로 읽는 구현이면 그 SELECT 가 첨부 수만큼 는다. 정렬은 문장으로 본다 — H2 는 {@code ORDER BY} 가 없어도 기본 키 순서로 돌려줘서
+		 * 결과만으로는 정렬을 뺀 변이가 보이지 않는다. MySQL 은 {@code ORDER BY} 없는 순서를 보장하지
+		 * 않는다.
+		 *
+		 * <p>지운 첨부를 가운데 두고, 다른 글의 활성 첨부도 둔다 — 그 글의 활성만 실린다.
+		 */
+		@Test
+		@DisplayName("상세의 attachments 는 그 글의 활성 첨부를 id 오름차순으로 한 문장에서 읽는다")
+		void 상세의_첨부는_활성만_id_순서로_한_문장이다() throws Exception {
+			Post post = 게시글을_만든다(첨부_대역);
+			Post 다른_글 = 게시글을_만든다(첨부_대역);
+			long 첫째 = 첨부_행을_둔다(post, "first.png", false);
+			첨부_행을_둔다(post, "deleted.png", true);
+			long 셋째 = 첨부_행을_둔다(post, "third.png", false);
+			첨부_행을_둔다(다른_글, "other.png", false);
+			this.발행된_문장.비운다();
+
+			PostDetailResponse detail = this.postService.getDetail(post.getId(), null, REMOTE_ADDR);
+
+			assertThat(detail.attachments()).extracting(AttachmentResponse::id).containsExactly(첫째, 셋째);
+			assertThat(detail.attachments()).extracting(AttachmentResponse::originalFilename)
+					.containsExactly("first.png", "third.png");
+			List<String> 첨부_SELECT = this.발행된_문장.발행된_attachment_SELECT();
+			assertThat(첨부_SELECT).as("attachment 를 읽는 SELECT 는 하나다").hasSize(1);
+			assertThat(첨부_SELECT.get(0)).as("올린 순서(id 오름차순)는 문장이 정한다")
+					.containsPattern("order by [a-z0-9_]+\\.id( asc)?$");
+			Map<String, Object> serialized = this.objectMapper.readValue(
+					this.objectMapper.writeValueAsString(detail.attachments().get(0)),
+					new TypeReference<Map<String, Object>>() { });
+			assertThat(serialized.keySet()).as("sp-docs/api-contract.md §4.7 의 첨부 하나의 모양")
+					.isEqualTo(Set.of("id", "originalFilename", "contentType", "size", "createdAt"));
+		}
+
+		/** 첨부 행 하나를 이 서비스를 거치지 않고 둔다. 파일은 두지 않는다 — 상세는 파일을 열지 않는다. */
+		private long 첨부_행을_둔다(Post post, String originalFilename, boolean deleted) {
+			String storageKey = UUID.randomUUID().toString();
+			this.jdbcTemplate.update("INSERT INTO attachment (post_id, storage_key, original_filename, "
+							+ "content_type, size, deleted, created_at, updated_at) "
+							+ "VALUES (?, ?, ?, 'image/png', 1, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+					post.getId(), storageKey, originalFilename, deleted);
+			return this.jdbcTemplate.queryForObject(
+					"SELECT id FROM attachment WHERE storage_key = ?", Long.class, storageKey);
+		}
+
+		/**
 		 * 검증표 <b>"발행된 UPDATE 의 모양 → {@code view_count} 만 싣는다.
 		 * {@code comment_count}·{@code title}·{@code content} 가 실리지 않는다"</b>.
 		 *
@@ -1391,8 +1448,7 @@ class PostServiceTest {
 		 *
 		 * <p><b>"여덟 키" 는 1차 계약의 수다</b> (sp-docs/plan/phase1.md §6 머리의 블록인용).
 		 * B-19 가 2026-11-11 {@code D-18} 의 {@code category}·{@code likeCount} 를, B-21 이
-		 * {@code liked} 를 더했다. §4.3 의 상세 줄에 남은 {@code attachments} 는 계획이 B-24 에
-		 * 배정했다 (sp-docs/plan/phase2-board.md 의 B-24).
+		 * {@code liked} 를, B-24 가 {@code attachments} 를 더했다 — 이제 §4.3 의 상세 줄 그대로다.
 		 *
 		 * <p>조회수 쪽은 처음 보는 조회자의 조회다 — B-21 뒤로 같은 조회자의 재조회는 세지 않는다
 		 * (sp-docs/requirements/board.md §9.2).
@@ -1424,12 +1480,11 @@ class PostServiceTest {
 					this.objectMapper.writeValueAsString(detail),
 					new TypeReference<Map<String, Object>>() { });
 			assertThat(serialized.keySet())
-					.as("상세는 목록 항목의 키에 content·liked 를 더한 것이다 — sp-docs/api-contract.md "
-							+ "§4.3 의 상세 줄에서 attachments 를 뺀 모양이고, attachments 는 계획이 B-24 에 "
-							+ "배정했다 (sp-docs/plan/phase2-board.md 의 B-24)")
+					.as("상세는 목록 항목의 키에 content·liked·attachments 를 더한 것이다 — "
+							+ "sp-docs/api-contract.md §4.3 의 상세 줄 그대로다")
 					.isEqualTo(Set.of(
 							"id", "title", "category", "content", "writerId", "writerNickname",
-							"viewCount", "commentCount", "likeCount", "liked", "createdAt"));
+							"viewCount", "commentCount", "likeCount", "liked", "attachments", "createdAt"));
 		}
 
 		/**
@@ -2166,6 +2221,14 @@ class PostServiceTest {
 			return this.발행된_문장.stream()
 					.map(StatementRecorder::정규화)
 					.filter(sql -> sql.startsWith("update post "))
+					.toList();
+		}
+
+		/** {@code attachment} 를 읽는 SELECT 만. 소문자·공백이 정규화된 문장이다 (B-24). */
+		List<String> 발행된_attachment_SELECT() {
+			return this.발행된_문장.stream()
+					.map(StatementRecorder::정규화)
+					.filter(sql -> sql.startsWith("select ") && sql.contains(" from attachment "))
 					.toList();
 		}
 

@@ -2,18 +2,31 @@ package com.example.board.attachment.controller;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.hamcrest.Matchers.nullValue;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.multipart;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.content;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import ch.qos.logback.classic.Level;
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
+import com.example.board.attachment.service.AttachmentContent;
+import com.example.board.attachment.service.AttachmentService;
 import com.example.board.global.error.BusinessException;
+import com.example.board.global.error.GlobalExceptionHandler;
 import com.example.board.post.entity.Post;
 import com.example.board.post.repository.PostRepository;
 import com.example.board.support.TestTokenFactory;
 import com.jayway.jsonpath.JsonPath;
 import com.sun.net.httpserver.HttpServer;
+import jakarta.servlet.ServletOutputStream;
+import java.io.EOFException;
 import java.io.IOException;
+import java.io.InputStream;
 import java.net.InetSocketAddress;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -25,7 +38,9 @@ import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicReference;
 import java.util.stream.Stream;
+import org.apache.catalina.connector.ClientAbortException;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -35,12 +50,16 @@ import org.junit.jupiter.params.ParameterizedTest;
 import org.junit.jupiter.params.provider.Arguments;
 import org.junit.jupiter.params.provider.MethodSource;
 import org.junit.jupiter.params.provider.ValueSource;
+import org.mockito.Mockito;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.autoconfigure.web.servlet.AutoConfigureMockMvc;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.jdbc.core.JdbcTemplate;
+import org.springframework.mock.web.DelegatingServletOutputStream;
+import org.springframework.mock.web.MockHttpServletResponse;
 import org.springframework.mock.web.MockMultipartFile;
 import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.DynamicPropertyRegistry;
@@ -48,10 +67,14 @@ import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.MvcResult;
 import org.springframework.test.web.servlet.ResultActions;
+import org.springframework.test.web.servlet.request.MockHttpServletRequestBuilder;
+import org.springframework.test.web.servlet.setup.MockMvcBuilders;
+import org.springframework.web.context.request.async.AsyncRequestNotUsableException;
 
 /**
  * sp-docs/plan/phase2-board.md B-23 검증 표 중 HTTP 쪽이다 — 판정 순서·상태 코드·응답 본문·저장된
- * 행과 파일·인증·member 호출 0회. 동시 올리기·INSERT 실패·판정과 UPDATE 사이에 지워진 글은
+ * 행과 파일·인증·member 호출 0회. B-24 검증 표의 내려받기·지우기 줄도 여기다(같은 첨부의 동시 지우기는
+ * 서비스 테스트). 동시 올리기·INSERT 실패·판정과 UPDATE 사이에 지워진 글은
  * {@link com.example.board.attachment.service.AttachmentServiceTest} 가 본다.
  *
  * <p>정본은 sp-docs/requirements/board.md §11 (판정 순서·형식·파일명·개수),
@@ -81,6 +104,12 @@ import org.springframework.test.web.servlet.ResultActions;
 class AttachmentControllerTest {
 
 	private static final String PATH = "/api/v1/posts/{postId}/attachments";
+
+	/** 내려받기·지우기의 경로 (sp-docs/api-contract.md §4.7). */
+	private static final String DOWNLOAD_PATH = "/api/v1/attachments/{id}";
+
+	/** 어떤 첨부에도 쓰이지 않는 id. IDENTITY 는 양수만 준다. */
+	private static final long 없는_첨부 = -1L;
 
 	/** sp-docs/api-contract.md §6 의 {@code role} claim 값. */
 	private static final String USER = "USER";
@@ -134,6 +163,9 @@ class AttachmentControllerTest {
 
 	@Autowired
 	private JdbcTemplate jdbcTemplate;
+
+	@Autowired
+	private AttachmentService attachmentService;
 
 	@BeforeEach
 	void 저장_루트를_비운다() throws IOException {
@@ -549,7 +581,533 @@ class AttachmentControllerTest {
 		거부된_뒤_아무것도_남지_않는다(post);
 	}
 
+	// --- 내려받기 (B-24, sp-docs/api-contract.md §4.7, sp-docs/security.md §8) ---
+
+	/**
+	 * B-24 검증 표 <b>「내려받기 → 200, 본문이 올린 바이트, 헤더가 sp-docs/security.md §8 의 표와 같다」</b>와
+	 * <b>「비로그인 내려받기 → 200」</b>.
+	 *
+	 * <p>헤더는 표의 다섯 줄을 값까지 리터럴로 대조한다. {@code Cache-Control} 은 값이 하나뿐인지도 본다 —
+	 * Spring Security 의 기본 캐시 헤더({@code no-cache, no-store …})가 섞이면 {@code private} 캐시가
+	 * 깨진다. 본문은 봉투가 아니라 올린 바이트 그대로다.
+	 */
+	@ParameterizedTest(name = "토큰 있음={0}")
+	@ValueSource(booleans = {true, false})
+	@DisplayName("내려받기는 200 이고 본문이 올린 바이트이며 헤더가 security.md §8 의 표와 같다 — 비로그인도 같다")
+	void 내려받기는_올린_바이트와_서빙_헤더다(boolean withToken) throws Exception {
+		Post post = 게시글을_만든다(1474L);
+		long id = idOf(올린다(post.getId(), 1474L, USER, 파일("map.png", "image/jpeg", PNG))
+				.andExpect(status().isCreated()).andReturn());
+
+		MockHttpServletRequestBuilder request = get(DOWNLOAD_PATH, id);
+		if (withToken) {
+			request.header(HttpHeaders.AUTHORIZATION, bearer(1475L, USER));
+		}
+		MvcResult result = this.mockMvc.perform(request)
+				.andExpect(status().isOk())
+				.andExpect(content().bytes(PNG))
+				.andReturn();
+
+		MockHttpServletResponse response = result.getResponse();
+		assertThat(response.getHeader(HttpHeaders.CONTENT_TYPE)).as("판정한 형식 — 요청의 image/jpeg 가 아니다")
+				.isEqualTo("image/png");
+		assertThat(response.getHeaders("X-Content-Type-Options")).containsExactly("nosniff");
+		assertThat(response.getHeaders(HttpHeaders.CONTENT_DISPOSITION))
+				.containsExactly("inline; filename*=UTF-8''map.png");
+		assertThat(response.getHeaders(HttpHeaders.CACHE_CONTROL)).containsExactly("private, max-age=86400");
+		assertThat(response.getHeader(HttpHeaders.CONTENT_LENGTH)).isEqualTo(String.valueOf(PNG.length));
+		assertThat(REQUEST_COUNT.get()).as("내려받기는 member 를 부르지 않는다").isZero();
+	}
+
+	/**
+	 * <b>서빙 헤더는 핸들러가 싣는다 — 보안 필터의 기본값에 기대지 않는다</b> (sp-docs/security.md §8 이
+	 * 서빙 응답에 요구한다). Spring Security 의 기본 헤더도 {@code X-Content-Type-Options: nosniff} 를
+	 * 싣는다 — 그래서 위 테스트는 핸들러가 그 줄을 빼도 녹색이었다(2026-11-19 B-24 변이 실측). 보안
+	 * 설정이 기본 헤더를 끄거나 바꾸면 서빙에서 {@code nosniff} 가 조용히 사라진다.
+	 *
+	 * <p>필터 없이 이 컨트롤러만 세운 {@link MockMvc} 로 같은 첨부를 받는다. 서비스는 컨텍스트의 실제
+	 * 빈이다.
+	 */
+	@Test
+	@DisplayName("보안 필터 없이도 서빙 헤더가 security.md §8 의 표와 같다 — 핸들러가 싣는다")
+	void 서빙_헤더는_핸들러가_싣는다() throws Exception {
+		Post post = 게시글을_만든다(1488L);
+		long id = idOf(올린다(post.getId(), 1488L, USER, 파일("map.png", "image/png", PNG))
+				.andExpect(status().isCreated()).andReturn());
+		MockMvc 필터_없음 = MockMvcBuilders.standaloneSetup(new AttachmentController(this.attachmentService)).build();
+
+		MockHttpServletResponse response = 필터_없음.perform(get(DOWNLOAD_PATH, id))
+				.andExpect(status().isOk())
+				.andExpect(content().bytes(PNG))
+				.andReturn().getResponse();
+
+		assertThat(response.getHeader(HttpHeaders.CONTENT_TYPE)).isEqualTo("image/png");
+		assertThat(response.getHeaders("X-Content-Type-Options")).containsExactly("nosniff");
+		assertThat(response.getHeaders(HttpHeaders.CONTENT_DISPOSITION))
+				.containsExactly("inline; filename*=UTF-8''map.png");
+		assertThat(response.getHeaders(HttpHeaders.CACHE_CONTROL)).containsExactly("private, max-age=86400");
+		assertThat(response.getHeader(HttpHeaders.CONTENT_LENGTH)).isEqualTo(String.valueOf(PNG.length));
+	}
+
+	/**
+	 * <b>클라이언트가 끊으면 WARN 한 줄이고 ERROR 가 아니다</b> (sp-docs/conventions.md §6.1 — 클라이언트 쪽
+	 * 사정을 마지막 그물로 보내지 않는다). 스트림은 닫힌다.
+	 *
+	 * <p>끊김은 <b>응답의 출력 스트림이</b> 던진다 — 실 Tomcat 에서 잰 모양 그대로
+	 * {@code AsyncRequestNotUsableException}(원인 {@code ClientAbortException})이다(2026-11-19 B-24 리뷰
+	 * 실측). 출력 스트림을 바꿔 끼우려고 컨트롤러를 직접 부른다. 로그는 루트에서 모은다.
+	 */
+	@Test
+	@DisplayName("내려받는 도중 클라이언트가 끊으면 WARN 한 줄로 끝내고 ERROR 가 없으며 스트림을 닫는다")
+	void 클라이언트가_끊으면_WARN_한_줄이다() throws Exception {
+		CloseRecordingStream stream = new CloseRecordingStream(PNG, Integer.MAX_VALUE);
+		AttachmentController controller = new AttachmentController(서비스_대역(stream));
+		MockHttpServletResponse response = new MockHttpServletResponse() {
+			@Override
+			public ServletOutputStream getOutputStream() {
+				return new DelegatingServletOutputStream(new java.io.OutputStream() {
+					@Override
+					public void write(int b) throws IOException {
+						throw new AsyncRequestNotUsableException("ServletOutputStream failed to write (대역)",
+								new ClientAbortException(new IOException("Connection reset by peer (대역)")));
+					}
+				});
+			}
+		};
+
+		List<ILoggingEvent> 로그 = 루트_로그(() -> controller.download(7L, response));
+
+		assertThat(stream.closed).as("스트림은 닫힌다").isTrue();
+		assertThat(로그).extracting(ILoggingEvent::getLevel).doesNotContain(Level.ERROR);
+		assertThat(로그).filteredOn(e -> e.getLevel() == Level.WARN).as("끊김은 컨트롤러의 WARN 한 줄이다")
+				.singleElement()
+				.satisfies(e -> assertThat(e.getLoggerName()).isEqualTo(AttachmentController.class.getName()));
+	}
+
+	/**
+	 * <b>저장소 읽기 실패는 서버 결함이다 — 응답이 커밋되기 전이면 500 {@code C005} 봉투와 ERROR 다</b>
+	 * (sp-docs/conventions.md §6.1 의 마지막 그물). 써 둔 서빙 헤더는 버려진다 — 봉투에
+	 * {@code Content-Disposition} 이 실리지 않는다. 스트림은 닫힌다.
+	 *
+	 * <p>필터 없이 이 컨트롤러와 {@code GlobalExceptionHandler} 만 세우고, 서비스는 대역이다 — 앞의 4
+	 * 바이트를 준 뒤 읽기에서 {@link IOException} 을 내는 스트림을 돌려준다. 4 바이트는 응답 버퍼 안이라
+	 * 커밋되지 않았다. 커밋 뒤의 읽기 실패(연결이 닫힌다)는 실 컨테이너가 필요해 여기서 보지 않는다.
+	 *
+	 * <p><b>끊김처럼 보이는 읽기 예외도 서버 결함이다</b> — "Connection reset by peer"·"Broken pipe" 메시지와
+	 * {@link EOFException} 은 Spring 의 끊김 판정이 보는 모양이다. 판정을 쓰기에만 걸지 않으면 이 셋이 200 과
+	 * 잘린 본문이 된다(2026-11-19 B-24 3라운드 리뷰 실측). 네트워크 저장소에서는 읽기가 이런 예외를 낸다.
+	 */
+	@ParameterizedTest(name = "{0}")
+	@ValueSource(strings = {"저장소 읽기 실패 (대역)", "Connection reset by peer", "Broken pipe", "EOF"})
+	@DisplayName("커밋 전에 저장소 읽기가 실패하면 — 끊김처럼 보이는 예외여도 — 500 C005 봉투이고 ERROR 를 남기며 스트림을 닫는다")
+	void 읽기_실패는_500_C005_와_ERROR(String 실패) throws Exception {
+		IOException 읽기_예외 = "EOF".equals(실패) ? new EOFException() : new IOException(실패);
+		CloseRecordingStream stream = new CloseRecordingStream(PNG, 4, 읽기_예외, false);
+		MockMvc 필터_없음 = MockMvcBuilders.standaloneSetup(new AttachmentController(서비스_대역(stream)))
+				.setControllerAdvice(new GlobalExceptionHandler())
+				.build();
+		AtomicReference<MockHttpServletResponse> 응답 = new AtomicReference<>();
+
+		List<ILoggingEvent> 로그 = 루트_로그(() -> 응답.set(필터_없음.perform(get(DOWNLOAD_PATH, 7L))
+				.andExpect(status().isInternalServerError())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.error.code").value("C005"))
+				.andReturn().getResponse()));
+
+		assertThat(응답.get().getContentType()).startsWith(MediaType.APPLICATION_JSON_VALUE);
+		assertThat(응답.get().getHeader(HttpHeaders.CONTENT_DISPOSITION)).as("써 둔 서빙 헤더를 버렸다").isNull();
+		assertThat(stream.closed).as("스트림은 닫힌다").isTrue();
+		assertThat(로그).extracting(ILoggingEvent::getLevel).as("서버 결함은 마지막 그물의 ERROR 다")
+				.contains(Level.ERROR);
+	}
+
+	/**
+	 * <b>본문을 다 보낸 뒤 닫기만 실패하면 응답은 그대로 200 이고 WARN 한 줄이다</b> — 바이트는 이미 다
+	 * 나갔다. 닫기를 흘려보내기의 판정에 섞으면 커밋 전의 작은 파일이 reset 되어 500 이 된다(2026-11-19 B-24
+	 * 3라운드 리뷰 실측).
+	 */
+	@Test
+	@DisplayName("본문을 다 보낸 뒤 저장소 스트림 닫기만 실패하면 200 과 온전한 본문이고 ERROR 없이 WARN 한 줄이다")
+	void 닫기_실패는_응답을_바꾸지_않는다() throws Exception {
+		CloseRecordingStream stream = new CloseRecordingStream(PNG, Integer.MAX_VALUE, null, true);
+		MockMvc 필터_없음 = MockMvcBuilders.standaloneSetup(new AttachmentController(서비스_대역(stream)))
+				.setControllerAdvice(new GlobalExceptionHandler())
+				.build();
+		AtomicReference<MockHttpServletResponse> 응답 = new AtomicReference<>();
+
+		List<ILoggingEvent> 로그 = 루트_로그(() -> 응답.set(필터_없음.perform(get(DOWNLOAD_PATH, 7L))
+				.andExpect(status().isOk())
+				.andReturn().getResponse()));
+
+		assertThat(응답.get().getContentAsByteArray()).isEqualTo(PNG);
+		assertThat(stream.closed).as("닫기를 시도했다").isTrue();
+		assertThat(로그).extracting(ILoggingEvent::getLevel).doesNotContain(Level.ERROR);
+		assertThat(로그).filteredOn(e -> e.getLevel() == Level.WARN).as("닫기 실패는 컨트롤러의 WARN 한 줄이다")
+				.singleElement()
+				.satisfies(e -> assertThat(e.getLoggerName()).isEqualTo(AttachmentController.class.getName()));
+	}
+
+	private static AttachmentService 서비스_대역(InputStream stream) {
+		AttachmentService service = Mockito.mock(AttachmentService.class);
+		Mockito.when(service.open(7L)).thenReturn(new AttachmentContent("image/png", "a.png", PNG.length, stream));
+		return service;
+	}
+
+	/** 작업을 돌리는 동안 루트 로거에 닿은 로그를 모은다 — 어느 로거에서 났든 본다. */
+	private static List<ILoggingEvent> 루트_로그(ThrowingRunnable 작업) throws Exception {
+		Logger root = (Logger) LoggerFactory.getLogger(org.slf4j.Logger.ROOT_LOGGER_NAME);
+		ListAppender<ILoggingEvent> appender = new ListAppender<>();
+		appender.start();
+		root.addAppender(appender);
+		try {
+			작업.run();
+			return List.copyOf(appender.list);
+		}
+		finally {
+			root.detachAppender(appender);
+			appender.stop();
+		}
+	}
+
+	/**
+	 * 닫혔는지 기록하는 스트림. 앞의 {@code failAfter} 바이트를 준 뒤 읽기에서 {@code readFailure} 를 내고,
+	 * {@code closeFails} 면 닫기에서 {@link IOException} 을 낸다(닫기를 시도한 것은 기록한다).
+	 */
+	private static final class CloseRecordingStream extends InputStream {
+
+		private final byte[] content;
+
+		private final int failAfter;
+
+		private final IOException readFailure;
+
+		private final boolean closeFails;
+
+		private int pos;
+
+		private volatile boolean closed;
+
+		CloseRecordingStream(byte[] content, int failAfter) {
+			this(content, failAfter, new IOException("저장소 읽기 실패 (대역)"), false);
+		}
+
+		CloseRecordingStream(byte[] content, int failAfter, IOException readFailure, boolean closeFails) {
+			this.content = content;
+			this.failAfter = failAfter;
+			this.readFailure = readFailure;
+			this.closeFails = closeFails;
+		}
+
+		@Override
+		public int read() throws IOException {
+			byte[] one = new byte[1];
+			return read(one, 0, 1) < 0 ? -1 : one[0] & 0xFF;
+		}
+
+		@Override
+		public int read(byte[] b, int off, int len) throws IOException {
+			if (this.pos >= this.failAfter) {
+				throw this.readFailure;
+			}
+			if (this.pos >= this.content.length) {
+				return -1;
+			}
+			int n = Math.min(len, Math.min(this.content.length, this.failAfter) - this.pos);
+			System.arraycopy(this.content, this.pos, b, off, n);
+			this.pos += n;
+			return n;
+		}
+
+		@Override
+		public void close() throws IOException {
+			this.closed = true;
+			if (this.closeFails) {
+				throw new IOException("저장소 스트림 닫기 실패 (대역)");
+			}
+		}
+
+	}
+
+	/**
+	 * B-24 검증 표 <b>「삭제된 첨부 / 지워진 글의 첨부 / 없는 id → 404 {@code AT001} 봉투」</b>
+	 * (sp-docs/domain-model.md §4.6 — 첨부와 글이 둘 다 활성일 때만 파일을 준다).
+	 *
+	 * <p>앞의 둘은 저장소에 파일이 <b>있는</b> 행이다 — 404 가 파일이 없어서 난 것이 아니다.
+	 */
+	@Test
+	@DisplayName("지운 첨부, 지워진 글의 첨부, 없는 id 의 내려받기는 모두 404 AT001 봉투다")
+	void 내려받을_수_없는_첨부는_AT001() throws Exception {
+		Post post = 게시글을_만든다(1476L);
+		long 지운_첨부 = 첨부_행을_둔다(post, "a.png", true, true);
+		Post 지워진_글 = 게시글을_만든다(1476L);
+		long 지워진_글의_첨부 = 첨부_행을_둔다(지워진_글, "b.png", false, true);
+		지운다(지워진_글);
+
+		for (long id : new long[] {지운_첨부, 지워진_글의_첨부, 없는_첨부}) {
+			내려받기는_AT001_봉투다(id);
+		}
+		assertThat(저장된_파일()).as("파일은 남아 있다").hasSize(2);
+	}
+
+	/** B-24 검증 표 <b>「행은 있는데 파일이 없다 → 404 {@code AT001}, WARN」</b> (sp-docs/api-contract.md §4.7). */
+	@Test
+	@DisplayName("행은 있는데 저장소에 파일이 없으면 404 AT001 이고 WARN 을 남긴다")
+	void 파일이_없는_첨부는_AT001_과_WARN() throws Exception {
+		Post post = 게시글을_만든다(1477L);
+		long id = 첨부_행을_둔다(post, "a.png", false, false);
+
+		List<ILoggingEvent> 로그 = 서비스_로그(() -> 내려받기는_AT001_봉투다(id));
+
+		assertThat(로그).extracting(ILoggingEvent::getLevel).containsExactly(Level.WARN);
+	}
+
+	/**
+	 * B-24 검증 표 <b>「따옴표·줄바꿈·한글이 든 원본 파일명 → {@code filename*=UTF-8''…} 로만 실리고 헤더가
+	 * 깨지지 않는다」</b> (sp-docs/security.md §8).
+	 *
+	 * <p>올리기는 제어 문자를 버리므로 줄바꿈이 든 파일명은 행으로 직접 둔다 — 서빙이 올리기의 정리에
+	 * 기대지 않는지 본다. 기대값은 UTF-8 바이트의 퍼센트 인코딩을 리터럴로 적었다 — 「사」 EC 82 AC,
+	 * 「진」 EC A7 84, 공백 20, 따옴표 22, CR 0D, LF 0A, 쌍점 3A, 세미콜론 3B, 퍼센트 25, 작은따옴표 27,
+	 * 별표 2A. 마지막 셋은 RFC 5987 의 {@code attr-char} 가 아니다 — {@code %} 는 인코딩의 시작이고
+	 * {@code '}·{@code *} 는 {@code filename*=UTF-8''} 의 구분 기호다.
+	 */
+	@Test
+	@DisplayName("따옴표·줄바꿈·한글·%'* 가 든 파일명은 filename*=UTF-8'' 퍼센트 인코딩으로만 실린다")
+	void 파일명은_퍼센트_인코딩으로만_싣는다() throws Exception {
+		Post post = 게시글을_만든다(1478L);
+		long id = 첨부_행을_둔다(post, "사진 \"a\";\r\nX-Evil: 1%'*.png", false, true);
+
+		MockHttpServletResponse response = this.mockMvc.perform(get(DOWNLOAD_PATH, id))
+				.andExpect(status().isOk())
+				.andReturn().getResponse();
+
+		assertThat(response.getHeaders(HttpHeaders.CONTENT_DISPOSITION)).containsExactly(
+				"inline; filename*=UTF-8''%EC%82%AC%EC%A7%84%20%22a%22%3B%0D%0AX-Evil%3A%201%25%27%2A.png");
+		assertThat(response.getHeaderNames()).doesNotContain("X-Evil");
+	}
+
+	// --- 지우기 (B-24, sp-docs/api-contract.md §4.7, sp-docs/domain-model.md §6.2) ---
+
+	/**
+	 * B-24 검증 표 <b>「지우기 → 204, {@code attachment_count} −1, 파일이 남는다, 내려받기 404
+	 * {@code AT001}」</b>와 <b>「프로필 없는 계정이 자기 글의 첨부를 지우기 → 204, {@code MemberClient}
+	 * 호출 0회」</b> — 이 클래스의 member 스텁은 언제나 프로필 미등록이라고 답한다.
+	 */
+	@Test
+	@DisplayName("자기 글의 첨부를 지우면 204, 집계 -1, 파일은 남고 내려받기는 404 AT001, member 호출 0회")
+	void 지우기는_204_이고_파일은_남는다() throws Exception {
+		Post post = 게시글을_만든다(1479L);
+		long 지울_첨부 = idOf(올린다(post.getId(), 1479L, USER, 파일("a.png", "image/png", PNG))
+				.andExpect(status().isCreated()).andReturn());
+		올린다(post.getId(), 1479L, USER, 파일("b.png", "image/png", PNG)).andExpect(status().isCreated());
+		REQUEST_COUNT.set(0);
+
+		지운다(지울_첨부, 1479L, USER)
+				.andExpect(status().isNoContent())
+				.andExpect(content().string(""));
+
+		assertThat(커밋된_집계(post)).isEqualTo(1);
+		assertThat(활성_첨부_수(post)).isEqualTo(1);
+		assertThat(저장된_파일()).as("파일은 지우지 않는다 (sp-docs/requirements/board.md §11)").hasSize(2);
+		assertThat(REQUEST_COUNT.get()).as("지우기는 member 를 부르지 않는다").isZero();
+		내려받기는_AT001_봉투다(지울_첨부);
+	}
+
+	/**
+	 * <b>지워진 글의 활성 첨부를 작성자가 지우면 204 이고 집계가 준다.</b> 지우기의 판정은 없는 첨부(404
+	 * {@code AT001}) → 작성자인가(403 {@code P002}) 뿐이고 글의 삭제 여부를 보지 않는다
+	 * (sp-docs/requirements/board.md §11 의 판정 순서). 글이 지워졌다고 {@code AT001} 로 막는 변이를 고정한다.
+	 *
+	 * <p><b>정본이 정하지 않은 경우를 지금 정본대로 고정한 것이다 — 정본이 정해지면 다시 볼 자리다.</b>
+	 * sp-docs/plan/phase2-board.md §4.3 「정본 개정으로 넘기는 것」 이 이 질문을 열어 두었다: 「지워진 글의
+	 * 활성 첨부를 지울 때의 결과. 404 {@code AT001} 로 정한 것은 없는·이미 지운 첨부뿐이고 (…)
+	 * sp-docs/domain-model.md §6.2 의 삭제 흐름은 글이 지워졌는지 보지 않는다. B-24 의 검증표는 이 경우를
+	 * 단언하지 않는다」. 지금의 §6.2·§11 판정 순서를 따르면 204 이다.
+	 */
+	@Test
+	@DisplayName("지워진 글의 활성 첨부를 작성자가 지우면 204 이고 집계가 1 준다")
+	void 지워진_글의_활성_첨부도_지운다() throws Exception {
+		Post post = 게시글을_만든다(1489L);
+		long id = 첨부_행을_둔다(post, "a.png", false, true);
+		집계를_맞춘다(post, 1);
+		지운다(post);
+
+		지운다(id, 1489L, USER).andExpect(status().isNoContent());
+
+		assertThat(커밋된_집계(post)).isZero();
+		assertThat(활성_첨부_수(post)).isZero();
+		assertThat(저장된_파일()).as("파일은 지우지 않는다").hasSize(1);
+	}
+
+	/** B-24 검증 표 <b>「상한이던 글에서 하나를 지운 뒤 올리기 → 201」</b> — 지우기가 집계를 줄였다. */
+	@Test
+	@DisplayName("활성 첨부가 10개인 글에서 하나를 지우면 다시 올릴 수 있다")
+	void 상한에서_하나_지우면_올린다() throws Exception {
+		Post post = 게시글을_만든다(1480L);
+		첨부를_둔다(post, 상한);
+		long 활성_하나 = this.jdbcTemplate.queryForObject(
+				"SELECT MIN(id) FROM attachment WHERE post_id = ? AND deleted = FALSE", Long.class, post.getId());
+
+		지운다(활성_하나, 1480L, USER).andExpect(status().isNoContent());
+		올린다(post.getId(), 1480L, USER, 파일("a.png", "image/png", PNG)).andExpect(status().isCreated());
+
+		assertThat(커밋된_집계(post)).isEqualTo(상한);
+		assertThat(활성_첨부_수(post)).isEqualTo(상한);
+	}
+
+	/**
+	 * B-24 검증 표 <b>「집계가 0 인데 활성 첨부를 지우기 → 204, 집계 0, WARN」</b> (sp-docs/domain-model.md
+	 * §6.2 — 어긋난 상태는 WARN 으로 드러내고 집계를 음수로 내리지 않는다).
+	 */
+	@Test
+	@DisplayName("집계가 0 인 글의 활성 첨부를 지우면 204 이고 집계는 0 그대로이며 WARN 을 남긴다")
+	void 집계가_0_이면_204_와_WARN() throws Exception {
+		Post post = 게시글을_만든다(1481L);
+		long id = 첨부_행을_둔다(post, "a.png", false, false);
+
+		List<ILoggingEvent> 로그 = 서비스_로그(() -> 지운다(id, 1481L, USER).andExpect(status().isNoContent()));
+
+		assertThat(로그).extracting(ILoggingEvent::getLevel).containsExactly(Level.WARN);
+		assertThat(커밋된_집계(post)).isZero();
+		assertThat(활성_첨부_수(post)).isZero();
+	}
+
+	/** B-24 검증 표 <b>「남의 글의 첨부 (USER·ADMIN) → 403 {@code P002}」</b>. 아무것도 바뀌지 않는다. */
+	@ParameterizedTest(name = "{0}")
+	@ValueSource(strings = {USER, ADMIN})
+	@DisplayName("남의 글의 첨부를 지우면 USER 도 ADMIN 도 403 P002 이고 첨부와 집계가 그대로다")
+	void 남의_글의_첨부는_P002(String role) throws Exception {
+		Post post = 게시글을_만든다(1482L);
+		long id = 첨부_행을_둔다(post, "a.png", false, true);
+		집계를_맞춘다(post, 1);
+
+		지운다(id, 1483L, role)
+				.andExpect(status().isForbidden())
+				.andExpect(jsonPath("$.error.code").value("P002"));
+
+		assertThat(커밋된_집계(post)).isEqualTo(1);
+		assertThat(활성_첨부_수(post)).isEqualTo(1);
+	}
+
+	/**
+	 * B-24 검증 표 <b>「이미 지운 첨부를 지우기, 그 글도 지워졌다 → 404 {@code AT001} ({@code P001}
+	 * 아님)」</b>, <b>「남의 글의 이미 지운 첨부를 지우기 → 404 {@code AT001} ({@code P002} 아님 —
+	 * 순서)」</b>, 그리고 없는 id. 선후는 행이 남은 지운 첨부에서만 관측된다 (sp-docs/api-contract.md §4.4
+	 * 의 블록인용).
+	 */
+	@Test
+	@DisplayName("이미 지운 첨부는 글이 지워졌어도, 남의 글이어도 404 AT001 이다 — 없는 id 도 같다")
+	void 이미_지운_첨부는_AT001() throws Exception {
+		Post 지워진_글 = 게시글을_만든다(1484L);
+		long 지워진_글의_지운_첨부 = 첨부_행을_둔다(지워진_글, "a.png", true, false);
+		지운다(지워진_글);
+		Post 남의_글 = 게시글을_만든다(1485L);
+		long 남의_지운_첨부 = 첨부_행을_둔다(남의_글, "b.png", true, false);
+
+		지운다(지워진_글의_지운_첨부, 1484L, USER)
+				.andExpect(status().isNotFound())
+				.andExpect(jsonPath("$.error.code").value("AT001"));
+		지운다(남의_지운_첨부, 1486L, USER)
+				.andExpect(status().isNotFound())
+				.andExpect(jsonPath("$.error.code").value("AT001"));
+		지운다(없는_첨부, 1486L, USER)
+				.andExpect(status().isNotFound())
+				.andExpect(jsonPath("$.error.code").value("AT001"));
+	}
+
+	/**
+	 * B-24 검증 표 <b>「claim 이 계약 밖인 토큰으로 지우기 → 401 {@code A002}」</b> — 올리기의 같은 줄과
+	 * 같은 방식이다. 서명이 유효하므로 필터 체인은 통과하고 {@code @CurrentMember} 리졸버가 끊는다.
+	 */
+	@Test
+	@DisplayName("role 이 열거 밖인 토큰으로 지우면 리졸버가 401 A002 로 끊고 첨부가 그대로다")
+	void 열거_밖_role_로_지우면_A002() throws Exception {
+		Post post = 게시글을_만든다(1487L);
+		long id = 첨부_행을_둔다(post, "a.png", false, false);
+		집계를_맞춘다(post, 1);
+
+		MvcResult result = 지운다(id, 1487L, "BOGUS")
+				.andExpect(status().isUnauthorized())
+				.andExpect(jsonPath("$.error.code").value("A002"))
+				.andReturn();
+
+		assertThat(result.getHandler())
+				.as("서명이 유효한 토큰은 필터 체인을 통과한다 — 집행 지점은 리졸버다").isNotNull();
+		assertThat(result.getResolvedException()).isInstanceOf(BusinessException.class);
+		assertThat(커밋된_집계(post)).isEqualTo(1);
+		assertThat(활성_첨부_수(post)).isEqualTo(1);
+	}
+
 	// --- 도구 ---
+
+	private ResultActions 지운다(long attachmentId, long accountId, String role) throws Exception {
+		return this.mockMvc.perform(delete(DOWNLOAD_PATH, attachmentId)
+				.header(HttpHeaders.AUTHORIZATION, bearer(accountId, role)));
+	}
+
+	/** 비로그인 내려받기가 404 {@code AT001} 봉투다 — 서빙 헤더가 실리지 않는다. */
+	private void 내려받기는_AT001_봉투다(long attachmentId) throws Exception {
+		MockHttpServletResponse response = this.mockMvc.perform(get(DOWNLOAD_PATH, attachmentId))
+				.andExpect(status().isNotFound())
+				.andExpect(jsonPath("$.success").value(false))
+				.andExpect(jsonPath("$.error.code").value("AT001"))
+				.andReturn().getResponse();
+		assertThat(response.getContentType()).startsWith(MediaType.APPLICATION_JSON_VALUE);
+		assertThat(response.getHeader(HttpHeaders.CONTENT_DISPOSITION)).isNull();
+	}
+
+	/**
+	 * 첨부 행 하나를 이 API 를 거치지 않고 둔다 — 집계는 건드리지 않는다. {@code withFile} 이면 그 행의
+	 * 저장 이름으로 저장 루트에 PNG 바이트를 쓴다. 원본 파일명은 올리기의 정리를 거치지 않은 값 그대로다.
+	 */
+	private long 첨부_행을_둔다(Post post, String originalFilename, boolean deleted, boolean withFile)
+			throws IOException {
+		String storageKey = UUID.randomUUID().toString();
+		if (withFile) {
+			Files.write(storageRoot.resolve(storageKey), PNG);
+		}
+		this.jdbcTemplate.update("INSERT INTO attachment (post_id, storage_key, original_filename, "
+						+ "content_type, size, deleted, created_at, updated_at) "
+						+ "VALUES (?, ?, ?, 'image/png', ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)",
+				post.getId(), storageKey, originalFilename, PNG.length, deleted);
+		return this.jdbcTemplate.queryForObject(
+				"SELECT id FROM attachment WHERE storage_key = ?", Long.class, storageKey);
+	}
+
+	private void 집계를_맞춘다(Post post, int count) {
+		int updated = this.jdbcTemplate.update(
+				"UPDATE post SET attachment_count = ? WHERE id = ?", count, post.getId());
+		if (updated != 1) {
+			throw new IllegalStateException("attachment_count 픽스처가 1 행이 아니다: " + updated);
+		}
+	}
+
+	/** 작업을 돌리는 동안 {@link AttachmentService} 가 남긴 로그를 모은다. */
+	private static List<ILoggingEvent> 서비스_로그(ThrowingRunnable 작업) throws Exception {
+		Logger logger = (Logger) LoggerFactory.getLogger(AttachmentService.class);
+		ListAppender<ILoggingEvent> appender = new ListAppender<>();
+		appender.start();
+		Level original = logger.getLevel();
+		// 수집 결과가 주변 설정에 좌우되지 않게 수준을 이 안에서 정한다
+		logger.setLevel(Level.TRACE);
+		logger.addAppender(appender);
+		try {
+			작업.run();
+			return List.copyOf(appender.list);
+		}
+		finally {
+			logger.detachAppender(appender);
+			logger.setLevel(original);
+			appender.stop();
+		}
+	}
+
+	@FunctionalInterface
+	private interface ThrowingRunnable {
+
+		void run() throws Exception;
+
+	}
 
 	private ResultActions 올린다(long postId, long accountId, String role, MockMultipartFile file)
 			throws Exception {

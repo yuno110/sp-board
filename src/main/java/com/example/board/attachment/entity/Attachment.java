@@ -28,8 +28,8 @@ import lombok.NoArgsConstructor;
  * 폭과 대조한다 (§4.6, sp-docs/tech-stack.md §5.2).
  *
  * <p>첨부 삭제는 {@code deleted} 를 조건부 UPDATE 로 바꾼다 — 그 전환의 영향 행 수가 동시 삭제의
- * 최종 판정이기 때문이다 (sp-docs/domain-model.md §6.2). 그 문장은 그 경로를 만드는 기능 항목이
- * 더한다.
+ * 최종 판정이기 때문이다 (sp-docs/domain-model.md §6.2). 그 문장은
+ * {@code AttachmentRepository.softDeleteIfActive} 다 — 엔티티에 삭제 메서드를 두지 않는다.
  *
  * <p>{@code @Setter}·{@code @Data} 를 두지 않는다 (sp-docs/conventions.md §2).
  */
