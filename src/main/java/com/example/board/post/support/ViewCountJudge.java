@@ -147,8 +147,10 @@ public class ViewCountJudge {
 	 *
 	 * <p>{@code saveAndFlush} 다 — INSERT 가 이 {@code try} 안에서 나가야 충돌을 여기서 받는다.
 	 *
-	 * <p>충돌은 Hibernate 의 SQL 오류 로그를 남긴다 — 그 로그 수준은 실 MySQL 측정 대상이고 이 격리
-	 * 수준 뒤에 I-11 이 잰다 (sp-docs/requirements/board.md §9.3 의 블록인용).
+	 * <p>충돌마다 Hibernate 의 {@code SqlExceptionHelper} 가 WARN {@code SQL Error: …} 와 위반 메시지의
+	 * ERROR 를 남긴다 (2026-11-20 I-11 실측). ERROR 줄은 {@code logback-spring.xml} 의
+	 * {@link com.example.board.global.config.ExpectedUniqueConflictLogFilter} 가 버리고 WARN 줄이 충돌의
+	 * 흔적으로 남는다 (sp-docs/conventions.md §8.1). 이 메서드는 로그를 더하지 않는다.
 	 */
 	private boolean insertView(Long postId, String viewerKey, LocalDateTime now) {
 		try {

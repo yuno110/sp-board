@@ -185,11 +185,11 @@ public class LikeService {
 	 * 회원당 한 번의 최종 판정은 {@code uk_post_like_post_account} 다 (§6.1, §4.4). 그래서 충돌을
 	 * 500 으로 만들지 않는다.
 	 *
-	 * <p><b>그래도 그 충돌은 ERROR 로그를 남긴다</b> (B-20 실측 — H2 에서 Hibernate 의
-	 * {@code SqlExceptionHelper} 가 SQL 상태를 WARN 으로, 위반 메시지를 ERROR 로 남겼다).
-	 * sp-docs/plan/phase2-board.md §4.1 이 이 로그 수준을 실 MySQL 측정 대상으로 넘기며 ERROR 면
-	 * sp-docs/conventions.md §6.1 과 어긋난다고 적었다. 그 로거는 이 충돌만의 것이 아니라 Hibernate 가
-	 * 변환하는 SQL 오류를 남기는 자리이므로(코드 읽기) 수준을 바꾸는 결정은 이 메서드가 하지 않는다.
+	 * <p><b>그 충돌의 ERROR 줄은 설정이 버린다</b> (sp-docs/conventions.md §8.1). Hibernate 의
+	 * {@code SqlExceptionHelper} 가 SQL 상태를 WARN 으로, 위반 메시지를 ERROR 로 남긴다 (B-20 의 H2
+	 * 실측). {@code logback-spring.xml} 의
+	 * {@link com.example.board.global.config.ExpectedUniqueConflictLogFilter} 가 이 제약의 ERROR 줄만
+	 * 버리고, WARN 줄이 충돌의 흔적으로 남는다. 로거의 수준은 바꾸지 않고 이 메서드는 로그를 더하지 않는다.
 	 *
 	 * <p><b>충돌한 트랜잭션은 이미 rollback-only 다.</b> 리포지터리의 트랜잭션 어드바이스가 참여한
 	 * 트랜잭션에서 예외를 보고 전체를 그렇게 표시한다. 부르는 쪽이 이 결과를 보고

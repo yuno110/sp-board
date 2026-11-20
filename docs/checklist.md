@@ -79,12 +79,14 @@
 - [x] B-23 첨부 올리기와 저장소 — P-10 · 상태 done · 커밋 89eb27b
 - [x] B-24 첨부 내려받기·지우기와 상세의 첨부 목록 — P-10 · 상태 done · 커밋 dcbd40e · 리뷰 3라운드
 - [x] B-25 조회수 판정 트랜잭션을 READ COMMITTED 로 · 상태 done · 커밋 cadc7a9 · 리뷰 1라운드
+- [x] B-26 정상 경합의 UNIQUE 충돌이 남기는 Hibernate ERROR 를 버린다 · 상태 done · 커밋 -
 - [x] I-06 2차 세 서비스와 Mailpit 의 기동 통합 · 상태 done · 커밋 41b7676 · 리뷰 1라운드
 - [x] I-07 board 의 실 MySQL 동시성과 격리 수준 · 상태 done · 커밋 7dab3bd · 리뷰 1라운드 · 결함 1(조회수 첫 조회 교착)
 - [ ] I-08 auth·member 의 실 MySQL 동시성과 콜레이션 · 상태 todo · 커밋 -
 - [ ] I-09 실서버에서만 보이는 동작 — multipart 한도·주소 처리·응답 시간 · 상태 todo · 커밋 -
 - [ ] I-10 2차 응답의 서비스 간 비교와 I-04 문장의 시점 · 상태 todo · 커밋 -
-- [x] I-11 B-25 뒤 조회수 판정의 실 MySQL 재측정 · 상태 done · 커밋 - · 리뷰 1라운드 · 후속 1(UNIQUE 충돌의 Hibernate ERROR 로그)
+- [x] I-11 B-25 뒤 조회수 판정의 실 MySQL 재측정 · 상태 done · 커밋 7105f09 · 리뷰 1라운드 · 후속 1(UNIQUE 충돌의 Hibernate ERROR 로그)
+- [ ] I-12 B-26 뒤 UNIQUE 충돌 로그의 실 MySQL 재측정 · 상태 todo · 커밋 -
 
 ## 선행 조건
 
