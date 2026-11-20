@@ -30,6 +30,7 @@ import java.util.UUID;
 import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.ExecutionException;
@@ -235,6 +236,35 @@ class AttachmentServiceTest {
 	}
 
 	/**
+	 * B-25 검증 표 <b>「첨부 올리기의 발행 순서 — {@code update post} 가 {@code insert into attachment}
+	 * 보다 먼저다」</b> (sp-docs/domain-model.md §6.2 의 1)·2)). 1) 이 {@code post} 행의 배타 락을 먼저
+	 * 잡아야 2) 의 FK 공유 락과 교착하지 않는다 — 2026-11-19 I-07 의 두 연결 프로브에서 순서를 뒤집으면
+	 * 실 MySQL 이 5/5 교착했다. H2 는 그 교착을 재현하지 않으므로 결과가 아니라 발행된 문장의 순서를
+	 * 본다 — 순서를 뒤집은 변이가 B-23 의 테스트를 모두 통과했던 빈틈이다.
+	 *
+	 * <p>두 쓰기는 한 트랜잭션의 문장이고 테스트 스레드에서 나간다. 판정의 글 읽기(SELECT)는 셈하지
+	 * 않는다.
+	 */
+	@Test
+	@DisplayName("올리기는 update post(attachment_count) 를 insert into attachment 보다 먼저 발행한다")
+	void 올리기는_집계_UPDATE_를_INSERT_보다_먼저_발행한다() throws Exception {
+		Post post = 게시글을_만든다(1406L);
+		PostUpdateBarrier.기록한다();
+
+		this.attachmentService.upload(post.getId(), 1406L, 파일());
+
+		assertThat(PostUpdateBarrier.기록된_문장().stream()
+				.filter(sql -> sql.startsWith("update post ") || sql.startsWith("insert into attachment "))
+				.map(sql -> sql.startsWith("update post ") ? "update post" : "insert into attachment")
+				.toList())
+				.as("sp-docs/domain-model.md §6.2 — 집계의 조건부 UPDATE 가 먼저, INSERT 가 뒤다")
+				.containsExactly("update post", "insert into attachment");
+		assertThat(PostUpdateBarrier.기록된_문장())
+				.as("집계 UPDATE 는 attachment_count 를 올리는 문장이다")
+				.anyMatch(sql -> sql.startsWith("update post ") && sql.contains("attachment_count"));
+	}
+
+	/**
 	 * B-24 검증 표 <b>「같은 첨부의 동시 지우기 N건 — 판정 읽기가 어느 쓰기보다 먼저 일어나게 강제한다 →
 	 * 성공 1, 나머지 404 {@code AT001}, {@code attachment_count} 가 1 만 준다」</b>
 	 * (sp-docs/domain-model.md §6.2 — 첨부의 조건부 전환이 최종 판정이다).
@@ -388,7 +418,8 @@ class AttachmentServiceTest {
 	}
 
 	/**
-	 * {@code update post …} 가 발행되기 직전에 훅을 돌리는 Hibernate {@link StatementInspector}.
+	 * {@code update post …} 가 발행되기 직전에 훅을 돌리는 Hibernate {@link StatementInspector}. 한
+	 * 스레드의 문장을 순서대로 모으기도 한다({@link #기록한다}, B-25 의 발행 순서 테스트).
 	 * {@code @DynamicPropertySource} 가 클래스 이름으로 꽂고 Hibernate 가 인스턴스를 만들므로 훅은 정적
 	 * 필드다.
 	 *
@@ -404,6 +435,24 @@ class AttachmentServiceTest {
 
 		private static final Set<String> 통과한_스레드 = ConcurrentHashMap.newKeySet();
 
+		/** {@link #기록한다} 를 부른 스레드. 훅과 별개로 그 스레드의 문장만 모은다. */
+		private static volatile Thread 기록할_스레드;
+
+		private static final List<String> 기록 = new CopyOnWriteArrayList<>();
+
+		/**
+		 * 부르는 스레드가 내는 문장을 모으기 시작한다 — 훅을 걸지 않는다. Hibernate 에는 inspector 를
+		 * 하나만 꽂을 수 있어 이 클래스가 두 역할을 한다 (B-25).
+		 */
+		static void 기록한다() {
+			기록.clear();
+			기록할_스레드 = Thread.currentThread();
+		}
+
+		static List<String> 기록된_문장() {
+			return List.copyOf(기록);
+		}
+
 		static void 건다(Runnable 걸_훅) {
 			통과한_스레드.clear();
 			훅 = 걸_훅;
@@ -412,6 +461,8 @@ class AttachmentServiceTest {
 		static void 푼다() {
 			훅 = null;
 			통과한_스레드.clear();
+			기록할_스레드 = null;
+			기록.clear();
 		}
 
 		static int 통과한_스레드_수() {
@@ -420,6 +471,9 @@ class AttachmentServiceTest {
 
 		@Override
 		public String inspect(String sql) {
+			if (Thread.currentThread() == 기록할_스레드) {
+				기록.add(sql.toLowerCase(Locale.ROOT).replaceAll("\\s+", " ").trim());
+			}
 			Runnable 지금_훅 = 훅;
 			String 스레드 = Thread.currentThread().getName();
 			if (지금_훅 != null && 스레드.startsWith(스레드_접두어)

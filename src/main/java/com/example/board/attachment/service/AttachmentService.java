@@ -237,9 +237,9 @@ public class AttachmentService {
 	 *
 	 * <p>1) 이 {@code post} 행의 배타 락을 먼저 잡으므로 2) 의 FK 공유 락과 교착하지 않는다 (§6.2 —
 	 * §6.1 과 같은 이유). 글은 다시 읽지 않고 참조만 건다 — INSERT 에 필요한 것은 {@code post_id} 다.
-	 * <b>이 순서를 고정하는 테스트는 없다</b> — INSERT 를 UPDATE 앞으로 옮긴 변이가 attachment 테스트를
-	 * 모두 통과했다(2026-11-18 B-23 리뷰 실측). H2 로는 MySQL 의 FK 공유 락 교착을 볼 수 없어서다 —
-	 * 실 MySQL 의 측정은 I-07 이다.
+	 * <b>이 순서는 발행된 문장의 순서로 고정한다</b> — {@code AttachmentServiceTest} 의 발행 순서 테스트
+	 * (B-25). H2 로는 MySQL 의 FK 공유 락 교착을 볼 수 없어 결과가 아니라 순서를 본다. 2026-11-19 I-07 의
+	 * 두 연결 프로브에서 이 순서를 뒤집으면 실 MySQL 이 5/5 교착했다(지금 순서 0/5).
 	 *
 	 * <p>{@code saveAndFlush} 다 — INSERT 가 이 트랜잭션의 커밋 전에, 이 메서드 안에서 나간다.
 	 */

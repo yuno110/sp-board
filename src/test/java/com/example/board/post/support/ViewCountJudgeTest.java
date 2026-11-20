@@ -7,6 +7,7 @@ import com.example.board.post.dto.PostDetailResponse;
 import com.example.board.post.entity.Post;
 import com.example.board.post.repository.PostRepository;
 import com.example.board.post.service.PostService;
+import java.sql.Connection;
 import java.time.LocalDateTime;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
@@ -30,6 +31,7 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.context.ContextConfiguration;
 import org.springframework.transaction.TransactionExecution;
 import org.springframework.transaction.TransactionExecutionListener;
+import org.springframework.transaction.support.TransactionSynchronizationManager;
 
 /**
  * sp-docs/plan/phase2-board.md B-21 의 완료 기준 중 판정의 순서·창의 경계·트랜잭션을 본다. HTTP 쪽
@@ -233,7 +235,78 @@ class ViewCountJudgeTest {
 		assertThat(detail.viewCount()).isEqualTo(1L);
 	}
 
+	/**
+	 * <b>판정 트랜잭션은 READ COMMITTED 로 선언된다</b> (sp-docs/requirements/board.md §9.3 의 표,
+	 * sp-docs/domain-model.md §4.5 — 2026-11-20 {@code D-24}). 판정의 네 문장이 모두 그 선언 안에서
+	 * 나간다 — 리포지터리의 트랜잭션은 판정 트랜잭션에 참여하므로 선언이 그대로 보인다.
+	 *
+	 * <p><b>효과가 아니라 설정을 본다.</b> H2 테스트 연결의 기본이 이미 READ COMMITTED 라 연결의 격리
+	 * 수준이나 동시 조회의 결과를 보는 단언은 설정을 뺀 변이에서도 통과한다
+	 * (sp-docs/process/review-policy.md §4.1). 그래서 문장마다 그 순간 트랜잭션 매니저가 선언한 격리
+	 * 수준({@code TransactionSynchronizationManager})을 기록하고 그것을 단언한다. 그 선언이 실제
+	 * 연결에 닿는 경로는 코드 읽기로 확인했다 — {@link ViewCountJudge} 의 클래스 주석.
+	 *
+	 * <p>기대값은 {@link Connection#TRANSACTION_READ_COMMITTED} 다 — 판정이 쓰는 상수를 가져다 쓰지
+	 * 않는다.
+	 */
+	@Test
+	@DisplayName("판정의 네 문장은 모두 READ COMMITTED 로 선언된 트랜잭션 안에서 나간다")
+	void 판정_트랜잭션은_READ_COMMITTED_로_선언된다() {
+		Post post = 게시글을_만든다(1289L);
+		기록을_시작한다();
+
+		this.viewCountJudge.judge(post.getId(), "a:1290", 판정_시각);
+
+		List<선언> 선언들 = this.수집기.선언된_격리();
+		assertThat(선언들).extracting(선언 -> 종류(선언.sql()))
+				.as("판정의 네 문장이 기록됐다 — 비었으면 수집기가 꽂히지 않았다")
+				.containsExactly("조건부 UPDATE", "존재 확인", "INSERT", "+1");
+		assertThat(선언들).allSatisfy(선언 -> assertThat(선언.격리())
+				.as("판정 트랜잭션에 선언된 격리 수준 — %s", 선언.sql())
+				.isEqualTo(Connection.TRANSACTION_READ_COMMITTED));
+	}
+
+	/**
+	 * <b>판정 밖의 트랜잭션은 격리 수준을 선언하지 않는다</b> — 상세의 404 확인과 응답의 읽기는 서버
+	 * 기본 그대로다 (sp-docs/requirements/board.md §9.3 의 표 「판정 트랜잭션에만 건다」). 판정의
+	 * 문장은 READ COMMITTED 이고 그 밖의 문장은 선언이 없다({@code null}).
+	 *
+	 * <p>격리 수준을 서비스 전체나 상세의 읽기에 거는 변이를 잡는다. 같은 요청의 연결이 판정 뒤
+	 * 원래 격리로 돌아오는 것은 이 테스트가 아니라 코드 읽기가 맡는다 — H2 에서는 원래 격리가 이미
+	 * READ COMMITTED 라 관측되지 않는다.
+	 */
+	@Test
+	@DisplayName("상세 조회의 판정 밖 트랜잭션(404 확인·응답 읽기)은 격리 수준을 선언하지 않는다")
+	void 상세_읽기는_격리_수준을_선언하지_않는다() {
+		Post post = 게시글을_만든다(1291L);
+		기록을_시작한다();
+
+		this.postService.getDetail(post.getId(), null, "192.0.2.2");
+
+		List<선언> 선언들 = this.수집기.선언된_격리();
+		List<String> 판정_종류 = List.of("조건부 UPDATE", "존재 확인", "INSERT", "+1");
+		List<선언> 판정 = 선언들.stream().filter(선언 -> 판정_종류.contains(종류(선언.sql()))).toList();
+		List<선언> 판정_밖 = 선언들.stream().filter(선언 -> !판정_종류.contains(종류(선언.sql()))).toList();
+		assertThat(판정).extracting(선언 -> 종류(선언.sql()))
+				.containsExactly("조건부 UPDATE", "존재 확인", "INSERT", "+1");
+		assertThat(판정).allSatisfy(선언 -> assertThat(선언.격리())
+				.isEqualTo(Connection.TRANSACTION_READ_COMMITTED));
+		assertThat(판정_밖)
+				.as("404 확인과 응답의 읽기가 기록됐다")
+				.anyMatch(선언 -> 선언.sql().startsWith("select ") && 선언.sql().contains(" from post ")
+						&& 선언.sql().contains("view_count"))
+				.allSatisfy(선언 -> assertThat(선언.격리())
+						.as("판정 밖 트랜잭션은 격리 수준을 선언하지 않는다 — %s", 선언.sql())
+						.isNull());
+		assertThat(선언들.indexOf(판정_밖.get(0)))
+				.as("404 확인이 판정보다 먼저다").isLessThan(선언들.indexOf(판정.get(0)));
+	}
+
 	// --- 헬퍼 ---
+
+	/** 문장 하나와 그 순간 선언된 격리 수준. 선언이 없으면 {@code 격리} 가 {@code null} 이다. */
+	record 선언(String sql, @Nullable Integer 격리) {
+	}
 
 	/** 테스트 스레드의 문장과 물리 트랜잭션의 시작·끝을 기록하기 시작한다. */
 	private void 기록을_시작한다() {
@@ -353,12 +426,23 @@ class ViewCountJudgeTest {
 
 		private final List<String> 기록 = new CopyOnWriteArrayList<>();
 
+		/** 문장마다 그 순간 선언된 격리 수준. 경계 표시는 넣지 않는다. */
+		private final List<선언> 격리_기록 = new CopyOnWriteArrayList<>();
+
 		private volatile Thread 기록할_스레드;
 
+		/**
+		 * 문장을 기록하고, 같은 스레드에서 그 순간 트랜잭션 매니저가 선언한 격리 수준도 남긴다 — 선언이
+		 * 없으면 {@code null} 이다. 매니저가 새 트랜잭션을 열 때 그 정의의 격리 수준을 스레드에 묶고,
+		 * 참여한 트랜잭션은 그 값을 그대로 둔다.
+		 */
 		@Override
 		public String inspect(String sql) {
 			if (Thread.currentThread() == this.기록할_스레드) {
-				this.기록.add(정규화(sql));
+				String 정규화된 = 정규화(sql);
+				this.기록.add(정규화된);
+				this.격리_기록.add(new 선언(정규화된,
+						TransactionSynchronizationManager.getCurrentTransactionIsolationLevel()));
 			}
 			return sql;
 		}
@@ -366,16 +450,22 @@ class ViewCountJudgeTest {
 		/** 부르는 스레드의 문장만 기록하기 시작한다. 앞의 기록은 버린다. */
 		void 시작한다() {
 			this.기록.clear();
+			this.격리_기록.clear();
 			this.기록할_스레드 = Thread.currentThread();
 		}
 
 		void 멈춘다() {
 			this.기록할_스레드 = null;
 			this.기록.clear();
+			this.격리_기록.clear();
 		}
 
 		List<String> 전부() {
 			return List.copyOf(this.기록);
+		}
+
+		List<선언> 선언된_격리() {
+			return List.copyOf(this.격리_기록);
 		}
 
 		@Override

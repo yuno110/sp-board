@@ -11,6 +11,7 @@ import org.hibernate.exception.ConstraintViolationException.ConstraintKind;
 import org.springframework.dao.DataIntegrityViolationException;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.PlatformTransactionManager;
+import org.springframework.transaction.TransactionDefinition;
 import org.springframework.transaction.TransactionStatus;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -23,8 +24,31 @@ import org.springframework.transaction.support.TransactionTemplate;
  * <p><b>순서는 §9.3 의 판정이다</b> — 조건부 UPDATE({@link PostViewRepository#renewViewedAt})가
  * 먼저이고, 0 행이면 존재 확인, 없을 때만 INSERT 한다. {@code INSERT IGNORE}·
  * {@code ON DUPLICATE KEY UPDATE} 를 쓰지 않는다 — 영향 행 수가 H2 와 MySQL 에서 같다는 근거가 없다
- * (§9.3). 그 순서가 MySQL 에서 만드는 락은 §9.3 의 블록인용이 추정으로 적었고 실 MySQL 측정은
- * sp-docs/plan/phase2-board.md §4.1 이 통합으로 넘겼다.
+ * (§9.3).
+ *
+ * <p><b>판정 트랜잭션의 격리 수준은 READ COMMITTED 다</b> (§9.3 의 표, sp-docs/domain-model.md §4.5
+ * — 2026-11-20 {@code D-24}). MySQL 의 기본 격리(반복 읽기)에서는 1) 의 0 행 조건부 UPDATE 가
+ * {@code uk_post_view_post_viewer} 의 끝 간격(supremum)에 next-key 락을 남겨, 동시 첫 조회끼리 —
+ * 같은 글이 아니어도 — 서로의 INSERT 를 막고 교착했다 (2026-11-19 I-07 실측, 상세 조회가 500
+ * {@code C005}). READ COMMITTED 에서는 그 UPDATE 가 간격 락을 남기지 않는다. 수치와 버린 대안
+ * (INSERT 먼저·재시도), 남는 위험(처음 INSERT 한 트랜잭션이 되돌아갈 때의 교착)은 §9.3 의 블록인용이
+ * 적는다. 순서와 UNIQUE 충돌의 처리는 격리 수준과 무관하게 그대로다.
+ *
+ * <p><b>이 트랜잭션에만 건다.</b> 서버·데이터소스의 전역 격리 수준을 바꾸지 않는다 — 상세의 읽기를
+ * 포함한 다른 트랜잭션은 서버 기본 그대로다 (§9.3, sp-docs/tech-stack.md §4.5). 선언은 연결에 닿고
+ * 트랜잭션이 끝날 때 되돌아간다 — {@code HibernateJpaDialect} 가 시작에서 물리 연결의 격리 수준을
+ * 바꾸고({@code DataSourceUtils.prepareConnectionForTransaction}) 정리에서 원래 값으로 돌린다
+ * ({@code resetConnectionAfterTransaction}). 그 경로의 전제는 {@code JpaDialect} 의 prepareConnection 이
+ * 켜져 있고(기본) Hibernate 의 연결 해제 모드가 {@code ON_CLOSE} 인 것이고, {@code HibernateJpaVendorAdapter} 의 기본
+ * ({@code DELAYED_ACQUISITION_AND_HOLD})이 그렇다 — 다른 모드면 시작에서
+ * {@code InvalidIsolationLevelException} 이 난다. open-in-view(Boot 기본 켜짐)에서는 같은 요청의 404
+ * 확인·판정·상세 읽기가 한 물리 연결을 쓰므로, 상세 읽기의 격리는 이 트랜잭션 끝의 되돌림이 정한다
+ * (B-25 의 코드 읽기, spring-orm 6.2.19). 실 MySQL 의 관측은 I-11 이다.
+ *
+ * <p><b>전제 — binlog 형식.</b> 바이너리 로그가 켜져 있고 {@code binlog_format} 이 {@code STATEMENT}
+ * 이면 MySQL 이 READ COMMITTED 트랜잭션의 쓰기를 거부해 판정이 실패한다(MySQL 의 동작 — 이
+ * 프로젝트에서 재지 않았다). {@code ROW} 또는
+ * {@code MIXED} 여야 한다 (sp-docs/tech-stack.md §4.5).
  *
  * <p><b>집계될 때만 {@code view_count} 를 좁은 UPDATE({@link PostRepository#increaseViewCount})로
  * +1 하고, 그 +1 도 이 판정의 트랜잭션 안이다</b> (§9.3). 판정 행이 생기거나 기준 시각이 바뀐
@@ -51,7 +75,7 @@ public class ViewCountJudge {
 	/** {@code view_count} 를 바꾸는 지점 — 좁은 UPDATE 다 (sp-docs/domain-model.md §6). */
 	private final PostRepository postRepository;
 
-	/** 판정의 DB 트랜잭션. 템플릿인 이유는 클래스 주석에 있다. */
+	/** 판정의 DB 트랜잭션. READ COMMITTED 다. 템플릿인 이유와 격리 수준의 이유는 클래스 주석에 있다. */
 	private final TransactionTemplate judgeTransaction;
 
 	public ViewCountJudge(
@@ -62,6 +86,8 @@ public class ViewCountJudge {
 		this.postViewRepository = postViewRepository;
 		this.postRepository = postRepository;
 		this.judgeTransaction = new TransactionTemplate(transactionManager);
+		// 판정 트랜잭션에만 건다 — 이유는 클래스 주석 (sp-docs/requirements/board.md §9.3)
+		this.judgeTransaction.setIsolationLevel(TransactionDefinition.ISOLATION_READ_COMMITTED);
 	}
 
 	/**
@@ -121,8 +147,8 @@ public class ViewCountJudge {
 	 *
 	 * <p>{@code saveAndFlush} 다 — INSERT 가 이 {@code try} 안에서 나가야 충돌을 여기서 받는다.
 	 *
-	 * <p>충돌은 Hibernate 의 SQL 오류 로그를 남긴다 — 그 로그 수준은 실 MySQL 측정 대상이다
-	 * (sp-docs/requirements/board.md §9.3 의 블록인용, sp-docs/plan/phase2-board.md §4.1).
+	 * <p>충돌은 Hibernate 의 SQL 오류 로그를 남긴다 — 그 로그 수준은 실 MySQL 측정 대상이고 이 격리
+	 * 수준 뒤에 I-11 이 잰다 (sp-docs/requirements/board.md §9.3 의 블록인용).
 	 */
 	private boolean insertView(Long postId, String viewerKey, LocalDateTime now) {
 		try {
