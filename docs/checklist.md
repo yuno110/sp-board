@@ -87,7 +87,8 @@
 - [x] I-10 2차 응답의 서비스 간 비교와 I-04 문장의 시점 · 상태 done · 커밋 9300000 · 리뷰 2라운드
 - [x] I-11 B-25 뒤 조회수 판정의 실 MySQL 재측정 · 상태 done · 커밋 7105f09 · 리뷰 1라운드 · 후속 1(UNIQUE 충돌의 Hibernate ERROR 로그)
 - [x] I-12 B-26 뒤 UNIQUE 충돌 로그의 실 MySQL 재측정 · 상태 done · 커밋 2bc10d9 · 리뷰 1라운드
-- [x] I-13 AU-23 뒤 로그인 실패 카운터의 실 MySQL 재측정 · 상태 done · 커밋 - · 리뷰 2라운드
+- [x] I-13 AU-23 뒤 로그인 실패 카운터의 실 MySQL 재측정 · 상태 done · 커밋 df3c72e · 리뷰 2라운드
+- [x] I-14 AU-24 뒤 메일 신뢰성의 SMTP 소켓 경로 재측정 · 상태 done · 커밋 - · 리뷰 1라운드 · 후속 2(교착의 Hibernate 로그 줄을 적는 정본 문구, AccountService javadoc 의 실행기 이름)
 
 ## 선행 조건
 
